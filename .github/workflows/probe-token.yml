@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Throwaway probe: which token can open a pull request about two seconds
+# after a plain push, and does a retry after 15 s save it? Delete with the
+# branch.
+name: probe-token
+
+on: push
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fresh branch per token, immediate create, one retry
+        env:
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git config user.name probe-bot
+          git config user.email probe-bot@users.noreply.github.com
+          mkhead() {
+            git switch --quiet --create "$1"
+            git commit --quiet --allow-empty -m "probe: $1"
+            git push --quiet origin "$1"
+            git switch --quiet -
+          }
+          try_pr() {
+            echo "=== $1 ($2) ==="
+            local out
+            out=$(GH_TOKEN="$3" gh pr create --base main --head "$1" \
+              --title "probe: $1" --body "Throwaway probe. Closing at once." 2>&1) \
+              && { echo "CREATED: $out"; GH_TOKEN="$3" gh pr close "${out##*/}" || true; return 0; } \
+              || { echo "REFUSED: $out"; return 1; }
+          }
+          mkhead probe2/gh-immediate
+          try_pr probe2/gh-immediate "github.token, immediate" "${{ github.token }}" || true
+          mkhead probe2/pat-immediate
+          try_pr probe2/pat-immediate "PAT, immediate" "$PUSH_TOKEN" || true
+          mkhead probe2/pat-retry
+          try_pr probe2/pat-retry "PAT, immediate" "$PUSH_TOKEN" || true
+          sleep 15
+          try_pr probe2/pat-retry "PAT, after 15 s" "$PUSH_TOKEN" || true
