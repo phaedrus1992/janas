@@ -1,0 +1,5 @@
+name: "Janas"
+description: "Janas LLM engine fork: arm64 and Apple Silicon (Metal) port for upstream"
+id: "janas"
+
+tags: ["macos", "lang-c", "lang-objc"]
