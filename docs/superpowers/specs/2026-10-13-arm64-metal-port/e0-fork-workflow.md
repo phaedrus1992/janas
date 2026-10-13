@@ -66,7 +66,7 @@ The sync steps:
    The test is containment, not "clean moved": a run whose pull request never merged must try again on the next run.
 3. Push `clean` to origin.
 4. Fetch `origin/main`. Cut a fresh `sync/YYYY-MM-DD-HHMMSS` from it.
-   When an open pull request with a `sync/*` head exists, exit 0. The script says so.
+   When an open pull request with a `sync/*` head exists, stop and name its URL: an earlier run stopped and needs a hand, and a silent skip would let `main` fall behind a green workflow.
 5. Merge `clean` into the sync branch with `git merge --no-ff --no-commit clean`.
    The `--no-ff` keeps the merge commit that the paragraph after the steps names.
    On a `README.md` conflict: take upstream's `README.md` with `git checkout clean -- README.md`, prepend `.fork/readme-header.md`, stage it.
@@ -103,7 +103,7 @@ An earlier revision routed the `gh` calls through a `SYNC_TOKEN` fine-grained PA
 Probes on 2026-10-13 showed the PAT was never scope-limited — run 38453180562 opened pull requests with it for every probed head — and the workflow token works with the setting above on.
 The real refusal was timing: every failed run (38451890753, 38452548732, 38453721431) opened its pull request about 1.5 seconds after the sync deleted and re-created `sync/2026-10-13`, and GitHub refuses `createPullRequest` for the seconds after such a delete.
 The sync gives each run a unique branch, `sync/YYYY-MM-DD-HHMMSS`, and deletes stale `sync/*` branches only after a merge (#31).
-The `SYNC_TOKEN` secret is gone.
+The `SYNC_TOKEN` repository secret is now unused; delete it, and revoke the fine-grained PAT.
 
 ## 5. Guard mechanics
 
