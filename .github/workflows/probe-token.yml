@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Throwaway probe: what can SYNC_TOKEN write in this repository?
+# Delete this file and its branch when the answer is recorded.
+name: probe-token
+
+on: push
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Ask what the token can write
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          gh api user --jq '"login: \(.login)"'
+          gh api "repos/$GITHUB_REPOSITORY" --jq '"repo permissions: \(.permissions)"'
+          echo "--- merge probe: 403 means no write, 404 means the permission is present ---"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/999999/merge" --method PUT 2>&1 || true
+          echo "--- review probe: same reading ---"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/999999/reviews" --method POST \
+            -f body=probe -f event=COMMENT 2>&1 || true
+          echo "--- the same call the sync makes ---"
+          pr_url="$(gh pr create --base main --head "$GITHUB_REF_NAME" \
+            --title "probe: can SYNC_TOKEN open this" \
+            --body "Throwaway probe for the fork sync token. Closing at once.")" || true
+          echo "pr create result: ${pr_url:-FAILED}"
+          if [[ -n "$pr_url" ]]; then gh pr close "$pr_url" || true; fi
