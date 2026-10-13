@@ -80,7 +80,6 @@ Tooling paths (permitted on `main` only):
 - `.claude/`, `CLAUDE.md`, `AGENTS.md`
 - `.fork/`
 - `.github/workflows/fork-*.yml`
-- `.pre-commit-config.yaml`
 - `.github/dependabot.yml`
 
 The sync loop:

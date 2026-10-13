@@ -8,7 +8,7 @@
 
 **Architecture:** One sync script and one guard script do all the work. The local session and the two GitHub workflows call the same scripts, so there is one implementation each. Fixture tests prove the scripts before a workflow trusts them. The epic adds no engine code.
 
-**Tech Stack:** Bash (`set -euo pipefail`, shellcheck, shfmt), git, the `gh` CLI, prek 0.3.2, GitHub Actions (SHA-pinned), Dependabot.
+**Tech Stack:** Bash (`set -euo pipefail`, shellcheck, shfmt), git, the `gh` CLI, GitHub Actions (SHA-pinned), Dependabot.
 
 **Spec:** `docs/superpowers/specs/2026-10-13-arm64-metal-port/e0-fork-workflow.md` (section numbers below refer to it).
 
@@ -22,7 +22,7 @@
 - Shell: `set -euo pipefail`, `shellcheck` and `shfmt` clean, no `grep -P`, macOS and Linux both.
 - Workflows: `actions/checkout` pinned to `3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1) with a version comment. `actionlint` and `zizmor` clean.
 - Dependabot: `github-actions` ecosystem, 7-day cooldown, grouped update.
-- Tooling paths live on `main` only: `.llmenv.yaml`, `docs/fork.md`, `docs/superpowers/`, `.claude/`, `CLAUDE.md`, `AGENTS.md`, `.fork/`, `.github/workflows/fork-*.yml`, `.pre-commit-config.yaml`, `.github/dependabot.yml`.
+- Tooling paths live on `main` only: `.llmenv.yaml`, `docs/fork.md`, `docs/superpowers/`, `.claude/`, `CLAUDE.md`, `AGENTS.md`, `.fork/`, `.github/workflows/fork-*.yml`, `.github/dependabot.yml`.
 - The `upstream` remote is `https://github.com/prabanta-dev/janas.git`. The fork remote `origin` is `phaedrus1992/janas`.
 - Scratch files stay under `.tmp/` in this clone, and the scripts clean up their own scratch.
 
@@ -32,11 +32,11 @@
 | --- | --- |
 | `.fork/readme-header.md` | The fork header block. The sync prepends it to upstream's README. |
 | `.fork/check-clean.sh` | The guard. One ref in, exit 0 or 1 out. |
-| `.fork/hooks/pre-push.sh` | The prek pre-push hook. Reads git's ref lines, calls the guard for `port/*` refs. |
+| `.fork/hooks/pre-push.sh` | The pre-push hook. Reads git's ref lines, calls the guard for `port/*` refs; reads the guard from `main` when the tree has none. |
 | `.fork/sync-upstream.sh` | The sync. Fast-forwards `clean`, then merges it into `main` through a PR. |
 | `.fork/tests/test-check-clean.sh` | Fixture test for the guard and the hook. |
 | `.fork/tests/test-sync-upstream.sh` | Fixture test for the sync, against two bare repositories and a stub `gh`. |
-| `.pre-commit-config.yaml` | The prek config. One local hook at the pre-push stage. |
+| `.fork/install-hooks.sh` | Copies the hook into `.git/hooks/pre-push`. One run per clone. |
 | `.github/workflows/fork-sync.yml` | Daily schedule and manual dispatch. Runs the sync. |
 | `.github/workflows/fork-guard.yml` | Runs the guard on every `port/*` pull request. |
 | `.github/dependabot.yml` | Keeps the pinned actions current, grouped, 7-day cooldown. |
@@ -305,10 +305,8 @@ if ! git rev-parse --verify --quiet "$ref" >/dev/null; then
 fi
 
 # Tooling paths (design.md §5). Port branches must not change them.
-exact_paths=(.llmenv.yaml docs/fork.md CLAUDE.md AGENTS.md
-  .pre-commit-config.yaml .github/dependabot.yml)
+exact_paths=(.llmenv.yaml docs/fork.md CLAUDE.md AGENTS.md .github/dependabot.yml)
 prefix_paths=(docs/superpowers/ .claude/ .fork/)
-glob_paths=(".github/workflows/fork-*.yml")
 
 is_tooling() {
   local path="$1" pattern
@@ -368,7 +366,6 @@ In `design.md` §5, the list under "Tooling paths (permitted on `main` only)" be
 - `.claude/`, `CLAUDE.md`, `AGENTS.md`
 - `.fork/`
 - `.github/workflows/fork-*.yml`
-- `.pre-commit-config.yaml`
 - `.github/dependabot.yml`
 ```
 
@@ -384,26 +381,30 @@ git commit -s -m "feat(fork): add the port-branch guard"
 
 ---
 
-### Task 4: The pre-push hook and the prek config
+### Task 4: The pre-push hook and its installer
 
 **Files:**
 - Create: `.fork/hooks/pre-push.sh`
-- Create: `.pre-commit-config.yaml`
+- Create: `.fork/install-hooks.sh`
 - Modify: `.fork/tests/test-check-clean.sh`
 
 **Interfaces:**
 - Consumes: `.fork/check-clean.sh` from Task 3.
-- Produces: `.fork/hooks/pre-push.sh`, which reads git's pre-push lines on stdin and exits 1 when any `port/*` ref fails the guard.
+- Produces: `.fork/install-hooks.sh`, which copies `.fork/hooks/pre-push.sh` into `.git/hooks/pre-push`. The hook reads git's pre-push lines on stdin and exits 1 when any `port/*` ref fails the guard.
+
+**Do not use prek for this hook.** A `port/*` checkout carries no tooling files, so its tree has no prek config; the installed prek hook then exits 1 and blocks every push. prek also consumes git's stdin, so the hook would never see the refs. The spec's §5 records this.
 
 - [ ] **Step 1: Add the failing hook cases to the test**
 
-Append to `.fork/tests/test-check-clean.sh`, before the final `if [[ "$fails" -gt 0 ]]` block:
+Append to `.fork/tests/test-check-clean.sh`, before the final `if [[ "$fails" -gt 0 ]]` block. The cases cover the plain refs, a multi-ref push, a delete, and the guard-from-`main` path on a checkout with no tooling:
 
 ```bash
+# The pre-push hook runs the guard on every port/* line of its stdin.
 zero=0000000000000000000000000000000000000000
 tooling_sha="$(git rev-parse fix-tooling)"
 port_line="refs/heads/port/x $tooling_sha refs/heads/port/x $zero"
 feat_line="refs/heads/feat/x $tooling_sha refs/heads/feat/x $zero"
+delete_line="(delete) $zero refs/heads/port/gone $tooling_sha"
 
 if printf '%s\n' "$port_line" | "$hook" >/dev/null 2>&1; then
   bad "a port/* push of a tooling ref must fail"
@@ -414,6 +415,45 @@ fi
 if printf '%s\n%s\n' "$feat_line" "$port_line" | "$hook" >/dev/null 2>&1; then
   bad "a multi-ref push with a port/* line must fail"
 fi
+if ! printf '%s\n' "$delete_line" | "$hook" >/dev/null 2>&1; then
+  bad "a deleted port/* ref must pass"
+fi
+```
+
+Then add the scratch-repository block that proves the fallback: push the current tree to a bare repository, fetch it into a scratch work tree, check out `clean` (no tooling), and run the installed hook on a tooling commit.
+
+```bash
+# A port/* checkout carries no tooling. The hook must read the guard from
+# main there, and it must block the push when main is missing.
+bare="$scratch/tiny.git"
+work="$scratch/tiny-work"
+git init --quiet --bare "$bare"
+git push --quiet "$bare" "HEAD:refs/heads/main" clean:refs/heads/clean
+git init --quiet "$work"
+git -C "$work" remote add origin "$bare"
+git -C "$work" fetch --quiet origin
+git -C "$work" branch --no-track main origin/main
+git -C "$work" switch --quiet --detach origin/clean
+tiny_index="$scratch/index.tiny"
+GIT_INDEX_FILE="$tiny_index" git -C "$work" read-tree origin/clean
+blob="$(printf 'id: tiny' | git -C "$work" hash-object --stdin -w)"
+GIT_INDEX_FILE="$tiny_index" git -C "$work" update-index --add --cacheinfo "100644,$blob,.llmenv.yaml"
+tree="$(GIT_INDEX_FILE="$tiny_index" git -C "$work" write-tree)"
+tiny_commit="$(git -C "$work" commit-tree "$tree" -p origin/clean -m "fixture: tiny tooling ref")"
+git -C "$work" branch --force port/x "$tiny_commit"
+cp "$hook" "$work/.git/hooks/pre-push"
+chmod +x "$work/.git/hooks/pre-push"
+if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" |
+  (cd "$work" && .git/hooks/pre-push) >/dev/null 2>&1; then
+  bad "a port/* push from a checkout without tooling must fail"
+fi
+git -C "$work" branch --move main main-hidden
+if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" |
+  (cd "$work" && .git/hooks/pre-push) 2>"$scratch/nomain.err"; then
+  bad "a port/* push with no main must fail"
+elif ! grep -q "main" "$scratch/nomain.err"; then
+  bad "the failure must name main"
+fi
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -422,7 +462,7 @@ fi
 .fork/tests/test-check-clean.sh
 ```
 
-Expected: exit 1, with `No such file or directory` for `.fork/hooks/pre-push.sh`.
+Expected: exit 1, with the hook cases reported as failures.
 
 - [ ] **Step 3: Write the hook**
 
@@ -430,19 +470,41 @@ Create `.fork/hooks/pre-push.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# The prek pre-push hook. Git writes one line per pushed ref on stdin:
+# The port-branch guard hook. Git writes one line per pushed ref on stdin:
 #   <local ref> <local oid> <remote ref> <remote oid>
 # Every port/* line runs the guard. One failure blocks the push.
+# Install it once per clone with .fork/install-hooks.sh.
+#
+# A port/* checkout carries no tooling files (design.md §5), so the guard is
+# read from main when the working tree has none. There is one guard.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
 guard="$root/.fork/check-clean.sh"
+scratch=""
+
+cleanup() {
+  if [[ -n "$scratch" ]]; then
+    rm -f "$scratch"
+  fi
+}
+trap cleanup EXIT
+
+if [[ ! -f "$guard" ]]; then
+  scratch="$(mktemp "${TMPDIR:-/tmp}/janas-guard.XXXXXX")"
+  if ! git show main:.fork/check-clean.sh >"$scratch" 2>/dev/null; then
+    echo "pre-push: cannot read .fork/check-clean.sh from main." >&2
+    echo "pre-push: fetch main, then push again." >&2
+    exit 1
+  fi
+  guard="$scratch"
+fi
 
 status=0
 while read -r local_ref local_sha _; do
   [[ -z "$local_ref" ]] && continue
   [[ "$local_ref" == refs/heads/port/* ]] || continue
-  "$guard" "$local_sha" || status=1
+  bash "$guard" "$local_sha" || status=1
 done
 
 exit "$status"
@@ -457,47 +519,56 @@ chmod +x .fork/hooks/pre-push.sh
 
 Expected: `test-check-clean: all checks passed`.
 
-- [ ] **Step 5: Write the prek config**
+- [ ] **Step 5: Write the installer**
 
-Create `.pre-commit-config.yaml`:
+Create `.fork/install-hooks.sh`:
 
-```yaml
-repos:
-  - repo: local
-    hooks:
-      - id: check-clean
-        name: port branch guard
-        entry: .fork/hooks/pre-push.sh
-        language: system
-        pass_filenames: false
-        stages: [pre-push]
+```bash
+#!/usr/bin/env bash
+# Install the fork hooks into this clone. Run it once per clone after the
+# first checkout of main. Design: e0-fork-workflow.md §5
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+source_hook="$root/.fork/hooks/pre-push.sh"
+target="$root/.git/hooks/pre-push"
+
+[[ -f "$source_hook" ]] || {
+  echo "install-hooks: $source_hook is missing; run this from main." >&2
+  exit 1
+}
+
+cp "$source_hook" "$target"
+chmod +x "$target"
+echo "install-hooks: installed $target"
 ```
 
 - [ ] **Step 6: Install the hook in this clone**
 
 ```bash
-prek install
+.fork/install-hooks.sh
 ```
 
-Expected: a line that names the pre-push hook, or no error.
+Expected: `install-hooks: installed .../.git/hooks/pre-push`.
 
-- [ ] **Step 7: Prove the install**
+- [ ] **Step 7: Prove git runs it**
 
-The hook cases in Step 4 call the hook file directly. This step proves that git runs it. The prek hook file is the wiring.
+The test cases call the hook file directly. This step goes through the installed copy.
 
 ```bash
-test -x .git/hooks/pre-push && echo "pre-push hook installed"
+sha="$(git rev-parse clean)"
+printf 'refs/heads/port/probe %s refs/heads/port/probe %s\n' "$sha" "$sha" | .git/hooks/pre-push
 ```
 
-Expected: `pre-push hook installed`.
+Expected: `check-clean: <sha> is clean.` and exit 0.
 
 - [ ] **Step 8: Lint and commit**
 
 ```bash
-shellcheck .fork/hooks/pre-push.sh .fork/tests/test-check-clean.sh
-shfmt -d .fork/hooks/pre-push.sh .fork/tests/test-check-clean.sh
-git add .fork/hooks/pre-push.sh .fork/tests/test-check-clean.sh .pre-commit-config.yaml
-git commit -s -m "feat(fork): guard port pushes with a prek hook"
+shellcheck .fork/hooks/pre-push.sh .fork/install-hooks.sh .fork/tests/test-check-clean.sh
+shfmt -i 2 -d .fork/hooks/pre-push.sh .fork/install-hooks.sh .fork/tests/test-check-clean.sh
+git add .fork/hooks/pre-push.sh .fork/install-hooks.sh .fork/tests/test-check-clean.sh
+git commit -s -m "feat(fork): guard port pushes with a pre-push hook"
 ```
 
 ---
@@ -1020,7 +1091,7 @@ E0, the fork workflow, is built: `clean` mirrors `upstream/main`, the daily
 sync merges upstream into `main` through a pull request, and a guard keeps
 fork tooling off `port/*` branches. The tests for the scripts are in
 `.fork/tests/`; run both by hand. Each clone installs the pre-push hook once
-with `prek install`.
+with `./.fork/install-hooks.sh`.
 
 No port code exists yet. Each epic gets its own design session before work
 starts.

@@ -38,8 +38,7 @@ if ! git rev-parse --verify --quiet "$ref" >/dev/null; then
 fi
 
 # Tooling paths (design.md §5). Port branches must not change them.
-exact_paths=(.llmenv.yaml docs/fork.md CLAUDE.md AGENTS.md
-  .pre-commit-config.yaml .github/dependabot.yml)
+exact_paths=(.llmenv.yaml docs/fork.md CLAUDE.md AGENTS.md .github/dependabot.yml)
 prefix_paths=(docs/superpowers/ .claude/ .fork/)
 
 is_tooling() {
