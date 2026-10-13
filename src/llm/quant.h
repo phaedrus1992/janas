@@ -248,6 +248,20 @@ void janas_axpy_f32(float *y, float a, const float *x, size_t n);
 float janas_fp16_to_fp32(uint16_t h);
 uint16_t janas_fp32_to_fp16(float f);
 
+/* MXFP4 (ggml's type 39): a block of 32 weights is an E8M0 scale byte e and
+   16 bytes of 4-bit codes, the weight kv[code] * 2^(e - 128) with kv the 16
+   integers 0, 1, 2, 3, 4, 6, 8, 12 and their opposites; codes j and j + 16
+   share byte j, low and high half. */
+#define JANAS_MXFP4_BLOCK 17
+
+/* n MXFP4 blocks as Q8_0 blocks, exactly: the codes' integers as the
+   weights, the power of two as the fp16 scale. A block whose power is below
+   fp16's least, 2^-24 (weights under 3.6e-7), is written as zeros and
+   counted in *tiny. -1 for a scale beyond fp16 (2^16 and more, or E8M0's
+   NaN), which no model's weights have. */
+int janas_mxfp4_to_q8_0(const uint8_t *in, struct janas_block_q8_0 *out,
+                        size_t n, size_t *tiny);
+
 /* Quantizes n floats (n multiple of JANAS_QK) into n / JANAS_QK blocks. */
 void janas_q8k_quantize(const float *x, struct janas_block_q8k *y, size_t n);
 

@@ -2,6 +2,12 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-13] - Qwen3-Coder-Next as llama.cpp writes it now
+
+- **qwen3next models converted by llama.cpp since early 2026 load** (issue #18, reported by nica-f with unsloth's Qwen3-Coder-Next-Q3_K_M): the recurrent layers' input projection comes as two tensors, `attn_qkv` and `attn_gate`, where the engine wanted the single `ssm_in`, its rows interleaved per key head. Both layouts are read; Qwen3-Coder-Next rewritten in the new one gives the very logits of the old, to the bit, token by token and in blocks.
+- **MXFP4 tensors written as Q8_0, exactly**: the same file has its shared experts in MXFP4 (ggml's type 39), which the engine did not know. An MXFP4 weight is an integer of -12 to 12 times its block's power of two, and Q8_0 holds both, so `gguf2jns` rewrites such a tensor with every weight unchanged, at twice the bytes (80 MB more for Qwen3-Coder-Next's shared experts). Checked on a Qwen3-4B with four layers' attention in MXFP4: the converted tensors give the GGUF's weights to the bit. Routed experts in MXFP4 are refused with a message for now: twice their bytes on every token would undo what the format is for.
+
+
 ## [2026-10-13] - janas-bench says what the GPU does
 
 - **`janas-bench` says that the GPU reads a prompt in every configuration** (issue #16, a Radeon 780M): with the fast prompt a prompt's blocks of 64 tokens or more go to the GPU whether a row says "+ GPU" or not, so that a prompt gives the same results in each, and the rows without it had been read as the CPU alone, the GPU as of no help where it read Qwen3-4B's prompt 5.2 times faster (477 against 92 tokens/s). A note under the table now says so; "+ GPU" is the GPU's part in the shorter passes.

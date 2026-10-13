@@ -286,7 +286,18 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
                          &ly->beta_own, err, err_len))
                 return -1;
         } else {
-            NEED(ssm_in, "ssm_in.weight", T_QUANT, dm, m->qkvz_dim)
+            /* qwen3next's fused projection, q, k, v and z interleaved per
+               key head; llama.cpp's converter writes it as two since 2026,
+               q|k|v and z each in the heads' order, as qwen35 has them
+               (issue #18: unsloth's Qwen3-Coder-Next files). ssm_ba is the
+               same in both. */
+            snprintf(name, sizeof(name), "blk.%u.attn_qkv.weight", l);
+            if (janas_jns_tensor(j, name)) {
+                NEED(ssm_qkv, "attn_qkv.weight", T_QUANT, dm, m->conv_ch)
+                NEED(ssm_z, "attn_gate.weight", T_QUANT, dm, m->d_inner)
+            } else {
+                NEED(ssm_in, "ssm_in.weight", T_QUANT, dm, m->qkvz_dim)
+            }
             NEED(ssm_ba, "ssm_ba.weight", T_QUANT, dm, 2 * m->n_vh)
         }
         NEED(conv, "ssm_conv1d.weight", T_F32, m->d_conv, m->conv_ch)

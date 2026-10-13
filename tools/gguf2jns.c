@@ -17,6 +17,15 @@
  * activations, quantized 256 at a time, fit. Gate and up fused in one
  * tensor (ffn_gate_up_exps) are split into the two matrices of the slot.
  *
+ * A resident tensor in MXFP4 (unsloth's Qwen3-Coder-Next files have their
+ * shared experts so, issue #18) is written as Q8_0, which holds it exactly:
+ * an MXFP4 weight is an integer of -12 to 12 times a power of two, a block's
+ * one (E8M0, 2^(e - 128)), and so is Q8_0's with the power as its fp16
+ * scale. Only a block whose power is below fp16's least, 2^-24, and whose
+ * weights are so below 3.6e-7, is written as zeros (counted). Routed
+ * experts in MXFP4 are refused: twice their bytes a token would undo what
+ * the format is for.
+ *
  * A model split into several GGUF files (name-00001-of-0000N.gguf) is read
  * from all of them: give the first. Data is copied in streaming; the model
  * is never held in memory.
@@ -35,11 +44,15 @@
 
 #include "llm/gguf.h"
 #include "llm/jns.h"
+#include "llm/quant.h"
 
 #define ALIGN 4096
 #define MATRIX_ALIGN 256
 #define COPY_CHUNK ((size_t)16 << 20)
 #define MAX_PARTS 256
+#define GGUF_MXFP4 39 /* ggml's type number */
+#define MXFP4_BLOCK JANAS_MXFP4_BLOCK
+#define Q8_0_BLOCK sizeof(struct janas_block_q8_0)
 
 static uint64_t align_up(uint64_t x, uint64_t a)
 {
@@ -63,6 +76,7 @@ struct tensor {
     uint64_t new_offset;
     /* a resident matrix widened with zeros: its rows, then as written */
     uint64_t rows, rb, new_rows, new_rb, new_dims[2], new_bytes;
+    uint32_t new_type; /* MXFP4 is written as Q8_0 */
 };
 
 /* A matrix of a slot: from which tensor, where in an expert's part of it,
@@ -216,6 +230,30 @@ static uint32_t copy_rows(const struct tensor *t, uint64_t src, uint64_t rows,
     return crc;
 }
 
+static size_t tiny_blocks; /* MXFP4 blocks below fp16's scales */
+
+/* n bytes of MXFP4 at src of t, to dst as Q8_0 (twice the bytes). */
+static void copy_mxfp4(const struct tensor *t, uint64_t src, uint64_t n,
+                       uint64_t dst)
+{
+    int fd = parts[t->part].fd;
+    uint64_t per = COPY_CHUNK / MXFP4_BLOCK * MXFP4_BLOCK;
+    for (uint64_t at = 0; at < n; at += per) {
+        uint64_t k = n - at < per ? n - at : per;
+        if (pread(fd, buf, k, (off_t)(t->base + src + at)) != (ssize_t)k)
+            die("%s", "unexpected end of the GGUF file");
+        uint64_t nb = k / MXFP4_BLOCK;
+        if (janas_mxfp4_to_q8_0(buf, (struct janas_block_q8_0 *)obuf, nb,
+                                &tiny_blocks) != 0)
+            die("%s", "an MXFP4 scale beyond fp16's (NaN, or 2^16 and more)");
+        if (pwrite(out_fd, obuf, nb * Q8_0_BLOCK,
+                   (off_t)(dst + at / MXFP4_BLOCK * Q8_0_BLOCK)) !=
+            (ssize_t)(nb * Q8_0_BLOCK))
+            die("write failed: %s", strerror(errno));
+        copied += k;
+    }
+}
+
 /* A width rounded up to a multiple of 256 (the engine's activations). */
 static uint64_t wide(uint64_t n)
 {
@@ -315,6 +353,10 @@ int main(int argc, char **argv)
                 die("%s missing: only models with routed experts in every "
                     "layer, or dense ones, are supported",
                     key);
+            if (t->t->type == GGUF_MXFP4)
+                die("%s: routed experts in MXFP4 are not supported yet; a "
+                    "file with K-quants (Q4_K_M, Q3_K_M) works",
+                    key);
             uint64_t ne = t->t->n_dims > 2 ? t->t->dims[2] : 1;
             if (ne != n_expert || t->t->bytes % n_expert ||
                 t->t->dims[0] > UINT32_MAX || t->t->dims[1] > UINT32_MAX ||
@@ -378,10 +420,22 @@ int main(int argc, char **argv)
         int gu = nl > 16 && (!strcmp(name + nl - 16, ".ffn_gate.weight") ||
                              !strcmp(name + nl - 14, ".ffn_up.weight"));
         int dn = nl > 16 && !strcmp(name + nl - 16, ".ffn_down.weight");
-        free(name);
         t->new_bytes = t->t->bytes;
         t->new_dims[0] = t->t->dims[0];
         t->new_dims[1] = t->t->dims[1];
+        t->new_type = t->t->type;
+        if (t->t->type == GGUF_MXFP4) {
+            if (t->t->bytes % MXFP4_BLOCK || t->t->dims[0] % 32 ||
+                (t->t->n_dims == 2 && (gu || dn) &&
+                 (wide(t->t->dims[0]) != t->t->dims[0] ||
+                  wide(t->t->dims[1]) != t->t->dims[1])))
+                die("%s: an MXFP4 tensor this converter cannot rewrite", name);
+            t->new_type = JANAS_Q8_0;
+            t->new_bytes = t->t->bytes / MXFP4_BLOCK * Q8_0_BLOCK;
+            free(name);
+            continue;
+        }
+        free(name);
         if (t->t->n_dims != 2 || !(gu || dn))
             continue;
         uint64_t rows = t->t->dims[1], cols = t->t->dims[0];
@@ -449,7 +503,9 @@ int main(int argc, char **argv)
 
     for (size_t i = 0; i < n_res; i++) {
         const struct tensor *t = resident[i];
-        if (t->new_bytes != t->t->bytes)
+        if (t->new_type != t->t->type)
+            copy_mxfp4(t, t->t->offset, t->t->bytes, t->new_offset);
+        else if (t->new_bytes != t->t->bytes)
             copy_rows(t, t->t->offset, t->rows, t->rb, t->new_rows, t->new_rb,
                       t->new_offset, 0, 0);
         else
@@ -479,6 +535,10 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
     printf("\n");
+    if (tiny_blocks)
+        printf("MXFP4: %llu blocks below fp16's least scale written as zeros "
+               "(their weights under 3.6e-7)\n",
+               (unsigned long long)tiny_blocks);
 
     /* tables, in file order, and their checksum */
     uint64_t tbl_len =
@@ -498,7 +558,7 @@ int main(int argc, char **argv)
             die("tensor name too long: %s", name);
         }
         memcpy(d.name, t->name.p, t->name.n);
-        d.type = t->type;
+        d.type = resident[i]->new_type;
         d.n_dims = t->n_dims;
         memcpy(d.dims, t->dims, sizeof(d.dims));
         d.dims[0] = resident[i]->new_dims[0];

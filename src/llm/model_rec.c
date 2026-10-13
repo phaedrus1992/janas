@@ -227,7 +227,7 @@ static void gate_worker(void *arg, int tid, int n_threads)
         uint32_t j = it / nv, h = it % nv, g = h / rf, r = h % rf;
         float *o = m->att + (size_t)j * m->d_inner + (size_t)h * ds;
         const float *z =
-            m->a->rec == JANAS_REC_Q35
+            a->ly->ssm_qkv
                 ? m->big + (size_t)j * m->qkvz_dim + m->conv_ch + (size_t)h * ds
                 : m->big + (size_t)j * m->qkvz_dim + (size_t)g * gsz + 2 * ds +
                       ds * rf + r * ds;
@@ -280,6 +280,33 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                 m->ba[(size_t)j * 2 * nv + nv + h] =
                     janas_dot_f32(wa + (size_t)h * dm, xj, dm);
             }
+    } else if (ly->ssm_qkv) {
+        /* qwen3next as llama.cpp writes it since 2026: q|k|v and z as for
+           qwen35, the betas and alphas fused and grouped as before */
+        struct janas_matvec_task t[3] = {{.type = (int)ly->ssm_qkv->type,
+                                          .w = data(m, ly->ssm_qkv),
+                                          .x = m->xq,
+                                          .y = m->big,
+                                          .rows = cc,
+                                          .cols = dm,
+                                          .n_vec = n,
+                                          .y_stride = m->qkvz_dim},
+                                         {.type = (int)ly->ssm_z->type,
+                                          .w = data(m, ly->ssm_z),
+                                          .x = m->xq,
+                                          .y = m->big + cc,
+                                          .rows = m->d_inner,
+                                          .cols = dm,
+                                          .n_vec = n,
+                                          .y_stride = m->qkvz_dim},
+                                         {.type = (int)ly->ssm_ba->type,
+                                          .w = data(m, ly->ssm_ba),
+                                          .x = m->xq,
+                                          .y = m->ba,
+                                          .rows = 2 * nv,
+                                          .cols = dm,
+                                          .n_vec = n}};
+        janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, t, 3);
     } else {
         struct janas_matvec_task t[2] = {{.type = (int)ly->ssm_in->type,
                                           .w = data(m, ly->ssm_in),
@@ -324,12 +351,16 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
             }
             continue;
         }
+        if (ly->ssm_qkv) /* q|k|v in the convolution's order already */
+            memcpy(mx, src, (size_t)cc * sizeof(float));
         for (uint32_t g = 0; g < m->n_kh; g++) {
             const float *s = src + (size_t)g * gsz;
-            memcpy(mx + (size_t)g * ds, s, ds * sizeof(float));
-            memcpy(mx + kd + (size_t)g * ds, s + ds, ds * sizeof(float));
-            memcpy(mx + 2 * kd + (size_t)g * ds * rf, s + 2 * ds,
-                   ds * rf * sizeof(float));
+            if (!ly->ssm_qkv) {
+                memcpy(mx + (size_t)g * ds, s, ds * sizeof(float));
+                memcpy(mx + kd + (size_t)g * ds, s + ds, ds * sizeof(float));
+                memcpy(mx + 2 * kd + (size_t)g * ds * rf, s + 2 * ds,
+                       ds * rf * sizeof(float));
+            }
             for (uint32_t r = 0; r < rf; r++) {
                 uint32_t h = g * rf + r;
                 float al = b[2 * g * rf + rf + r] + dt[h];
@@ -344,7 +375,7 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
     trace_row(m, "qkv_mixed", m->mixed + (size_t)(a + n - 1) * cc, cc);
     trace_row(m, "z",
               m->big + (size_t)(n - 1) * m->qkvz_dim +
-                  (m->a->rec == JANAS_REC_Q35 ? m->conv_ch : 0),
+                  (ly->ssm_qkv ? m->conv_ch : 0),
               m->d_inner);
     struct ssm_job sj = {m, ly, n};
     janas_pool_run(m->compute, conv_worker, &sj);
@@ -377,8 +408,7 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                   m->att + (size_t)(n - 1) * m->d_inner + (size_t)31 * ds, ds);
         trace_row(m, "z_h31",
                   m->big + (size_t)(n - 1) * m->qkvz_dim +
-                      (m->a->rec == JANAS_REC_Q35 ? m->conv_ch : 0) +
-                      (size_t)31 * ds,
+                      (ly->ssm_qkv ? m->conv_ch : 0) + (size_t)31 * ds,
                   ds);
     }
     /* logged for a call that may be taken back; a longer one (a prefill

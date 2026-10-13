@@ -75,6 +75,31 @@ uint16_t janas_fp32_to_fp16(float f)
     return (uint16_t)half;
 }
 
+int janas_mxfp4_to_q8_0(const uint8_t *in, struct janas_block_q8_0 *out,
+                        size_t n, size_t *tiny)
+{
+    static const int8_t kv[16] = {0, 1,  2,  3,  4,  6,  8,  12,
+                                  0, -1, -2, -3, -4, -6, -8, -12};
+    for (size_t b = 0; b < n; b++) {
+        const uint8_t *x = in + b * JANAS_MXFP4_BLOCK;
+        int p = (int)x[0] - 128; /* the block's power of two */
+        if (x[0] == 0xFF || p > 15)
+            return -1;
+        /* fp16 of 2^p: normal from 2^-14, subnormal down to 2^-24 */
+        uint16_t d = p >= -14   ? (uint16_t)((p + 15) << 10)
+                     : p >= -24 ? (uint16_t)(1u << (p + 24))
+                                : 0;
+        if (!d)
+            ++*tiny;
+        out[b].d = d;
+        for (int j = 0; j < 16; j++) {
+            out[b].qs[j] = d ? kv[x[1 + j] & 15] : 0;
+            out[b].qs[j + 16] = d ? kv[x[1 + j] >> 4] : 0;
+        }
+    }
+    return 0;
+}
+
 static int use_avx2_fma; /* set by float_helpers_init, further down */
 
 /* The eight blocks of 32 (d32, qs32, bsums32) of one block, as the 256
