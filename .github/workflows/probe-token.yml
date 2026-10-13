@@ -4,7 +4,9 @@
 # branch.
 name: probe-token
 
-on: push
+on:
+  push:
+  workflow_dispatch:
 
 permissions:
   contents: write
