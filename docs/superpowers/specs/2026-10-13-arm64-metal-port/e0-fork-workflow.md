@@ -17,7 +17,7 @@ The maintainer answers the three questions in `design.md` §5.
 | Decision | Choice | Reason |
 | --- | --- | --- |
 | Sync policy | Auto-resolve + auto-merge | Upstream releases several times a day and edits `README.md` with each release. The fork header at the top of `README.md` therefore conflicts on nearly every sync. A human per sync cannot keep up. |
-| Sync landing | A `sync/YYYY-MM-DD` branch, merged into `main` through an auto-merged PR | `main` only ever moves through PR merges. `clean` stays a pure mirror forever. Each sync leaves a record. |
+| Sync landing | A `sync/YYYY-MM-DD-HHMMSS` branch, merged into `main` through an auto-merged PR | `main` only ever moves through PR merges. `clean` stays a pure mirror forever. Each sync leaves a record. |
 | README auto-resolve | Take upstream's `README.md`, then prepend the fork header block from `.fork/readme-header.md` | The header block is fixed text. The resolve is deterministic. |
 | Guard hook | `.fork/hooks/pre-push.sh`, copied into `.git/hooks/pre-push` by `.fork/install-hooks.sh` | The hook must run on a `port/*` checkout, and that checkout carries no tooling files. prek refuses to run when its config is absent, and it consumes git's stdin refs. prek therefore cannot run this hook. |
 | Upstream issue | Filed first, before the plumbing is built | The maintainer's answer gates E1. The clock starts as soon as the issue is up. |
@@ -65,9 +65,8 @@ The sync steps:
    Exit 0 when `main` already contains every commit `clean` has.
    The test is containment, not "clean moved": a run whose pull request never merged must try again on the next run.
 3. Push `clean` to origin.
-4. Fetch `origin/main`. Cut `sync/YYYY-MM-DD` from it.
-   When an open PR with the same head exists, exit 0. The script says so.
-   When the branch exists without an open PR, delete it and cut it again.
+4. Fetch `origin/main`. Cut a fresh `sync/YYYY-MM-DD-HHMMSS` from it.
+   When an open pull request with a `sync/*` head exists, stop and name its URL: an earlier run stopped and needs a hand, and a silent skip would let `main` fall behind a green workflow.
 5. Merge `clean` into the sync branch with `git merge --no-ff --no-commit clean`.
    The `--no-ff` keeps the merge commit that the paragraph after the steps names.
    On a `README.md` conflict: take upstream's `README.md` with `git checkout clean -- README.md`, prepend `.fork/readme-header.md`, stage it.
@@ -78,32 +77,33 @@ The sync steps:
    - Exit 1.
 6. Commit the merge with the message `sync: merge upstream/main into main (YYYY-MM-DD)`.
 7. Push the sync branch. Open PR `sync/*` → `main`. Merge it at once with `gh pr merge --merge`, delete the branch.
+   Delete every other `sync/*` branch too: an open one would have ended the run above, so the rest are stale.
 8. Return to `main` and run `git pull --ff-only`. CI skips this step.
 
 The PR merge adds a second merge commit on top of the sync branch's own merge commit.
 This is cosmetic and keeps the record of each sync.
 
 CI runs the same script.
-`fork-sync.yml` sets `permissions: contents: write` for the workflow token, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+`fork-sync.yml` sets `permissions: contents: write, issues: write, pull-requests: write` for the workflow token, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
 `contents: write` covers the pushes, including a `clean` mirror that carries upstream's workflow files.
 The runner checks out with `fetch-depth: 0`.
+All of the workflow's `gh` calls run on the workflow token.
 
-The workflow's `gh` calls run with the `SYNC_TOKEN` repository secret, a fine-grained token owned by the fork account.
-The workflow token cannot create a pull request in this repository, whatever the repository settings and the workflow `permissions` say.
-Run 38443285506 failed at `gh pr create` with `Resource not accessible by integration` while the run's token held `pull-requests: write` and the repository setting below was already on.
-A first step of the workflow checks the secret: the token must belong to the repository owner and be able to read the repository.
-
-Two repo settings change once, by hand or with `gh api`:
+Two repo settings were set once, by hand or with `gh api`:
 
 ```
 PUT /repos/phaedrus1992/janas/actions/permissions/workflow
 {"default_workflow_permissions": "write", "can_approve_pull_request_reviews": true}
 ```
 
-The current value is `read` and pull request creation is off.
-With those values, the sync workflow cannot push `clean`.
-Pull request creation needs the `SYNC_TOKEN` secret either way.
-Its rotation steps are in `docs/fork.md`.
+Pull request creation stays off while `can_approve_pull_request_reviews` is false, whatever the workflow's `permissions` block says.
+Run 38443285506 failed at `gh pr create` with `Resource not accessible by integration` while that setting was off; with it on, probe run 38453455883 opened pull requests with the workflow token, including one about two seconds after its push.
+
+An earlier revision routed the `gh` calls through a `SYNC_TOKEN` fine-grained PAT.
+Probes on 2026-10-13 showed the PAT was never scope-limited — run 38453180562 opened pull requests with it for every probed head — and the workflow token works with the setting above on.
+The real refusal was timing: every failed run (38451890753, 38452548732, 38453721431) opened its pull request about 1.5 seconds after the sync deleted and re-created `sync/2026-10-13`, and GitHub refuses `createPullRequest` for the seconds after such a delete.
+The sync gives each run a unique branch, `sync/YYYY-MM-DD-HHMMSS`, and deletes stale `sync/*` branches only after a merge (#31).
+The `SYNC_TOKEN` repository secret is now unused; delete it, and revoke the fine-grained PAT.
 
 ## 5. Guard mechanics
 

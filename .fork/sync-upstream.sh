@@ -10,8 +10,8 @@ usage() {
 usage: sync-upstream.sh
 
 Runs from main. Fast-forwards clean from upstream/main, merges clean into a
-sync/YYYY-MM-DD branch, and merges that branch into main through a pull
-request. Exits 0 when main is already in sync.
+fresh sync/YYYY-MM-DD-HHMMSS branch, and merges that branch into main
+through a pull request. Exits 0 when main is already in sync.
 EOF
 }
 
@@ -29,6 +29,7 @@ die() {
   exit 1
 }
 note() { echo "sync-upstream: $*"; }
+warn() { echo "sync-upstream: $*" >&2; }
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -83,33 +84,27 @@ if git merge-base --is-ancestor clean origin/main; then
   exit 0
 fi
 
-today="$(date +%F)"
-sync_branch="sync/$today"
+# A name no earlier run used, and one clock read so the branch name and the
+# date in the messages always agree. Re-creating an existing branch (delete,
+# push, then open the pull request a second later) makes GitHub refuse
+# createPullRequest until the delete has settled (#31).
+stamp="$(date +%F-%H%M%S)"
+today="${stamp:0:10}"
+sync_branch="sync/$stamp"
 
-# An open pull request for today's branch means an earlier run is in flight.
-# A pull request from another fork does not count: its isCrossRepository is
-# true, and merging it would sync someone else's branch.
-open_prs="$(gh pr list --state open --head "$sync_branch" --json number,isCrossRepository \
-  --jq '[.[] | select(.isCrossRepository == false)] | length')" ||
+# An open sync pull request means an earlier run stopped and needs a hand, or
+# another sync is in flight right now. Either way this run stops and names
+# the pull request: a silent exit 0 would let main fall behind a green
+# workflow. A pull request from another fork does not count: it has
+# isCrossRepository true, and merging it would sync someone else's branch.
+if ! pr_json="$(gh pr list --state open --limit 1000 --json url,headRefName,isCrossRepository)"; then
   die "cannot list pull requests; is gh installed and authenticated?"
-if [[ "$open_prs" != "0" ]]; then
-  note "an open pull request for $sync_branch exists; nothing to do"
-  exit 0
 fi
-
-if git rev-parse --verify --quiet "refs/heads/$sync_branch" >/dev/null; then
-  git branch --delete --force "$sync_branch"
+open_pr="$(jq -r '[.[] | select(.isCrossRepository == false) | select(.headRefName | startswith("sync/")) | .url] | first // "none"' <<<"$pr_json")" ||
+  die "cannot read the pull request list"
+if [[ "$open_pr" != "none" ]]; then
+  die "a sync pull request is open: $open_pr. Merge it, or close it, then run again"
 fi
-
-# ls-remote exits 2 when the branch is absent, 0 when it is there, and
-# something else on a real failure.
-ls_status=0
-git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null 2>&1 || ls_status=$?
-case "$ls_status" in
-0) git push --quiet origin --delete "$sync_branch" ;;
-2) ;;
-*) die "cannot read the remote for $sync_branch (ls-remote exit $ls_status)" ;;
-esac
 
 git switch --quiet --create "$sync_branch" origin/main
 
@@ -158,8 +153,36 @@ pr_url="$(gh pr create --base main --head "$sync_branch" \
 gh pr merge "$pr_url" --merge --delete-branch ||
   die "cannot merge $pr_url; merge it by hand and delete $sync_branch"
 
+# Branches left by earlier runs that never merged. A concurrent run is the
+# only way another sync branch can be live, and it shows up as an open sync
+# pull request; re-check for one just before the sweep, because a local run
+# can start between this run's guard and here. Delete after the merge, never
+# before the create (#31).
+stale_skipped=0
+if ! pr_json="$(gh pr list --state open --limit 1000 --json headRefName,isCrossRepository)"; then
+  warn "cannot list the open pull requests; skipping the stale cleanup"
+  stale_skipped=1
+elif [[ "$(jq -r '[.[] | select(.isCrossRepository == false) | select(.headRefName | startswith("sync/"))] | length' <<<"$pr_json")" != "0" ]]; then
+  note "another sync pull request is open; skipping the stale cleanup"
+  stale_skipped=1
+elif ! stale="$(git ls-remote --heads origin 'refs/heads/sync/*')"; then
+  warn "cannot list the sync branches; skipping the stale cleanup"
+  stale_skipped=1
+else
+  while IFS=$'\t' read -r _sha ref; do
+    [[ -n "$ref" ]] || continue
+    name="${ref#refs/heads/}"
+    if [[ "$name" == "$sync_branch" ]]; then continue; fi
+    git push --quiet origin --delete "$name" || warn "cannot delete the stale branch $name"
+  done <<<"$stale"
+fi
+
 git switch --quiet main
 if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
   git pull --quiet --ff-only
 fi
-note "sync complete"
+if [[ "$stale_skipped" == "0" ]]; then
+  note "sync complete"
+else
+  note "sync complete; the stale cleanup was skipped"
+fi

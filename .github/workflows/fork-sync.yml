@@ -4,9 +4,9 @@
 # when a conflict stops it. A local session runs the same script:
 # .fork/sync-upstream.sh
 #
-# The git pushes run on the workflow token, which the permissions block below
-# scopes. The gh calls run on the SYNC_TOKEN secret: GitHub refuses pull
-# request creation to the workflow token here. Rotation: docs/fork.md.
+# The gh calls run on the workflow token. Pull request creation needs the
+# repository setting "Allow GitHub Actions to create and approve pull
+# requests" left on; with it off, GitHub refuses the call here (#31).
 name: fork-sync
 
 on:
@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: fork-sync
@@ -28,26 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: # zizmor: ignore[artipacked] the script pushes clean and the sync branch with this token
           fetch-depth: 0
-      - name: Check the sync token
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-        run: |
-          login="$(gh api user --jq .login)" || {
-            echo "SYNC_TOKEN is missing or not valid; the gh error is above." >&2
-            echo "Mint a new fine-grained token and replace the repository secret." >&2
-            exit 1
-          }
-          [[ "$login" == "$GITHUB_REPOSITORY_OWNER" ]] || {
-            echo "SYNC_TOKEN belongs to $login, not $GITHUB_REPOSITORY_OWNER." >&2
-            echo "Replace the secret with a token on $GITHUB_REPOSITORY_OWNER." >&2
-            exit 1
-          }
-          gh api "repos/$GITHUB_REPOSITORY" --jq .full_name >/dev/null || {
-            echo "SYNC_TOKEN cannot read $GITHUB_REPOSITORY; the gh error is above." >&2
-            echo "Add that repository to the token's access." >&2
-            exit 1
-          }
       - name: Merge upstream/main into main
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: .fork/sync-upstream.sh
