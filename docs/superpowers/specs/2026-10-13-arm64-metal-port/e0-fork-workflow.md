@@ -61,7 +61,9 @@ The script resolves `clean` in this order:
 The sync steps:
 
 1. Fetch `upstream/main`.
-2. Create `clean` from it when `clean` is missing. Fast-forward `clean`. Exit 0 when it did not move.
+2. Create `clean` from it when `clean` is missing. Fast-forward `clean`.
+   Exit 0 when `main` already contains every commit `clean` has.
+   The test is containment, not "clean moved": a run whose pull request never merged must try again on the next run.
 3. Push `clean` to origin.
 4. Fetch `origin/main`. Cut `sync/YYYY-MM-DD` from it.
    When an open PR with the same head exists, exit 0. The script says so.
@@ -82,7 +84,8 @@ The PR merge adds a second merge commit on top of the sync branch's own merge co
 This is cosmetic and keeps the record of each sync.
 
 CI runs the same script.
-`fork-sync.yml` sets `permissions: contents: write, pull-requests: write`, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+`fork-sync.yml` sets `permissions: contents: write, issues: write, pull-requests: write`, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+The `issues` scope is for the conflict path, which opens a fork issue.
 The runner checks out with `fetch-depth: 0`.
 
 One repo setting must change once, by hand or with `gh api`:
@@ -118,10 +121,15 @@ Then two checks run:
 2. README marker. `git show ref:README.md` must not contain `> **This is a fork.**`.
 
 The guard prints each offending path and exits 1.
+A failed diff is an error, not an empty diff: a ref with no shared history with `clean` fails.
+The path match ignores case, includes the bare names (`.fork` where a directory is expected), and covers `fork-*.yaml` as well as `fork-*.yml`.
 
 The hook reads the ref lines from stdin.
-For each pushed ref whose short name starts with `port/`, it runs the guard on the ref's local SHA.
+For each line whose destination ref starts with `port/`, it runs the guard on the pushed commit.
+The destination decides, so a push that creates `port/*` from any local ref is checked.
 One failure blocks the push.
+The guard comes from `main`, never from the working tree: the tree is the content under review.
+A push with no `port/*` destination needs no guard and never blocks.
 A `port/*` checkout carries no tooling files, so the hook reads the guard from `main` when the working tree has none.
 When `main` is missing, the hook fails and names the fix: it never passes in silence.
 
@@ -133,7 +141,8 @@ The installed prek hook refuses to run when its config is absent, and a `port/*`
 prek also consumes git's stdin, so the hook would never see the refs.
 
 `fork-guard.yml` runs on pull requests whose head branch starts with `port/`.
-It checks out with `fetch-depth: 0`, then runs `.fork/check-clean.sh` on the PR head SHA.
+It checks out with `fetch-depth: 0`, reads `main`'s copy of `.fork/check-clean.sh`, and runs it on the PR head SHA.
+The guard must not come from the pull request's own tree: an added or changed guard would check itself.
 
 A known limit: a PR opened against upstream runs upstream's CI, not the fork's.
 The local pre-push hook is the only guard on that path.
