@@ -10,8 +10,8 @@ usage() {
 usage: sync-upstream.sh
 
 Runs from main. Fast-forwards clean from upstream/main, merges clean into a
-sync/YYYY-MM-DD branch, and merges that branch into main through a pull
-request. Exits 0 when main is already in sync.
+fresh sync/YYYY-MM-DD-HHMMSS branch, and merges that branch into main
+through a pull request. Exits 0 when main is already in sync.
 EOF
 }
 
@@ -84,32 +84,21 @@ if git merge-base --is-ancestor clean origin/main; then
 fi
 
 today="$(date +%F)"
-sync_branch="sync/$today"
+# A name no earlier run used. Re-creating an existing branch (delete, push,
+# then open the pull request a second later) makes GitHub refuse
+# createPullRequest until the delete has settled (#31).
+sync_branch="sync/$(date +%F-%H%M%S)"
 
-# An open pull request for today's branch means an earlier run is in flight.
-# A pull request from another fork does not count: its isCrossRepository is
-# true, and merging it would sync someone else's branch.
-open_prs="$(gh pr list --state open --head "$sync_branch" --json number,isCrossRepository \
-  --jq '[.[] | select(.isCrossRepository == false)] | length')" ||
+# An open sync pull request means an earlier run is in flight, or it stopped
+# and needs a hand. A pull request from another fork does not count: its
+# isCrossRepository is true, and merging it would sync someone else's branch.
+open_prs="$(gh pr list --state open --json headRefName,isCrossRepository \
+  --jq '[.[] | select(.isCrossRepository == false) | select(.headRefName | startswith("sync/"))] | length')" ||
   die "cannot list pull requests; is gh installed and authenticated?"
 if [[ "$open_prs" != "0" ]]; then
-  note "an open pull request for $sync_branch exists; nothing to do"
+  note "an open sync pull request exists; nothing to do"
   exit 0
 fi
-
-if git rev-parse --verify --quiet "refs/heads/$sync_branch" >/dev/null; then
-  git branch --delete --force "$sync_branch"
-fi
-
-# ls-remote exits 2 when the branch is absent, 0 when it is there, and
-# something else on a real failure.
-ls_status=0
-git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null 2>&1 || ls_status=$?
-case "$ls_status" in
-0) git push --quiet origin --delete "$sync_branch" ;;
-2) ;;
-*) die "cannot read the remote for $sync_branch (ls-remote exit $ls_status)" ;;
-esac
 
 git switch --quiet --create "$sync_branch" origin/main
 
@@ -157,6 +146,21 @@ pr_url="$(gh pr create --base main --head "$sync_branch" \
 # could name a pull request from another fork.
 gh pr merge "$pr_url" --merge --delete-branch ||
   die "cannot merge $pr_url; merge it by hand and delete $sync_branch"
+
+# Branches left by earlier runs that never opened a pull request: an open
+# sync pull request would have ended this run above, so every other sync
+# branch is stale. Delete them here, after the merge, never before the
+# create (#31).
+if ! stale="$(git ls-remote --heads origin 'refs/heads/sync/*')"; then
+  note "cannot list the sync branches; skipping the stale cleanup"
+else
+  while IFS=$'\t' read -r _sha ref; do
+    [[ -n "$ref" ]] || continue
+    name="${ref#refs/heads/}"
+    if [[ "$name" == "$sync_branch" ]]; then continue; fi
+    git push --quiet origin --delete "$name" || note "cannot delete the stale branch $name"
+  done <<<"$stale"
+fi
 
 git switch --quiet main
 if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then

@@ -95,12 +95,33 @@ case "$1 ${2:-}" in
 esac
 STUB
 chmod +x "$scratch/bin/gh"
+
+# The stub date: the sync names its branch from the clock, so the test fixes
+# the clock and knows each run's branch name before the run.
+cat >"$scratch/bin/date" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
++%F) echo "${STUB_DATE:-2026-10-13}" ;;
++%F-%H%M%S) echo "${STUB_DATE:-2026-10-13}-${STUB_TIME:-000000}" ;;
+*) exec /bin/date "$@" ;;
+esac
+STUB
+chmod +x "$scratch/bin/date"
+
 export PATH="$scratch/bin:$PATH"
 export GH_STUB_LOG="$scratch/gh.log"
 : >"$GH_STUB_LOG"
 
-today="$(date +%F)"
-sync_branch="sync/$today"
+export STUB_DATE="2026-10-13"
+sync_branch=""
+
+# Step the clock and set the branch name the next run will use. Each scenario
+# gets its own second, so every run cuts a fresh branch, as in production.
+at_time() {
+  export STUB_TIME="$1"
+  sync_branch="sync/$STUB_DATE-$1"
+}
 
 run_sync() { cd "$1" && "$script"; }
 
@@ -111,6 +132,7 @@ printf 'two\n' >>README.md
 git commit --quiet -am "upstream: readme two"
 git push --quiet origin main
 
+at_time 120001
 if run_sync "$fork"; then ok "sync 1 exits 0"; else bad "sync 1 must exit 0"; fi
 
 clean_sha="$(git --git-dir="$upstream" rev-parse main)"
@@ -129,36 +151,49 @@ if [[ "$parents" -eq 3 ]]; then ok "the sync branch carries a merge commit"; els
 if grep -q -- "pr create" "$GH_STUB_LOG" 2>/dev/null; then ok "the PR was opened"; else bad "gh pr create must run"; fi
 if grep -q -- "pr merge" "$GH_STUB_LOG"; then ok "the PR was merged"; else bad "gh pr merge must run"; fi
 
-# Scenario 2: a second sync on the same day. The branch exists, no PR is
-# open, so the script deletes it and cuts it again.
+# Scenario 2: a second sync on the same day. The run must cut a fresh branch
+# rather than delete and re-create one: a re-created branch cannot open its
+# pull request for the first seconds after the delete (#31).
 rm -f "$GH_STUB_LOG"
+first_branch="$sync_branch"
 cd "$seed"
 printf 'int two(void) { return 2; }\n' >src/engine.c
 git commit --quiet -am "upstream: engine two"
 git push --quiet origin main
-before="$(git --git-dir="$origin" rev-parse "$sync_branch")"
+at_time 120002
 if run_sync "$fork"; then ok "sync 2 exits 0"; else bad "sync 2 must exit 0"; fi
-after="$(git --git-dir="$origin" rev-parse "$sync_branch")"
-if [[ "$before" != "$after" ]]; then ok "the sync branch was cut again"; else bad "the branch must be cut again"; fi
+if [[ "$sync_branch" != "$first_branch" ]]; then
+  ok "the run cut a fresh branch"
+else
+  bad "the run must cut a fresh branch"
+fi
+if git --git-dir="$origin" rev-parse --verify --quiet "refs/heads/$sync_branch" >/dev/null; then
+  ok "the fresh branch is on origin"
+else
+  bad "the fresh branch must be on origin"
+fi
 if git -C "$fork" show "origin/$sync_branch:src/engine.c" | grep -q "two"; then
   ok "upstream's engine change arrived"
 else
   bad "the engine change must arrive"
 fi
 
-# Scenario 3: an open PR for the same head. The script must do nothing.
+# Scenario 3: an open sync PR. The script must do nothing.
 rm -f "$GH_STUB_LOG"
 cd "$seed"
 printf 'three\n' >>README.md
 git commit --quiet -am "upstream: readme three"
 git push --quiet origin main
 cd "$fork"
-before="$(git --git-dir="$origin" rev-parse "$sync_branch")"
+at_time 120003
 export GH_STUB_OPEN_PRS=1
 if run_sync "$fork"; then ok "sync 3 exits 0"; else bad "sync 3 must exit 0"; fi
 unset GH_STUB_OPEN_PRS
-after="$(git --git-dir="$origin" rev-parse "$sync_branch")"
-if [[ "$before" == "$after" ]]; then ok "nothing was pushed"; else bad "nothing must be pushed"; fi
+if git --git-dir="$origin" rev-parse --verify --quiet "refs/heads/$sync_branch" >/dev/null; then
+  bad "nothing must be pushed"
+else
+  ok "nothing was pushed"
+fi
 if grep -q "pr create" "$GH_STUB_LOG" 2>/dev/null; then bad "no PR must be opened"; else ok "no PR was opened"; fi
 
 # Scenario 4: a conflict on a file other than README.md. The script must
@@ -174,6 +209,7 @@ printf 'upstream edit\n' >src/engine.c
 git commit --quiet -am "upstream: engine edit"
 git push --quiet origin main
 cd "$fork"
+at_time 120004
 if run_sync "$fork" 2>"$scratch/conflict.err"; then
   bad "sync 4 must fail"
 else
@@ -209,6 +245,7 @@ git config "url.$upstream.insteadOf" "$canonical"
 git remote add upstream "$canonical"
 git fetch --quiet upstream
 git switch --quiet main
+at_time 120005
 if run_sync "$fresh"; then ok "sync 5 exits 0"; else bad "sync 5 must exit 0"; fi
 if git --git-dir="$origin" rev-parse --verify --quiet refs/heads/clean >/dev/null; then
   ok "clean was created and pushed"
@@ -221,6 +258,7 @@ fi
 # report that main is in sync.
 rm -f "$GH_STUB_LOG"
 cd "$fresh"
+at_time 120006
 if run_sync "$fresh"; then ok "sync 6 exits 0"; else bad "sync 6 must exit 0"; fi
 if grep -q "pr create" "$GH_STUB_LOG" 2>/dev/null; then ok "sync 6 opens a pull request"; else bad "sync 6 must open a pull request"; fi
 
@@ -232,14 +270,20 @@ git fetch --quiet origin
 git fetch --quiet upstream
 git merge --no-ff --no-commit clean >/dev/null 2>&1 || true
 git checkout clean -- README.md
-cat "$root/.fork/readme-header.md" README.md >README.md.new
-mv README.md.new README.md
+cat "$root/.fork/readme-header.md" README.md >README.new
+mv README.new README.md
 git add README.md
 git commit --quiet -m "fixture: main contains clean"
 git push --quiet origin main
 rm -f "$GH_STUB_LOG"
+at_time 120007
 if run_sync "$fork"; then ok "sync 7 exits 0"; else bad "sync 7 must exit 0"; fi
 if grep -q "pr create" "$GH_STUB_LOG" 2>/dev/null; then bad "sync 7 must not open a pull request"; else ok "sync 7 opens nothing"; fi
+if git --git-dir="$origin" rev-parse --verify --quiet "refs/heads/$sync_branch" >/dev/null; then
+  bad "sync 7 must not cut a branch"
+else
+  ok "sync 7 cuts no branch"
+fi
 
 # Scenario 8: gh cannot list pull requests. That is an error, not "a pull
 # request is open".
@@ -248,6 +292,7 @@ printf 'four\n' >>README.md
 git commit --quiet -am "upstream: readme four"
 git push --quiet origin main
 cd "$fresh"
+at_time 120008
 export GH_STUB_FAIL_PR_LIST=1
 if run_sync "$fresh" >/dev/null 2>&1; then
   bad "sync 8 must fail when gh pr list fails"
@@ -269,6 +314,7 @@ git commit --quiet -am "upstream: engine edit two"
 git push --quiet origin main
 cd "$fork"
 rm -f "$GH_STUB_LOG"
+at_time 120009
 export GH_STUB_FAIL_ISSUE_LIST=1
 if run_sync "$fork" >"$scratch/conflict2.out" 2>"$scratch/conflict2.err"; then
   bad "sync 9 must fail"
@@ -310,6 +356,7 @@ git commit --quiet -am "upstream: readme five"
 git push --quiet origin main
 cd "$fork"
 rm -f "$GH_STUB_LOG"
+at_time 120010
 export GH_STUB_FAIL_PR_MERGE=1
 if run_sync "$fork" 2>"$scratch/merge.err"; then
   bad "sync 10 must fail when the merge fails"
@@ -321,6 +368,27 @@ if grep -q "cannot merge" "$scratch/merge.err"; then
   ok "the failure names the recovery"
 else
   bad "the failure must name the recovery"
+fi
+
+# Scenario 11: branches left behind by earlier runs that never merged. The
+# next successful merge deletes every other sync branch, after the merge,
+# never before the create.
+cd "$fork"
+git switch --quiet main
+git --git-dir="$origin" update-ref refs/heads/sync/2020-01-01-000000 "$(git --git-dir="$origin" rev-parse main)"
+cd "$seed"
+printf 'six\n' >>README.md
+git commit --quiet -am "upstream: readme six"
+git push --quiet origin main
+cd "$fork"
+rm -f "$GH_STUB_LOG"
+at_time 120011
+if run_sync "$fork"; then ok "sync 11 exits 0"; else bad "sync 11 must exit 0"; fi
+remaining="$(git --git-dir="$origin" for-each-ref --format='%(refname:short)' 'refs/heads/sync/*')"
+if [[ "$remaining" == "$sync_branch" ]]; then
+  ok "only this run's sync branch remains"
+else
+  bad "the stale sync branches must be deleted, remaining: $remaining"
 fi
 
 if [[ "$fails" -gt 0 ]]; then
