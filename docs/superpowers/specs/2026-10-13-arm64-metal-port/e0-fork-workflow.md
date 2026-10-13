@@ -54,7 +54,9 @@ The script resolves `clean` in this order:
 
 1. The local branch `clean`, when it exists.
 2. `origin/clean`, which is what CI sees after a full checkout.
-3. Otherwise the script fails. The message names the fix: run `sync-upstream.sh` once to create `clean`.
+3. Otherwise the script creates `clean` from `upstream/main`.
+   This is the first run in a fresh clone.
+   Artifact 1 and sync step 2 say the same.
 
 The sync steps:
 
@@ -64,7 +66,8 @@ The sync steps:
 4. Fetch `origin/main`. Cut `sync/YYYY-MM-DD` from it.
    When an open PR with the same head exists, exit 0. The script says so.
    When the branch exists without an open PR, delete it and cut it again.
-5. Merge `clean` into the sync branch with `git merge clean`, no commit.
+5. Merge `clean` into the sync branch with `git merge --no-ff --no-commit clean`.
+   The `--no-ff` keeps the merge commit that the paragraph after the steps names.
    On a `README.md` conflict: take upstream's `README.md` with `git checkout clean -- README.md`, prepend `.fork/readme-header.md`, stage it.
    On any other conflict, do these:
    - Abort the merge.
@@ -86,10 +89,11 @@ One repo setting must change once, by hand or with `gh api`:
 
 ```
 PUT /repos/phaedrus1992/janas/actions/permissions/workflow
-{"default_workflow_permissions": "write"}
+{"default_workflow_permissions": "write", "can_approve_pull_request_reviews": true}
 ```
 
-The current value is `read`. With it, the sync workflow cannot push `clean`.
+The current value is `read` and pull request creation is off.
+With those values, the sync workflow cannot push `clean`, and `gh pr create` fails with the workflow token.
 
 ## 5. Guard mechanics
 
