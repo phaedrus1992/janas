@@ -14,6 +14,37 @@ permissions:
   pull-requests: write
 
 jobs:
+  pat-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.SYNC_TOKEN }}
+      - name: PAT checkout, app create and PAT create
+        env:
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git config user.name probe-bot
+          git config user.email probe-bot@users.noreply.github.com
+          mkhead() {
+            git switch --quiet --create "$1"
+            git commit --quiet --allow-empty -m "probe: $1"
+            git push --quiet origin "$1"
+            git switch --quiet -
+          }
+          try_pr() {
+            echo "=== $1 ($2) ==="
+            local out
+            out=$(GH_TOKEN="$3" gh pr create --base main --head "$1" \
+              --title "probe: $1" --body "Throwaway probe. Closing at once." 2>&1) \
+              && { echo "CREATED: $out"; GH_TOKEN="$3" gh pr close "${out##*/}" || true; return 0; } \
+              || { echo "REFUSED: $out"; return 1; }
+          }
+          suffix="${GITHUB_RUN_ID}-patck"
+          mkhead "probe2/patck-app-$suffix"
+          try_pr "probe2/patck-app-$suffix" "app create, PAT-pushed head" "${{ github.token }}" || true
+          mkhead "probe2/patck-pat-$suffix"
+          try_pr "probe2/patck-pat-$suffix" "PAT create, PAT-pushed head" "$PUSH_TOKEN" || true
   probe:
     runs-on: ubuntu-latest
     steps:
