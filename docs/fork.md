@@ -12,7 +12,12 @@ It adds:
 
 ## Status
 
-The design is approved.
+E0, the fork workflow, is built: `clean` mirrors `upstream/main`, the daily
+sync merges upstream into `main` through a pull request, and a pre-push hook
+keeps fork tooling off `port/*` branches. The hook tests are in
+`.fork/tests/`; run both by hand. Each clone installs the hook once with
+`./.fork/install-hooks.sh`.
+
 No port code exists yet.
 Each epic gets its own design session before work starts.
 
