@@ -85,7 +85,11 @@ size_t janas_gt_part_tok(const struct janas_gpu_tok *t,
 }
 
 /* A Gated DeltaNet layer (qwen3.5) on the block normalized in q256 / q32
-   and XNF: its output into YWO, as model_rec.c's janas_m_rec_layer. */
+   and XNF: its output into YWO, as model_rec.c's janas_m_rec_layer. The
+   tokens of the last call to replay first (the position buffer's word 3)
+   come from the layer's log, and the block's go to it (word 4): the
+   convolution and its norm take a + n rows, so their dispatches have room
+   for JANAS_GPU_TOK_MAX_REPLAY more. */
 int janas_gt_rec_gdn(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_gpu_tok_model *md,
                      const struct janas_gpu_tok_layer *ly, uint32_t l,
@@ -95,53 +99,102 @@ int janas_gt_rec_gdn(struct janas_gpu *g, struct janas_gpu_tok *t,
                     CONV = B + t->o_conv, BA = B + t->o_ba, ATT = B + t->o_att,
                     POS = B + t->o_pos;
     const size_t *pr = t->par + (size_t)l * PAR_N;
-    uint32_t cc = md->conv_ch;
+    uint32_t cc = md->conv_ch, rows = n + JANAS_GPU_TOK_MAX_REPLAY;
+    /* the layer's log: log_rows rows a layer (0 without one: never read
+       then, the position buffer replaying and logging nothing) */
+    size_t lr = (size_t)md->n_rec * md->log_rows;
+    VkDeviceAddress
+        LM = t->log_ok ? janas_gt_addr_of(g, md->log_mixed, lr * cc * 4) +
+                             (VkDeviceAddress)ly->slot * md->log_rows * cc * 4
+                       : 0,
+        LB = t->log_ok
+                 ? janas_gt_addr_of(g, md->log_beta, lr * md->nv * 4) +
+                       (VkDeviceAddress)ly->slot * md->log_rows * md->nv * 4
+                 : 0,
+        LD = t->log_ok
+                 ? janas_gt_addr_of(g, md->log_decay, lr * md->nv * 4) +
+                       (VkDeviceAddress)ly->slot * md->log_rows * md->nv * 4
+                 : 0,
+        BD = B + t->o_bd;
     /* q|k|v (the convolution's channels) and z */
     if (janas_gt_rec_product(g, t, bound, &ly->ssm_qkv, 0, MIX, n, cc) != 0 ||
         janas_gt_rec_product(g, t, bound, &ly->ssm_z, 0, Z, n, md->d_inner) !=
             0)
         return -1;
-    /* beta then alpha, per token, from the normalized input at f32 */
-    struct push_dm pd = {.rows = 2 * md->nv,
-                         .cols = md->dm,
-                         .nv = n,
-                         .ys = 2 * md->nv,
-                         .scale = 1.0f};
-    janas_g_push_addr(pd.w, B + pr[PAR_BA]);
-    janas_g_push_addr(pd.x, B + t->o_xnf);
-    janas_g_push_addr(pd.y, BA);
-    janas_gt_bind(g, bound, g->pipe_dm[0]);
-    janas_gt_push(g, &pd, sizeof(pd));
-    g->vkCmdDispatch(g->cb, (2 * md->nv + 63) / 64, (n + 63) / 64, 1);
+    janas_gt_stamp(g, t, PH_SSM_PROD);
+    /* the betas and decays, per token, from the normalized input at f32:
+       a short block a row a workgroup (gdn_ba.comp), a longer one in
+       dense_mm.comp's tiles, made betas and decays by gdn_act.comp; into
+       BD either way */
+    if (n <= GBA_MAX_N) {
+        struct push_gba pb = {
+            .rows = 2 * md->nv, .cols = md->dm, .n = n, .ys = 2 * md->nv};
+        janas_g_push_addr(pb.w, B + pr[PAR_BA]);
+        janas_g_push_addr(pb.x, B + t->o_xnf);
+        janas_g_push_addr(pb.y, BD);
+        janas_g_push_addr(pb.dt, B + pr[PAR_DT]);
+        janas_g_push_addr(pb.a, B + pr[PAR_A]);
+        janas_gt_bind(g, bound, t->p_gb);
+        janas_gt_push(g, &pb, sizeof(pb));
+        g->vkCmdDispatch(g->cb, (2 * md->nv + GBA_RW - 1) / GBA_RW, (n + 7) / 8,
+                         1);
+    } else {
+        struct push_dm pd = {.rows = 2 * md->nv,
+                             .cols = md->dm,
+                             .nv = n,
+                             .ys = 2 * md->nv,
+                             .scale = 1.0f};
+        janas_g_push_addr(pd.w, B + pr[PAR_BA]);
+        janas_g_push_addr(pd.x, B + t->o_xnf);
+        janas_g_push_addr(pd.y, BA);
+        janas_gt_bind(g, bound, g->pipe_dm[0]);
+        janas_gt_push(g, &pd, sizeof(pd));
+        g->vkCmdDispatch(g->cb, (2 * md->nv + 63) / 64, (n + 63) / 64, 1);
+        janas_g_compute_barrier(g);
+        struct push_gact px = {.nv = md->nv, .n = n};
+        janas_g_push_addr(px.ba, BA);
+        janas_g_push_addr(px.bd, BD);
+        janas_g_push_addr(px.dt, B + pr[PAR_DT]);
+        janas_g_push_addr(px.a, B + pr[PAR_A]);
+        janas_gt_bind(g, bound, t->p_gx);
+        janas_gt_push(g, &px, sizeof(px));
+        g->vkCmdDispatch(g->cb, (n * 2 * md->nv + 255) / 256, 1, 1);
+    }
     janas_g_compute_barrier(g);
+    janas_gt_stamp(g, t, PH_SSM_BA);
     /* the convolution, then the state it leaves, the q and k heads' norms */
     uint32_t hs_c = md->n_rec * (md->d_conv - 1) * cc,
              so_c = ly->slot * (md->d_conv - 1) * cc;
     VkDeviceAddress CS = janas_gt_addr_of(g, md->conv_state, (size_t)hs_c * 8);
-    struct push_gconv pc = {.cc = cc, .d = md->d_conv, .hs = hs_c, .so = so_c};
+    struct push_gconv pc = {
+        .cc = cc, .d = md->d_conv, .hs = hs_c, .so = so_c, .n = n};
     janas_g_push_addr(pc.mixed, MIX);
     janas_g_push_addr(pc.out, CONV);
     janas_g_push_addr(pc.w, B + pr[PAR_CONV]);
     janas_g_push_addr(pc.state, CS);
     janas_g_push_addr(pc.pos, POS);
+    janas_g_push_addr(pc.log, LM);
     janas_gt_bind(g, bound, t->p_gc);
     janas_gt_push(g, &pc, sizeof(pc));
-    g->vkCmdDispatch(g->cb, cc / 256, n, 1);
+    g->vkCmdDispatch(g->cb, cc / 256, rows, 1);
     janas_g_compute_barrier(g);
     struct push_gcst ps = {
         .cc = cc, .d = md->d_conv, .hs = hs_c, .so = so_c, .n = n};
     janas_g_push_addr(ps.mixed, MIX);
     janas_g_push_addr(ps.state, CS);
     janas_g_push_addr(ps.pos, POS);
+    janas_g_push_addr(ps.log, LM);
     janas_gt_bind(g, bound, t->p_gs);
     janas_gt_push(g, &ps, sizeof(ps));
     g->vkCmdDispatch(g->cb, cc / 256, 1, 1);
-    struct push_gl2 pl = {.cc = cc, .eps = md->eps};
+    struct push_gl2 pl = {.cc = cc, .eps = md->eps, .n = n};
     janas_g_push_addr(pl.x, CONV);
+    janas_g_push_addr(pl.pos, POS);
     janas_gt_bind(g, bound, t->p_gl);
     janas_gt_push(g, &pl, sizeof(pl));
-    g->vkCmdDispatch(g->cb, 2 * md->nkh, n, 1);
+    g->vkCmdDispatch(g->cb, 2 * md->nkh, rows, 1);
     janas_g_compute_barrier(g);
+    janas_gt_stamp(g, t, PH_SSM_CONV);
     /* the recurrence, then each head's norm, gate and quantization */
     uint32_t hs_s = md->n_rec * md->nv * md->ds * md->ds,
              so_s = ly->slot * md->nv * md->ds * md->ds;
@@ -154,30 +207,37 @@ int janas_gt_rec_gdn(struct janas_gpu *g, struct janas_gpu_tok *t,
                            .vmap_mod = (uint32_t)md->vmap_mod,
                            .scale = 1.0f / sqrtf((float)md->ds)};
     janas_g_push_addr(pg.co, CONV);
-    janas_g_push_addr(pg.ba, BA);
     janas_g_push_addr(pg.att, ATT);
     janas_g_push_addr(pg.state,
                       janas_gt_addr_of(g, md->ssm_state, (size_t)hs_s * 4));
     janas_g_push_addr(pg.pos, POS);
-    janas_g_push_addr(pg.dt, B + pr[PAR_DT]);
-    janas_g_push_addr(pg.a, B + pr[PAR_A]);
+    janas_g_push_addr(pg.lb, LB);
+    janas_g_push_addr(pg.ld, LD);
+    janas_g_push_addr(pg.bd, BD);
     janas_gt_bind(g, bound, t->p_gr);
     janas_gt_push(g, &pg, sizeof(pg));
     g->vkCmdDispatch(g->cb, md->nv * (md->ds / 16), 1, 1);
     janas_g_compute_barrier(g);
-    struct push_ggate pq = {.d = md->d_inner, .eps = md->eps};
+    janas_gt_stamp(g, t, PH_SSM_REC);
+    struct push_ggate pq = {.d = md->d_inner, .nv = md->nv, .eps = md->eps};
     janas_g_push_addr(pq.att, ATT);
     janas_g_push_addr(pq.z, Z);
     janas_g_push_addr(pq.w, B + pr[PAR_NORM]);
     janas_g_push_addr(pq.q256, B + t->o_q256);
     janas_g_push_addr(pq.q32, B + t->o_q32);
+    janas_g_push_addr(pq.bd, BD);
+    janas_g_push_addr(pq.lb, LB);
+    janas_g_push_addr(pq.ld, LD);
+    janas_g_push_addr(pq.pos, POS);
     janas_gt_bind(g, bound, t->p_gg);
     janas_gt_push(g, &pq, sizeof(pq));
     g->vkCmdDispatch(g->cb, md->d_inner / JANAS_QK, n, 1);
     janas_g_compute_barrier(g);
+    janas_gt_stamp(g, t, PH_SSM_GATE);
     if (janas_gt_rec_product(g, t, bound, &ly->ssm_out, 0, YWO, n, 0) != 0)
         return -1;
     janas_g_compute_barrier(g);
+    janas_gt_stamp(g, t, PH_WO);
     return 0;
 }
 
@@ -309,8 +369,9 @@ static void rec_quant(struct janas_gpu *g, struct janas_gpu_tok *t,
 /* A feed-forward on the block normalized in q256: gate and up (the n
    tokens' gates, then their ups), SiLU(gate) up quantized, down into out
    (a dense layer's, or a mixture's shared expert). A down matrix in blocks
-   of 32 (a shared expert's Q8_0) takes the activation as floats quantized
-   into both layouts, the experts' shader making only the one of 256. */
+   of 32 (a shared expert's Q8_0, a dense layer's IQ4_NL) takes the
+   activation as floats quantized into both layouts, the activation's
+   shader making only the one of 256. */
 int janas_gt_rec_ffn(struct janas_gpu *g, struct janas_gpu_tok *t,
                      VkPipeline *bound, const struct janas_matvec_task *gate,
                      const struct janas_matvec_task *up,

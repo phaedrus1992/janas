@@ -6,6 +6,10 @@
 // normalized by its RMS and the weights w (ds), times SiLU(z), then
 // quantized to Q8_K as norm_quant.comp does (q256, and q32 if set). A
 // workgroup per block of 256 (two heads) and token (y), a number a thread.
+// The first workgroup of each token also logs the token's beta and decay of
+// each head as gdn_rec.comp used them (bd: 2 nv a token) into lb and ld
+// (the layer's log, nv a row) at row (the position buffer's word 4) + y,
+// where that word is not all ones.
 #extension GL_EXT_buffer_reference : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -16,9 +20,11 @@ layout(local_size_x = 256) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
 
 // att, z: n rows of d floats; w: ds floats
-layout(push_constant) uniform P { uvec2 att, z, w, q256, q32; uint d; float eps; } p;
+layout(push_constant) uniform P { uvec2 att, z, w, q256, q32, bd, lb, ld, pos; uint d, nv; float eps; } p;
 
 shared float sq_[256];
 shared float hs_[2];
@@ -46,6 +52,12 @@ void main()
 {
     uint t = gl_LocalInvocationID.x, b = gl_WorkGroupID.x, j = gl_WorkGroupID.y;
     uint e = 256u * b + t, o = j * p.d + e;
+    uint lrow = RP(p.pos).v[4];
+    if (b == 0u && t < p.nv && lrow != 0xffffffffu) {
+        F BD = F(p.bd);
+        W(p.lb).v[(lrow + j) * p.nv + t] = BD.v[j * 2u * p.nv + t];
+        W(p.ld).v[(lrow + j) * p.nv + t] = BD.v[j * 2u * p.nv + p.nv + t];
+    }
     U Q = U(p.q256), Q32 = U(p.q32);
     float a = F(p.att).v[o];
     sq_[t] = a * a;

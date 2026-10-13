@@ -7,11 +7,18 @@
 // (key head g), v and the head's beta and decay -
 //   x = M[r] decay, sk = x . k, d = (v[r] - sk) beta, y = x + d k,
 //   out[r] = (y . q) scale, M[r] = y at sixteen bits.
-// beta = sigmoid(b), decay = exp(softplus(a + dt[h]) A[h]) from the raw b
-// and a (ba: per token, the nv b then the nv a). The row stays in registers
-// for the whole block: eight threads a row, sixteen numbers each, sixteen
-// rows a workgroup. The state is read from the half the position buffer's
-// word 1 names and written to the one its word 2 does.
+// The row stays in registers for the whole block: eight threads a row,
+// sixteen numbers each (their q and k read four at a time), sixteen rows a
+// workgroup. The state is read from the half the position buffer's word 1
+// names and written to the one its word 2 does.
+// A call that starts before the end of the last one first replays the a
+// tokens of it that were kept (the position buffer's word 3): their rows of
+// the convolution come first, their beta and decay from the log (lb, ld:
+// the layer's, nv a row), their outputs are not wanted, and the state after
+// them goes back into the half it was read from (the base: a call that
+// replays starts from it); then the call's n tokens, their beta and decay
+// from bd (gdn_ba.comp or gdn_act.comp: per token the nv betas, then the nv
+// decays).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_control_flow_attributes : require
@@ -21,15 +28,17 @@
 layout(local_size_x = 128) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer R4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
 
-// co: n rows of cc (q heads, k heads at kd, v at 2 kd); ba: n rows of 2 nv;
+// co: a + n rows of cc (q heads, k heads at kd, v at 2 kd), on 16 bytes;
 // att: n rows of nv ds; state: two halves of hs sixteen-bit numbers, this
-// layer's nv ds ds at so; dt, A: nv floats
+// layer's nv ds ds at so; lb, ld: the log's betas and decays, nv a row; bd:
+// n rows of 2 nv
 layout(push_constant) uniform P {
-    uvec2 co, ba, att, state, pos, dt, a;
+    uvec2 co, att, state, pos, lb, ld, bd;
     uint cc, nv, nkh, n, hs, so, vmap_mod;
     float scale;
 } p;
@@ -39,7 +48,8 @@ void main()
     uint t = gl_LocalInvocationID.x, lane = t % 8u, rl = t / 8u;
     uint h = gl_WorkGroupID.x / 8u, r = (gl_WorkGroupID.x % 8u) * 16u + rl;
     uint kd = p.nkh * 128u, g = p.vmap_mod != 0u ? h % p.nkh : h / (p.nv / p.nkh);
-    R CO = R(p.co), BA = R(p.ba);
+    R CO = R(p.co);
+    R4 CO4 = R4(p.co);
     W O = W(p.att);
     U S = U(p.state);
     RP PS = RP(p.pos);
@@ -53,29 +63,43 @@ void main()
         x[2u * i] = f.x;
         x[2u * i + 1u] = f.y;
     }
-    float dtv = R(p.dt).v[h], av = R(p.a).v[h];
-    for (uint j = 0; j < p.n; j++) {
-        float b = BA.v[j * 2u * p.nv + h], al = BA.v[j * 2u * p.nv + p.nv + h] + dtv;
-        float beta = 1.0 / (1.0 + exp(-b));
-        float sp = al > 20.0 ? al : log(1.0 + exp(al));
-        float dec = exp(sp * av);
-        uint qo = j * p.cc + g * 128u + e0, ko = qo + kd;
+    uint ar = PS.v[3]; /* the tokens replayed */
+    for (uint j = 0; j < ar + p.n; j++) {
+        float beta, dec;
+        if (j < ar) {
+            beta = R(p.lb).v[j * p.nv + h];
+            dec = R(p.ld).v[j * p.nv + h];
+        } else {
+            uint jn = (j - ar) * 2u * p.nv + h;
+            beta = R(p.bd).v[jn];
+            dec = R(p.bd).v[jn + p.nv];
+        }
+        /* the token's q and k, sixteen numbers each, a vec4 at a time */
+        uint qo = (j * p.cc + g * 128u + e0) / 4u, ko = qo + kd / 4u;
+        vec4 kv[4], qv[4];
+        [[unroll]] for (uint m = 0; m < 4u; m++) {
+            kv[m] = CO4.v[ko + m];
+            qv[m] = CO4.v[qo + m];
+        }
         float sk = 0.0;
         [[unroll]] for (uint i = 0; i < 16u; i++) {
             x[i] *= dec;
-            sk = fma(x[i], CO.v[ko + i], sk);
+            sk = fma(x[i], kv[i / 4u][i % 4u], sk);
         }
         sk = subgroupClusteredAdd(sk, 8u);
         float d = (CO.v[j * p.cc + 2u * kd + h * 128u + r] - sk) * beta;
         float sq = 0.0;
         [[unroll]] for (uint i = 0; i < 16u; i++) {
-            float y = fma(d, CO.v[ko + i], x[i]);
-            sq = fma(y, CO.v[qo + i], sq);
+            float y = fma(d, kv[i / 4u][i % 4u], x[i]);
+            sq = fma(y, qv[i / 4u][i % 4u], sq);
             x[i] = unpackHalf2x16(packHalf2x16(vec2(y, 0.0))).x;
         }
         sq = subgroupClusteredAdd(sq, 8u);
-        if (lane == 0u)
-            O.v[j * p.nv * 128u + h * 128u + r] = sq * p.scale;
+        if (lane == 0u && j >= ar)
+            O.v[(j - ar) * p.nv * 128u + h * 128u + r] = sq * p.scale;
+        if (j + 1u == ar) /* the base, past the replayed tokens: in place */
+            [[unroll]] for (uint i = 0; i < 8u; i++)
+                S.v[src + i] = packHalf2x16(vec2(x[2u * i], x[2u * i + 1u]));
     }
     [[unroll]] for (uint i = 0; i < 8u; i++)
         S.v[dst + i] = packHalf2x16(vec2(x[2u * i], x[2u * i + 1u]));

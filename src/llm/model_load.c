@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "model.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -698,8 +699,11 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             (m->resident = janas_gpu_alloc(m->gpu, m->j.h.resident_bytes)))
             m->resident_gpu = 1;
     }
+    /* on 2 MB boundaries: see janas_m_huge_pages */
     if (!m->resident)
-        m->resident = aligned_alloc(4096, m->j.h.resident_bytes);
+        m->resident = aligned_alloc(
+            JANAS_HUGE_PAGE, (m->j.h.resident_bytes + JANAS_HUGE_PAGE - 1) /
+                                 JANAS_HUGE_PAGE * JANAS_HUGE_PAGE);
     if (!m->resident) {
         snprintf(err, err_len, "out of memory for the resident region");
         goto fail;
@@ -1037,10 +1041,14 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         m->conv_out = malloc(R * m->conv_ch * sizeof(float));
         m->beta = malloc(R * m->n_vh * sizeof(float));
         m->decay = malloc(R * m->n_vh * sizeof(float));
+        /* the log too, which the GPU writes for a chain of drafts it
+           verifies and reads back to replay the tokens kept */
         m->log_mixed =
-            malloc((size_t)m->n_rec * L * m->conv_ch * sizeof(float));
-        m->log_beta = malloc((size_t)m->n_rec * L * m->n_vh * sizeof(float));
-        m->log_decay = malloc((size_t)m->n_rec * L * m->n_vh * sizeof(float));
+            out_alloc(m, (size_t)m->n_rec * L * m->conv_ch * sizeof(float));
+        m->log_beta =
+            out_alloc(m, (size_t)m->n_rec * L * m->n_vh * sizeof(float));
+        m->log_decay =
+            out_alloc(m, (size_t)m->n_rec * L * m->n_vh * sizeof(float));
         if (!m->ssm_buf || !m->conv_buf || !m->ba || !m->mixed ||
             !m->conv_out || !m->beta || !m->decay || !m->log_mixed ||
             !m->log_beta || !m->log_decay) {
@@ -1188,8 +1196,9 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
            flushed out of the CPU's caches before the GPU reads it */
         if (m->resident_gpu)
             janas_gpu_flush(m->gpu, m->resident, m->j.h.resident_bytes);
-        else if (janas_m_gpu_import(m, m->resident, m->j.h.resident_bytes, 0) !=
-                 0)
+        else if (janas_m_huge_pages(m->resident, m->j.h.resident_bytes),
+                 janas_m_gpu_import(m, m->resident, m->j.h.resident_bytes, 0) !=
+                     0)
             m->gpu_off = 1;
         if (m->mtp_res && janas_gpu_import(m->gpu, m->mtp_res,
                                            m->mtp_j.h.resident_bytes) != 0)
@@ -1197,9 +1206,14 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         /* the products' outputs too, so that the GPU writes them where the
            engine reads them: through a staging buffer they cost a copy on
            one thread, 0.4-2.8 ms a block of a layer on Qwen3-4B (9 Oct
-           2026). One that cannot be shared keeps the copy. */
-        for (int i = 0; i < m->n_out; i++)
-            janas_gpu_import(m->gpu, m->out[i].p, m->out[i].bytes);
+           2026). One that cannot be shared keeps the copy. Only where the
+           GPU shares the host's memory: on a card with memory of its own an
+           import is a copy there, which the GPU's writes never left - the
+           CPU read stale outputs, a Quadro RTX 5000 garbled its answers
+           (issue #17) */
+        if (janas_gpu_shares_host(m->gpu))
+            for (int i = 0; i < m->n_out; i++)
+                janas_gpu_import(m->gpu, m->out[i].p, m->out[i].bytes);
     }
     janas_m_init_tuner(m);
     return m;
@@ -1438,6 +1452,52 @@ uint64_t janas_llm_model_warm(const struct janas_llm_model *m, double *seconds)
    begins, so that no tensor straddles two and each stays in reach */
 #define GPU_REGION_MAX ((uint64_t)4 << 30)
 
+/*
+ * Memory the GPU imports, collapsed into huge pages first: the GPU's own
+ * page tables map it in 2 MB pages only where it is on them and the region
+ * starts on a 2 MB boundary, and it reads such memory a fifth faster than
+ * memory in 4 KB pages - 71.6 GB/s against 59.6 on the development laptop,
+ * where the CPU reads both alike (13 Oct 2026; memory the kernel had already
+ * put on huge pages, but not from a 2 MB boundary, read as 4 KB pages). A
+ * request, collapsed once, before the import pins the pages; nothing is
+ * asked of the kernel while the model answers (see expert_cache.c on huge
+ * pages asked for on first touch). JANAS_GPU_HUGE=0: not asked.
+ */
+void janas_m_huge_pages(void *p, uint64_t bytes)
+{
+#if defined(__linux__)
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+    const char *e = getenv("JANAS_GPU_HUGE");
+    if (e && atoi(e) == 0)
+        return;
+    uintptr_t a = ((uintptr_t)p + JANAS_HUGE_PAGE - 1) &
+                  ~(uintptr_t)(JANAS_HUGE_PAGE - 1);
+    uintptr_t end = ((uintptr_t)p + bytes) & ~(uintptr_t)(JANAS_HUGE_PAGE - 1);
+    /* in pieces: the kernel refuses a range holding pages never written
+       (a cache's slots not yet loaded), and the pieces already on huge
+       pages cost nothing */
+    const uintptr_t piece = (uintptr_t)32 << 20;
+    size_t done = 0, tried = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (uintptr_t at = a; at < end; at += piece, tried++) {
+        uintptr_t to = at + piece < end ? at + piece : end;
+        done += madvise((void *)at, to - at, MADV_COLLAPSE) == 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (getenv("JANAS_GPU_VERBOSE") && tried)
+        fprintf(stderr,
+                "huge pages: %.2f GB, %zu of %zu pieces collapsed in %.2f s\n",
+                (end - a) / 1e9, done, tried,
+                (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec));
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
 static uint64_t resident_cut(const struct janas_llm_model *m, uint64_t from)
 {
     uint64_t base = m->j.h.resident_offset, best = from;
@@ -1462,10 +1522,16 @@ int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
             end = resident_cut(m, at);
         if (end > bytes)
             end = bytes;
-        /* the regions are whole pages: the last one's length rounded up
-           (the allocations are) */
-        uint64_t len = (end - at + 4095) & ~(uint64_t)4095;
-        if (janas_gpu_import(m->gpu, p + at, len) != 0)
+        /* each region from a 2 MB boundary (the memory is allocated on
+           one), overlapping the one before by what it takes: the GPU maps
+           only such regions in huge pages (janas_m_huge_pages); whole
+           pages, the last one's length rounded up (the allocations are) */
+        uint64_t from = at;
+        if (((uintptr_t)p & (JANAS_HUGE_PAGE - 1)) == 0 &&
+            !(getenv("JANAS_GPU_HUGE") && atoi(getenv("JANAS_GPU_HUGE")) == 0))
+            from = at / JANAS_HUGE_PAGE * JANAS_HUGE_PAGE;
+        uint64_t len = (end - from + 4095) & ~(uint64_t)4095;
+        if (janas_gpu_import(m->gpu, p + from, len) != 0)
             return -1;
         at = end;
     }
@@ -1567,7 +1633,8 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
         if (getenv("JANAS_GPU_VERBOSE"))
             fprintf(stderr, "arena: %.1f GB in the GPU driver's memory%s\n",
                     bytes / 1e9, in_place ? " (in place)" : "");
-    } else if (janas_m_gpu_import(m, a, bytes, slot) == 0) {
+    } else if (janas_m_huge_pages((void *)a, bytes),
+               janas_m_gpu_import(m, a, bytes, slot) == 0) {
         m->arena_gpu = 1;
         m->arena_loads = loads;
         m->arena_in_place = in_place;

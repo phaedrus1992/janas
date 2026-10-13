@@ -10,18 +10,27 @@
  * to convert their scale through a function call (6 Oct 2026).
  *
  * Usage: bench_kernels [MiB [threads [first_cpu]]]
+ * BENCH_MEM=driver puts the weights in memory allocated by the GPU's driver
+ * (the memory a GPU sharing the host's reads fastest), BENCH_MEM=huge2m in
+ * ordinary memory aligned to 2 MB and collapsed into huge pages: the CPU's
+ * speed on each, against malloc's (13 Oct 2026).
  * Defaults: 256 MiB of weights per type, 12 threads on CPUs 0-11; the
  * single core is first_cpu (default 2).
  * The weights are random bytes below 0x7c, so that every fp16 scale is a
  * finite number; the speed of a kernel does not depend on the values.
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <time.h>
 
 #include "common/pool.h"
 #include "llm/matvec.h"
+#include "llm/gpu.h"
 #include "llm/quant.h"
 
 static double now(void)
@@ -29,6 +38,25 @@ static double now(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+
+/* where the weights go (BENCH_MEM): malloc, the GPU driver, 2 MB pages */
+static struct janas_gpu *gpu;
+static int mem_kind; /* 0 malloc, 1 driver, 2 huge2m */
+
+static unsigned char *weights(size_t bytes)
+{
+    if (mem_kind == 1)
+        return janas_gpu_alloc(gpu, bytes);
+    if (mem_kind == 2) {
+        size_t al = (size_t)2 << 20;
+        return aligned_alloc(al, (bytes + al - 1) / al * al);
+    }
+    return malloc(bytes);
 }
 
 static const struct {
@@ -65,6 +93,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: bench_kernels [MiB [threads [first_cpu]]]\n");
         return 2;
     }
+    const char *bm = getenv("BENCH_MEM");
+    mem_kind = !bm                     ? 0
+               : !strcmp(bm, "driver") ? 1
+               : !strcmp(bm, "huge2m") ? 2
+                                       : 0;
+    if (mem_kind == 1) {
+        char err[200];
+        gpu = janas_gpu_create(err, sizeof err);
+        if (!gpu) {
+            fprintf(stderr, "bench_kernels: no GPU: %s\n", err);
+            return 1;
+        }
+    }
     int cpus[256];
     for (int i = 0; i < nt; i++)
         cpus[i] = i;
@@ -83,14 +124,17 @@ int main(int argc, char **argv)
     for (int k = 0; k < 8; k++)
         janas_q8k_quantize(v + k * cols, x + k * nb, cols);
     printf("GB/s of weights, %zu MiB a type, 2048 columns; 1 core (CPU %d) "
-           "and %d threads\n",
-           mib, one, nt);
+           "and %d threads; weights in %s\n",
+           mib, one, nt,
+           mem_kind == 1   ? "the GPU driver's memory"
+           : mem_kind == 2 ? "2 MB pages"
+                           : "malloc's memory");
     printf("%-7s %8s %8s %8s %8s | %8s %8s %8s %8s\n", "type", "1x1", "1x2",
            "1x4", "1x8", "Nx1", "Nx2", "Nx4", "Nx8");
     for (size_t k = 0; k < sizeof TYPES / sizeof *TYPES; k++) {
         size_t bs = janas_qtype_block_size(TYPES[k].type);
         size_t rows = (mib << 20) / (nb * bs), bytes = rows * nb * bs;
-        unsigned char *w = malloc(bytes);
+        unsigned char *w = weights(bytes);
         float *y = malloc(8 * rows * sizeof(float));
         if (!w || !y) {
             fprintf(stderr, "bench_kernels: out of memory\n");
@@ -98,6 +142,10 @@ int main(int argc, char **argv)
         }
         for (size_t i = 0; i < bytes; i++)
             w[i] = (unsigned char)(rand() % 0x7c);
+#if defined(__linux__)
+        if (mem_kind == 2)
+            madvise(w, bytes, MADV_COLLAPSE);
+#endif
         printf("%-7s", TYPES[k].name);
         for (int p = 0; p < 2; p++) {
             for (size_t i = 0; i < 4; i++) {
@@ -116,12 +164,14 @@ int main(int argc, char **argv)
             printf(p ? "\n" : " |");
         }
         fflush(stdout);
-        free(w);
+        if (mem_kind != 1)
+            free(w); /* the driver's goes with the GPU */
         free(y);
     }
     free(x);
     free(v);
     janas_pool_destroy(single);
     janas_pool_destroy(many);
+    janas_gpu_destroy(gpu);
     return 0;
 }

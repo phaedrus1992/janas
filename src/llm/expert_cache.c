@@ -477,8 +477,12 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
     c->head = c->tail = NONE;
 
     c->fd = janas_reopen_read(j->fd, 1);
-    size_t arena_bytes = n_slots * slot_bytes + JANAS_ARENA_GUARD;
-    c->arena = aligned_alloc(JANAS_JNS_ALIGN, arena_bytes);
+    /* on 2 MB boundaries, for a GPU that imports it (model_load.c
+       janas_m_huge_pages) */
+    size_t arena_bytes =
+        (n_slots * slot_bytes + JANAS_ARENA_GUARD + JANAS_HUGE_PAGE - 1) /
+        JANAS_HUGE_PAGE * JANAS_HUGE_PAGE;
+    c->arena = aligned_alloc(JANAS_HUGE_PAGE, arena_bytes);
     c->where = malloc(n_keys * sizeof(int32_t));
     c->key = malloc(n_slots * sizeof(int64_t));
     c->prev = malloc(n_slots * sizeof(int32_t));

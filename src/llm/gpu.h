@@ -141,5 +141,15 @@ unsigned janas_gpu_subgroup(const struct janas_gpu *g);
    discrete GPU (single tokens too), 2 on an integrated one;
    JANAS_GPU_MIN_N sets it. */
 size_t janas_gpu_min_n(const struct janas_gpu *g);
+/* The most vectors the shaders with the lanes on the vectors take
+   (*_mvd.comp: subgroups of 8 lanes, JANAS_GPU_MVD=0 leaves them out),
+   beyond which a product goes to the slower shaders of many vectors: 8,
+   or 0 without them. */
+size_t janas_gpu_few_max(const struct janas_gpu *g);
+/* Whether the GPU reads and writes the host's memory in place (an
+   integrated GPU with the host-memory import, not JANAS_GPU_COPY): what the
+   whole token needs, and what makes the engine's buffers worth importing.
+   On a card with memory of its own an import is a copy. */
+int janas_gpu_shares_host(const struct janas_gpu *g);
 
 #endif

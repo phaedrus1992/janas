@@ -33,22 +33,34 @@ int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
 int dp4(uvec4 a, uvec4 b) { return dp(a.x, b.x) + dp(a.y, b.y) + dp(a.z, b.z) + dp(a.w, b.w); }
 uvec4 bc(uvec4 xr[NX], uint k) { return subgroupBroadcast(xr[k / SG], k % SG); }
 
+/* The table in the workgroup's shared memory: a constant array read at a
+   varying index is far slower on some GPUs (on the development laptop's,
+   IQ4_XS on 8 vectors 3.73 -> 2.67 ms; a table of 256 entries, both
+   nibbles of a byte in one read, was slower again: 2.98, 12 Oct 2026). */
+shared uint T[16];
+
 /* each byte of w (a nibble) through the IQ4_NL table */
 uint iq4(uint w)
 {
-    return (uint(IQ4[w & 15u]) & 0xffu) | ((uint(IQ4[(w >> 8) & 15u]) & 0xffu) << 8) |
-           ((uint(IQ4[(w >> 16) & 15u]) & 0xffu) << 16) |
-           ((uint(IQ4[(w >> 24) & 15u]) & 0xffu) << 24);
+    return T[w & 15u] | (T[(w >> 8) & 15u] << 8) | (T[(w >> 16) & 15u] << 16) |
+           (T[(w >> 24) & 15u] << 24);
 }
 
 void main()
 {
+    if (gl_LocalInvocationID.x < 16u)
+        T[gl_LocalInvocationID.x] = uint(IQ4[gl_LocalInvocationID.x]) & 0xffu;
+    barrier();
     U1 W = U1(p.w);
     U4 X = U4(p.x);
     F Y = F(p.y);
     uint lane = gl_SubgroupInvocationID;
-    uint row = min(gl_GlobalInvocationID.x, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.y * NV;
+    /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
+       of the same rows go out together and the weights the first reads
+       from memory the others find in the L3 */
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
@@ -85,7 +97,7 @@ void main()
             xo[v] += 20u;
         }
     }
-    if (gl_GlobalInvocationID.x < p.rows)
+    if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
             if (v0 + v < p.nv)
                 Y.v[(v0 + v) * p.ys + row] = acc[v];

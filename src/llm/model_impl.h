@@ -269,11 +269,12 @@ struct janas_llm_model {
        is left out, not read (see skip_misses); 0: never. And how many were */
     float miss_skip;
     uint64_t skip_asked, skip_left;
-    /* the products' output buffers, whole pages, shared with the GPU */
+    /* the products' output buffers and the recurrent state and log, whole
+       pages, shared with the GPU */
     struct janas_out_buf {
         float *p;
         size_t bytes;
-    } out[16];
+    } out[24];
     int n_out;
     int warm_use;        /* preload the most used experts, and count them */
     uint32_t *use_count; /* experts used this session, n_layer * n_expert */
@@ -381,9 +382,14 @@ struct tok_job {
 };
 
 void janas_m_init_tuner(struct janas_llm_model *m);
+/* Memory the GPU will import collapsed into 2 MB pages (Linux; see
+   model_load.c), before the import pins it. */
+void janas_m_huge_pages(void *p, uint64_t bytes);
 int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
                        uint64_t bytes, uint64_t unit);
 void janas_m_arena_to_gpu(struct janas_llm_model *m);
+/* A block on the GPU whole (model_gpu.c): 0; -1, the CPU to run it; -2,
+   the GPU failed after replaying on the base in place, the state lost. */
 int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits);
 void janas_m_apply_candidate(struct janas_llm_model *m, int cand);

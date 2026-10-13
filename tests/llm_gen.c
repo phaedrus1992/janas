@@ -66,6 +66,37 @@ static void report(const char *name, const struct janas_gen_stats *s)
     printf("\n");
 }
 
+/* By position in the chain: how often the draft there was accepted, of all
+   verified there and of those whose predecessor was accepted; and by the
+   tokens in a pass, its mean time against a pass of one in the run without
+   drafts (plain). */
+static void report_chain(const struct janas_gen_stats *s,
+                         const struct janas_gen_stats *plain)
+{
+    if (!s->pos_tried[0])
+        return;
+    printf("chain, position: accepted/verified (%%, %% given the one "
+           "before):");
+    for (int i = 0; i < JANAS_GEN_MAX_K && s->pos_tried[i]; i++) {
+        uint32_t before = i ? s->pos_won[i - 1] : s->pos_tried[0];
+        printf(" %d: %u/%u (%.0f%%, %.0f%%)", i + 1, s->pos_won[i],
+               s->pos_tried[i], 100.0 * s->pos_won[i] / s->pos_tried[i],
+               before ? 100.0 * s->pos_won[i] / before : 0.0);
+    }
+    printf("\n");
+    double one = plain->pass_count[1]
+                     ? plain->pass_seconds[1] / plain->pass_count[1]
+                     : 0;
+    printf("pass, tokens: passes, ms (x a pass of one):");
+    for (int n = 1; n < JANAS_GEN_MAX_K + 2; n++)
+        if (s->pass_count[n]) {
+            double t = s->pass_seconds[n] / s->pass_count[n];
+            printf(" %d: %u, %.1f (%.2f)", n, s->pass_count[n], t * 1e3,
+                   one > 0 ? t / one : 0.0);
+        }
+    printf("\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 6) {
@@ -214,8 +245,8 @@ int main(int argc, char **argv)
         printf(" %d", a[i]);
     printf("\n");
     printf("first tokens:");
-    for (int i = 0; i < 12 && i < na; i++)
-        printf(" %d", a[i]);
+    for (int i = 0; i < 12 && i < nb; i++)
+        printf(" %d", b[i]);
     printf("\n");
     report("normal", &sa);
     report(draft     ? "draft"
@@ -223,11 +254,19 @@ int main(int argc, char **argv)
                      : (on.spec_auto ? "lookup+a" : "lookup"),
            &sb);
     report_calibration(&sb);
+    report_chain(&sb, &sa);
     int same = na == nb && memcmp(a, b, (size_t)na * sizeof(int32_t)) == 0;
-    printf("tokens identical: %s (%d and %d); speed-up %.2fx\n",
-           same ? "yes" : "NO", na, nb,
-           (sb.new_tokens / sb.decode_seconds) /
-               (sa.new_tokens / sa.decode_seconds));
+    /* where they part: on the CPU the drafts never change the text, on
+       the GPU its sums in another order may (its quality is measured
+       against a reference instead, llm_eval) */
+    int first = 0;
+    while (first < na && first < nb && a[first] == b[first])
+        first++;
+    printf("tokens identical: %s (%d and %d", same ? "yes" : "NO", na, nb);
+    if (!same)
+        printf(", the first difference at token %d", first);
+    printf("); speed-up %.2fx\n", (sb.new_tokens / sb.decode_seconds) /
+                                      (sa.new_tokens / sa.decode_seconds));
     free(a);
     free(b);
     char tune[512];

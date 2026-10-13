@@ -1,0 +1,76 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// A Gated DeltaNet layer's beta and decay for a short block (a chain of
+// drafts): the dot product of row r of w (f32, 2 nv x cols: the nv betas'
+// rows, then the nv alphas') with token t's normalized input x (cols
+// floats), then for a beta's row sigmoid of it, for an alpha's
+// exp(softplus(it + dt[h]) A[h]) - what gdn_rec.comp takes (y: per token
+// the nv betas then the nv decays). dense_mm.comp's tiles of 64 rows by 64
+// tokens leave such a block one workgroup, which walks the row 16 columns
+// a barrier: 25 ms a pass of 8 tokens on Qwen3.5-9B (13 Oct 2026). Here a
+// workgroup takes RW rows and up to NT tokens (y), each thread every 256th
+// column of them for all the tokens, the sums then added across the
+// workgroup; a token's inputs are read once for the RW rows (a workgroup a
+// row read them 96 times a layer on Qwen3.8-27B: 13 ms a pass of 8
+// tokens). Not the CPU's order of the sums.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint NV = 8; // unused
+layout(constant_id = 1) const uint SG = 8; // unused
+const uint NT = 8u;                        // tokens a workgroup
+const uint RW = 4u;                        // rows a workgroup (the host's GBA_RW)
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+
+// w: rows x cols; x: n rows of cols; y: n rows of ys floats; dt, A: nv
+layout(push_constant) uniform P { uvec2 w, x, y, dt, a; uint rows, cols, n, ys; } p;
+
+shared float part[RW * NT * 32u]; /* a subgroup's sums: up to 32 subgroups */
+
+void main()
+{
+    uint r0 = gl_WorkGroupID.x * RW, t0 = gl_WorkGroupID.y * NT, id = gl_LocalInvocationID.x;
+    F Wt = F(p.w), X = F(p.x);
+    uint nt = min(NT, p.n - t0);
+    float acc[RW * NT];
+    for (uint i = 0; i < RW * NT; i++)
+        acc[i] = 0.0;
+    for (uint c = id; c < p.cols; c += 256u) {
+        float xv[NT];
+        for (uint k = 0; k < NT; k++)
+            xv[k] = k < nt ? X.v[(t0 + k) * p.cols + c] : 0.0;
+        for (uint j = 0; j < RW; j++) {
+            float w = Wt.v[min(r0 + j, p.rows - 1u) * p.cols + c];
+            for (uint k = 0; k < NT; k++)
+                acc[j * NT + k] = fma(w, xv[k], acc[j * NT + k]);
+        }
+    }
+    for (uint i = 0; i < RW * NT; i++) {
+        float s = subgroupAdd(acc[i]);
+        if (subgroupElect())
+            part[i * 32u + gl_SubgroupID] = s;
+    }
+    barrier();
+    uint r = r0 + id / NT, k = id % NT;
+    if (id < RW * NT && r < p.rows && k < nt) {
+        float s = 0.0;
+        for (uint i = 0; i < gl_NumSubgroups; i++)
+            s += part[id * 32u + i];
+        uint nv = p.rows / 2u;
+        float y;
+        if (r < nv) {
+            y = 1.0 / (1.0 + exp(-s)); /* beta */
+        } else {
+            float al = s + F(p.dt).v[r - nv];
+            float sp = al > 20.0 ? al : log(1.0 + exp(al));
+            y = exp(sp * F(p.a).v[r - nv]); /* the decay */
+        }
+        W(p.y).v[(t0 + k) * p.ys + r] = y;
+    }
+}

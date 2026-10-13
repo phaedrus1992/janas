@@ -1,0 +1,99 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// Q5_K weights times 2 to 8 Q8_K vectors with the lanes on the vectors, as
+// q4k_mvd.comp (the same layout but for the fifth bits): lane v of a
+// subgroup of 8 is vector v, a subgroup takes R rows one after the other,
+// lane i reads the block's i-th 16 bytes of nibbles and the 16 bytes of
+// fifth bits of its positions (qh, half i & 1), sets them in, and the words
+// reach every lane's dot products through subgroupBroadcast. A block is 176
+// bytes, eleven times 16: every load is aligned. The same integer sums and
+// float operations as janas_q5k_dot_ref: the CPU's result bit for bit.
+// Subgroups of 8 lanes. Workgroup x: a group of 8 vectors; y: the rows.
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8; /* unused: the lanes are the vectors */
+layout(constant_id = 1) const uint SG = 8;
+const uint R = 4; /* rows a subgroup: 32 a workgroup (gpu_impl.h MVD_ROWS) */
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+
+/* the uvec4 at byte lo of the 4 GB whose high word is hi: neither buffer
+   crosses a 4 GB boundary (the host checks), so an address is its low word
+   plus an offset */
+uvec4 at(uint lo, uint hi) { return U4(uvec2(lo, hi)).v[0]; }
+int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+
+void main()
+{
+    F Y = F(p.y);
+    uint lane = gl_SubgroupInvocationID;
+    uint row0 = (gl_WorkGroupID.y * (64u / SG) + gl_SubgroupID) * R;
+    uint v = gl_WorkGroupID.x * SG + lane, vv = min(v, p.nv - 1u);
+    /* this lane's vector: its blocks from byte xl */
+    uint xl = p.x.x + vv * p.xs * 320u;
+    float acc[R], accm[R];
+    for (uint r = 0; r < R; r++) {
+        acc[r] = 0.0;
+        accm[r] = 0.0;
+    }
+    for (uint b = 0; b < p.nb; b++) {
+        /* the vector's block: 256 quants, the sums of 16, the scale */
+        uvec4 xq[16];
+        for (uint k = 0; k < 16u; k++)
+            xq[k] = at(xl + b * 320u + 16u * k, p.x.y);
+        uvec4 t0 = at(xl + b * 320u + 256u, p.x.y), t1 = at(xl + b * 320u + 272u, p.x.y);
+        float d8 = uintBitsToFloat(at(xl + b * 320u + 288u, p.x.y).x);
+        ivec4 ps0 = bitfieldExtract(ivec4(t0), 0, 16) + (ivec4(t0) >> 16);
+        ivec4 ps1 = bitfieldExtract(ivec4(t1), 0, 16) + (ivec4(t1) >> 16);
+        int ps[8] = int[8](ps0.x, ps0.y, ps0.z, ps0.w, ps1.x, ps1.y, ps1.z, ps1.w);
+        for (uint r = 0; r < R; r++) {
+            uint row = min(row0 + r, p.rows - 1u);
+            uint wl = p.w.x + (row * p.nb + b) * 176u;
+            uvec4 hd = at(wl, p.w.y);
+            uvec4 q = at(wl + 48u + 16u * lane, p.w.y);
+            /* bit s of qh[l]: the fifth bit of weight 32 s + l; this lane's
+               positions are 16 (lane & 1) on, its sub-blocks lane & ~1 (low
+               nibbles) and lane | 1 (high) */
+            uvec4 qh = at(wl + 16u + 16u * (lane & 1u), p.w.y);
+            uint sb = lane & ~1u;
+            uvec4 lo = (q & 0x0f0f0f0fu) | (((qh >> sb) & 0x01010101u) << 4);
+            uvec4 hi = ((q >> 4) & 0x0f0f0f0fu) | (((qh >> (sb + 1u)) & 0x01010101u) << 4);
+            uint sc03 = hd.y & 0x3f3f3f3fu, mn03 = hd.z & 0x3f3f3f3fu;
+            uint sc47 = (hd.w & 0x0f0f0f0fu) | ((hd.y >> 2) & 0x30303030u);
+            uint mn47 = ((hd.w >> 4) & 0x0f0f0f0fu) | ((hd.z >> 2) & 0x30303030u);
+            int isum = 0, imin = 0;
+            [[unroll]] for (uint c = 0; c < 4u; c++) {
+                /* sub-blocks 2c (low nibbles) and 2c + 1 (high): lanes 2c and
+                   2c + 1 hold their halves */
+                int dl = 0, dh = 0;
+                for (uint h = 0; h < 2u; h++) {
+                    uvec4 l = subgroupBroadcast(lo, 2u * c + h), u = subgroupBroadcast(hi, 2u * c + h);
+                    uvec4 a = xq[4u * c + h], e = xq[4u * c + 2u + h];
+                    dl += dp(l.x, a.x) + dp(l.y, a.y) + dp(l.z, a.z) + dp(l.w, a.w);
+                    dh += dp(u.x, e.x) + dp(u.y, e.y) + dp(u.z, e.z) + dp(u.w, e.w);
+                }
+                uint scw = c < 2u ? sc03 : sc47;
+                isum += dl * int(bitfieldExtract(scw, int(16u * (c & 1u)), 8)) +
+                        dh * int(bitfieldExtract(scw, int(16u * (c & 1u) + 8u), 8));
+            }
+            for (uint s = 0; s < 8u; s++)
+                imin += int(bitfieldExtract(s < 4u ? mn03 : mn47, int(8u * (s & 3u)), 8)) * ps[s];
+            vec2 dd = unpackHalf2x16(hd.x);
+            acc[r] = fma(dd.x * d8, float(isum), acc[r]);
+            accm[r] = fma(dd.y * d8, float(imin), accm[r]);
+        }
+    }
+    if (v < p.nv)
+        for (uint r = 0; r < R; r++)
+            if (row0 + r < p.rows)
+                Y.v[v * p.ys + row0 + r] = acc[r] - accm[r];
+}

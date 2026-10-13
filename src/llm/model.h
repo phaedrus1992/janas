@@ -272,6 +272,12 @@ void janas_llm_model_tuning(const struct janas_llm_model *m, char *buf,
  * part worth telling anybody.
  */
 int janas_llm_model_gpu_used(const struct janas_llm_model *m);
+/* The most tokens a pass of drafts is worth (0: no limit): where the
+   passes of a few tokens go whole to the GPU, as many as its shaders of a
+   few vectors take (janas_gpu_few_max) - one more sends every product to
+   the shaders of many vectors, and Qwen3.8-27B's pass of 9 tokens took
+   855 ms against 437 for one of 5 (13 Oct 2026). */
+uint32_t janas_llm_model_pass_cap(const struct janas_llm_model *m);
 /* Whether the GPU reads the prompts' blocks whatever the tuner chooses
    (the fast prompt, outside eco mode). */
 int janas_llm_model_gpu_prompts(const struct janas_llm_model *m);

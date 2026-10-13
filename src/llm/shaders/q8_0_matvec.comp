@@ -39,8 +39,12 @@ void main()
     U4 X = U4(p.x);
     F Y = F(p.y);
     uint lane = gl_SubgroupInvocationID;
-    uint row = min(gl_GlobalInvocationID.x, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.y * NV;
+    /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
+       of the same rows go out together and the weights the first reads
+       from memory the others find in the L3 */
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
@@ -83,7 +87,7 @@ void main()
             xo[v] += 20u;
         }
     }
-    if (gl_GlobalInvocationID.x < p.rows)
+    if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
             if (v0 + v < p.nv)
                 Y.v[(v0 + v) * p.ys + row] =

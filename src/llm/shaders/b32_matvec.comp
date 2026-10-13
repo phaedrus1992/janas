@@ -49,12 +49,15 @@ uint spread5(uint b)
     return ((b & 1u) << 4) | ((b & 2u) << 11) | ((b & 4u) << 18) | ((b & 8u) << 25);
 }
 
+/* the table in the workgroup's shared memory: a constant array read at a
+   varying index is far slower on some GPUs (iq4xs_matvec.comp) */
+shared uint T[16];
+
 /* each byte of w through the IQ4_NL table */
 uint iq4(uint w)
 {
-    return (uint(IQ4[w & 15u]) & 0xffu) | ((uint(IQ4[(w >> 8) & 15u]) & 0xffu) << 8) |
-           ((uint(IQ4[(w >> 16) & 15u]) & 0xffu) << 16) |
-           ((uint(IQ4[(w >> 24) & 15u]) & 0xffu) << 24);
+    return T[w & 15u] | (T[(w >> 8) & 15u] << 8) | (T[(w >> 16) & 15u] << 16) |
+           (T[(w >> 24) & 15u] << 24);
 }
 
 float hsum8(float a[8])
@@ -64,12 +67,19 @@ float hsum8(float a[8])
 
 void main()
 {
+    if (gl_LocalInvocationID.x < 16u)
+        T[gl_LocalInvocationID.x] = uint(IQ4[gl_LocalInvocationID.x]) & 0xffu;
+    barrier();
     U1 W = U1(p.w);
     U4 X = U4(p.x);
     F Y = F(p.y);
     uint lane = gl_SubgroupInvocationID;
-    uint row = min(gl_GlobalInvocationID.x, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.y * NV;
+    /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
+       of the same rows go out together and the weights the first reads
+       from memory the others find in the L3 */
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
@@ -137,7 +147,7 @@ void main()
             xo[v] += 20u;
         }
     }
-    if (gl_GlobalInvocationID.x < p.rows)
+    if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
             if (v0 + v < p.nv) {
                 float r = hsum8(acc[v]);

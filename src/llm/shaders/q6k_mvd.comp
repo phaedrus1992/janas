@@ -1,0 +1,121 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// Q6_K weights times 2 to 8 Q8_K vectors with the lanes on the vectors, as
+// q4k_mvd.comp: lane v of a subgroup of 8 is vector v, a subgroup takes R
+// rows one after the other, each lane keeps its vector's block of
+// activations in registers. A Q6_K block is 210 bytes (ql 128, qh 64,
+// scales 16, d 2), so a block starts on an even byte, and on a word or two
+// bytes past one: lane j = 4n + 2h + kk loads the five words around its 16
+// bytes of ql (positions 16kk .. 16kk + 15 of half n, quarters h and h + 2)
+// and the five around its 16 bytes of qh, and shifts them by 16 bits where
+// the block starts two bytes past a word; the bytes of a load all lie in
+// one block, so a load of the subgroup touches the block's few lines only. Its 32 weights
+// (sub-blocks 8n + 2h + kk and that + 4) reach every lane's dot products as
+// scalar operands, already less 32 (-32 .. 31, made a byte at a time). The
+// integer sums as the CPU's (janas_q6k_dot_ref): scale x ((q - 32) x a),
+// then one fma with d x d8; bit for bit. The scales are taken plus 128
+// (their sign bit flipped: 0 .. 255, which the GPU multiplies in one
+// instruction, a signed one in three), and 128 x the sum of the dot
+// products comes off at the end. Subgroups of 8 lanes; workgroup x: a
+// group of 8 vectors, y: the rows (32 a workgroup, gpu_impl.h MVD_ROWS).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8; /* unused: the lanes are the vectors */
+layout(constant_id = 1) const uint SG = 8;
+const uint R = 4; /* rows a subgroup */
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+
+/* the uvec4 at byte lo of the 4 GB whose high word is hi: neither buffer
+   crosses a 4 GB boundary (the host checks) */
+uvec4 at(uint lo, uint hi) { return U4(uvec2(lo, hi)).v[0]; }
+int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+
+/* The 16 bytes at byte c (c even): the five words from the word below c,
+   shifted by 16 bits where c is two bytes past a word (m all ones), with no
+   branch. */
+uvec4 bytes16(uint c, uint hi)
+{
+    U1 B = U1(uvec2(c & ~3u, hi));
+    uvec4 w = uvec4(B.v[0], B.v[1], B.v[2], B.v[3]);
+    uvec4 n = uvec4(w.yzw, B.v[4]);
+    uint m = 0u - ((c >> 1) & 1u);
+    return (w & ~m) | (((w >> 16) | (n << 16)) & m);
+}
+
+/* Four weights 0 .. 63 a word, less 32: -32 .. 31 as bytes (no borrow from
+   one byte to the next: each is 128 more while the 32 is taken). */
+uint less32(uint q) { return ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u; }
+
+void main()
+{
+    F Y = F(p.y);
+    uint lane = gl_SubgroupInvocationID;
+    uint row0 = (gl_WorkGroupID.y * (64u / SG) + gl_SubgroupID) * R;
+    uint v = gl_WorkGroupID.x * SG + lane, vv = min(v, p.nv - 1u);
+    uint xl = p.x.x + vv * p.xs * 320u;
+    /* this lane's part of a block: half n, quarters h and h + 2, positions
+       16kk .. 16kk + 15; its bytes of ql and of qh */
+    uint n = lane >> 2, h = (lane >> 1) & 1u, kk = lane & 1u;
+    uint oql = 64u * n + 32u * h + 16u * kk, oqh = 128u + 32u * n + 16u * kk;
+    float acc[R];
+    for (uint r = 0; r < R; r++)
+        acc[r] = 0.0;
+    for (uint b = 0; b < p.nb; b++) {
+        /* the vector's block: 256 quants, the sums of 16, the scale */
+        uvec4 xq[16];
+        for (uint k = 0; k < 16u; k++)
+            xq[k] = at(xl + b * 320u + 16u * k, p.x.y);
+        float d8 = uintBitsToFloat(at(xl + b * 320u + 288u, p.x.y).x);
+        for (uint r = 0; r < R; r++) {
+            uint row = min(row0 + r, p.rows - 1u);
+            uint c0 = p.w.x + (row * p.nb + b) * 210u;
+            uvec4 ql = bytes16(c0 + oql, p.w.y), qh = bytes16(c0 + oqh, p.w.y);
+            /* the 16 scales and d: bytes 192 .. 209, every lane the same */
+            uvec4 scv = bytes16(c0 + 192u, p.w.y);
+            uint dw = U1(uvec2((c0 + 208u) & ~3u, p.w.y)).v[0] >> (8u * (c0 & 2u));
+            /* the scales plus 128 */
+            uint sc[4] = uint[4](scv.x ^ 0x80808080u, scv.y ^ 0x80808080u, scv.z ^ 0x80808080u,
+                                 scv.w ^ 0x80808080u);
+            /* this lane's 32 weights, less 32: quarter h (low nibbles) and h + 2 */
+            uvec4 wl, wh;
+            for (uint k = 0; k < 4u; k++) {
+                wl[k] = less32((ql[k] & 0x0f0f0f0fu) | ((qh[k] << (4u - 2u * h)) & 0x30303030u));
+                wh[k] = less32(((ql[k] >> 4) & 0x0f0f0f0fu) | ((qh[k] >> (2u * h)) & 0x30303030u));
+            }
+            int isum = 0, dsum = 0;
+            [[unroll]] for (uint j = 0; j < 8u; j++) {
+                /* lane j's sub-blocks g (quarter h) and g + 4 (quarter h + 2) */
+                uint gn = j >> 2, gh = (j >> 1) & 1u, gk = j & 1u;
+                uint g = 8u * gn + 2u * gh + gk;
+                uvec4 l = subgroupBroadcast(wl, j), u = subgroupBroadcast(wh, j);
+                uvec4 a0 = xq[g], a1 = xq[g + 4u];
+                /* chains, so that each sum is the next dot product's
+                   accumulator */
+                int d0 = dp(l.w, a0.w) + (dp(l.z, a0.z) + (dp(l.y, a0.y) + dp(l.x, a0.x)));
+                int d1 = dp(u.w, a1.w) + (dp(u.z, a1.z) + (dp(u.y, a1.y) + dp(u.x, a1.x)));
+                uint c0s = bitfieldExtract(sc[g >> 2], int(8u * (g & 3u)), 8);
+                uint c1s = bitfieldExtract(sc[(g + 4u) >> 2], int(8u * ((g + 4u) & 3u)), 8);
+                isum += int(c0s) * d0 + int(c1s) * d1;
+                dsum += d0 + d1;
+            }
+            isum -= dsum << 7;
+            float d = unpackHalf2x16(dw & 0xffffu).x;
+            acc[r] = fma(d * d8, float(isum), acc[r]);
+        }
+    }
+    if (v < p.nv)
+        for (uint r = 0; r < R; r++)
+            if (row0 + r < p.rows)
+                Y.v[v * p.ys + row0 + r] = acc[r];
+}

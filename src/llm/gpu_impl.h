@@ -34,6 +34,8 @@
 #define Y_STAGE_BYTES ((size_t)32 << 20)
 #define ROWS_PER_GROUP 64 /* local_size_x of the shader */
 #define NV_PER_GROUP 8    /* its NV */
+#define MV_NV 8           /* q4k_mv's */
+#define MVD_ROWS 32       /* q4k_mvd's rows a workgroup */
 #define GPU_BLOCK 320     /* a Q8_K block in the shader's layout */
 #define SHARE_SLOTS 64
 #define MAX_GROUP 64
@@ -102,6 +104,10 @@ struct region {
     VkDeviceMemory mem;
     VkDeviceAddress addr;
     int coherent; /* allocated regions: else flushed after host writes */
+    /* the host's own memory (imported, or the driver's mapped): what the
+       GPU writes there the CPU reads. 0: a copy in a card's own memory
+       (copy_to_device), which the GPU's writes never leave */
+    int host_shared;
 };
 
 struct stage {
@@ -149,10 +155,13 @@ struct janas_gpu {
     VkPipeline pipe32[4];
     VkPipeline pipex4, pipe3, pipei3; /* IQ4_XS, Q3_K, IQ3_S */
     /* Q4_K on many vectors in tiles (q4k_mm.comp), MM_ROWS x MM_VECS */
-    VkShaderModule sm_mm, sm_mm6, sm_mm6s, sm_mm80, sm_mm5, sm_mm3, sm_dm[2];
+    VkShaderModule sm_mm, sm_mm6, sm_mm6s, sm_mm80, sm_mm5, sm_mm3, sm_mmx4,
+        sm_mmi3, sm_mmn4,
+        sm_dm[2]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL */
     VkPipeline pipe_mm, pipe_mm6, pipe_mm6s, pipe_mm80, pipe_mm5, pipe_mm3,
-        pipe_dm[2];
+        pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_dm[2];
     int only_fast; /* janas_gpu_set_only_fast */
+    uint32_t nvg;  /* vectors a product's workgroup takes (NV_PER_GROUP) */
     /* a mixture's experts in one dispatch (experts_id): Q4_K, Q6_K_P */
     VkShaderModule sm_id4, sm_id6, sm_id6s;
     VkPipeline pipe_id4, pipe_id6, pipe_id6s;
@@ -172,6 +181,11 @@ struct janas_gpu {
        [k] up to 2 << k of them; [][3] the aligned Q6_K */
     VkShaderModule rmv[3][4];
     VkPipeline rpv[3][4];
+    VkShaderModule sm_mv; /* q4k_mv, MV_NV vectors (JANAS_GPU_MV=1) */
+    VkPipeline pipe_mv;
+    /* q4k_mvd, q6k_mvd, q5k_mvd, iq4xs_mvd: 2-8 vectors, subgroups of 8 */
+    VkShaderModule sm_mvd, sm_mvd6, sm_mvd5, sm_mvdx4;
+    VkPipeline pipe_mvd, pipe_mvd6, pipe_mvd5, pipe_mvdx4;
     VkCommandPool cp;
     VkCommandBuffer cb;
     VkFence fence;
@@ -192,7 +206,9 @@ struct janas_gpu {
     struct share {
         uint64_t key;
         float f;
-        uint32_t calls, waits;
+        /* alone: calls with every row on the GPU, where the CPU waits
+           having nothing to do; waits: the others the GPU was late in */
+        uint32_t calls, waits, alone;
         double t_begin, t_cpu, t_wait, t_copy; /* seconds, verbose only */
         uint64_t rows_gpu, rows_all;
         uint32_t off;     /* calls left on the CPU alone */

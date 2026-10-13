@@ -25,6 +25,8 @@ enum janas_spec_mode {
 };
 
 #define JANAS_GEN_MAX_STOP 4
+/* the longest chain of drafts a pass verifies (spec_k) */
+#define JANAS_GEN_MAX_K 16
 
 struct janas_gen_options {
     int spec_mode; /* enum janas_spec_mode */
@@ -75,6 +77,12 @@ struct janas_gen_stats {
        A bin the planner never finds worth trying stays empty, so this says
        what it has actually learned. */
     uint32_t cal_tried[10], cal_won[10];
+    /* by position in the chain (0: the first draft), the drafts verified and
+       those accepted; by the tokens in a pass (1: no drafts), the passes and
+       their seconds - what the planner weighs, as it turned out */
+    uint32_t pos_tried[JANAS_GEN_MAX_K], pos_won[JANAS_GEN_MAX_K];
+    uint32_t pass_count[JANAS_GEN_MAX_K + 2];
+    double pass_seconds[JANAS_GEN_MAX_K + 2];
 };
 
 /*
