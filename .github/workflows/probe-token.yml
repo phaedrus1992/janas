@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Throwaway probe: what can SYNC_TOKEN write in this repository?
-# Delete this file and its branch when the answer is recorded.
+# Throwaway probe: which head branches can SYNC_TOKEN turn into a pull request?
+# Delete this file and its branches when the answer is recorded.
 name: probe-token
 
 on: push
@@ -13,20 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Ask what the token can write
+      - name: Push head branches to test
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          gh api user --jq '"login: \(.login)"'
-          gh api "repos/$GITHUB_REPOSITORY" --jq '"repo permissions: \(.permissions)"'
-          echo "--- merge probe: 403 means no write, 404 means the permission is present ---"
-          gh api "repos/$GITHUB_REPOSITORY/pulls/999999/merge" --method PUT 2>&1 || true
-          echo "--- review probe: same reading ---"
-          gh api "repos/$GITHUB_REPOSITORY/pulls/999999/reviews" --method POST \
-            -f body=probe -f event=COMMENT 2>&1 || true
-          echo "--- the same call the sync makes ---"
-          pr_url="$(gh pr create --base main --head "$GITHUB_REF_NAME" \
-            --title "probe: can SYNC_TOKEN open this" \
-            --body "Throwaway probe for the fork sync token. Closing at once.")" || true
-          echo "pr create result: ${pr_url:-FAILED}"
-          if [[ -n "$pr_url" ]]; then gh pr close "$pr_url" || true; fi
+          gh --version
+          git config user.name probe-bot
+          git config user.email probe-bot@users.noreply.github.com
+          for b in probe2/bot-pushed sync/probe-fresh; do
+            git switch --create "$b"
+            git commit --allow-empty -m "probe: head for $b"
+            git push origin "$b"
+            git switch -
+          done
+          git switch --create probe2/pat-pushed
+          git commit --allow-empty -m "probe: head for pat push"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" probe2/pat-pushed
+          git switch -
+      - name: Ask the token to open each one
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          try_pr() {
+            echo "=== head $1 ==="
+            local out
+            out=$(gh pr create --base main --head "$1" \
+              --title "probe: $1" --body "Throwaway probe. Closing at once." 2>&1) \
+              && { echo "CREATED: $out"; gh pr close "${out##*/}" || true; } \
+              || echo "REFUSED: $out"
+          }
+          try_pr sync/2026-10-13
+          try_pr probe2/bot-pushed
+          try_pr probe2/pat-pushed
+          try_pr sync/probe-fresh
+          gh api "repos/$GITHUB_REPOSITORY/commits/sync%2F2026-10-13" \
+            --jq '"sync tip author: \(.commit.author.name) / \(.commit.committer.name)"'
