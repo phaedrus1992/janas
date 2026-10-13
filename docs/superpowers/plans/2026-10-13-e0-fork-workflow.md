@@ -1185,8 +1185,8 @@ Expected: the run list shows a merged sync pull request, `origin/main` carries t
 
 ```bash
 git switch --quiet --create port/00-guard-test origin/clean
-echo 'id: guard-test' >> .llmenv.yaml
-git add .llmenv.yaml
+printf '# guard test\n' > AGENTS.md
+git add AGENTS.md
 git commit -s -m "chore: guard test (do not merge)"
 git push --set-upstream origin port/00-guard-test
 gh pr create --base main --head port/00-guard-test --title "guard test (do not merge)" --body "Throwaway. The fork-guard check must fail."
@@ -1194,7 +1194,14 @@ sleep 20   # the check needs a moment to register; gh pr checks needs one to wat
 gh pr checks --watch || true
 ```
 
-Expected: `fork-guard` fails and names `.llmenv.yaml`.
+The tooling path must be one `main` does not have, such as `AGENTS.md`.
+A path `main` already has, such as `.llmenv.yaml`, makes both sides of the pull request add it, so the pull request has a conflict, and GitHub does not run `pull_request` workflows for a pull request it cannot merge.
+The run is then absent, not red.
+
+The local pre-push hook blocks this push first, which is the point.
+Add `--no-verify` to the push to reach the CI half of the test.
+
+Expected: `fork-guard` fails and names `AGENTS.md`.
 
 - [ ] **Step 4: Clean up the throwaway branch**
 
