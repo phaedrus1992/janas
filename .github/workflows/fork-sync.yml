@@ -3,6 +3,11 @@
 # fast-forwards clean, then merges it into main through an auto-merged pull
 # request, and opens an issue when a conflict stops it. A local session runs
 # the same script: .fork/sync-upstream.sh
+#
+# It runs with the repository's SYNC_TOKEN secret. The workflow token cannot
+# create pull requests here, whatever its permissions say. The secret holds a
+# fine-grained token owned by the fork's account; its expiry lives on that
+# token's own settings page.
 name: fork-sync
 
 on:
@@ -26,7 +31,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: # zizmor: ignore[artipacked] the script pushes clean and the sync branch with this token
           fetch-depth: 0
+      - name: Check the sync token
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          gh api user --jq '"sync token: \(.login)"' || {
+            echo "SYNC_TOKEN is missing, expired, or lacks access to this repository." >&2
+            echo "Mint a new fine-grained token and update the repository secret." >&2
+            exit 1
+          }
       - name: Merge upstream/main into main
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: .fork/sync-upstream.sh

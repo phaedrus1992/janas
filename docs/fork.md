@@ -21,6 +21,20 @@ keeps fork tooling off `port/*` branches. The hook tests are in
 No port code exists yet.
 Each epic gets its own design session before work starts.
 
+The daily sync runs with the `SYNC_TOKEN` repository secret, a fine-grained
+token owned by the fork's account. GitHub refuses pull request creation to the
+workflow's own token in this repository, whatever the repository settings and
+the workflow `permissions` say.
+To rotate it, mint a new fine-grained token on that account with `Contents`,
+`Issues`, `Pull requests` and `Workflows` write access to this repository, and
+replace the secret's value.
+The current token's expiry date lives on its own settings page; this file does
+not repeat it.
+A sync run that cannot read the token stops at the `Check the sync token` step
+and names the fix.
+`.fork/sync-upstream.sh` in a local clone uses your own credentials, not the
+secret, so a lapsed token does not stop a manual sync.
+
 ## The spec
 
 The spec and its reference material are in [`docs/superpowers/specs/2026-10-13-arm64-metal-port/`](superpowers/specs/2026-10-13-arm64-metal-port/):
