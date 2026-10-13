@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# The daily sync of upstream/main into the fork's main. The script
-# fast-forwards clean, then merges it into main through an auto-merged pull
-# request, and opens an issue when a conflict stops it. A local session runs
-# the same script: .fork/sync-upstream.sh
+# The daily sync of upstream/main into the fork's main: fast-forward clean,
+# merge it into main through an auto-merged pull request, and open an issue
+# when a conflict stops it. A local session runs the same script:
+# .fork/sync-upstream.sh
 #
-# It runs with the repository's SYNC_TOKEN secret. The workflow token cannot
-# create pull requests here, whatever its permissions say. The secret holds a
-# fine-grained token owned by the fork's account; its expiry lives on that
-# token's own settings page.
+# The git pushes run on the workflow token, which the permissions block below
+# scopes. The gh calls run on the SYNC_TOKEN secret: GitHub refuses pull
+# request creation to the workflow token here. Rotation: docs/fork.md.
 name: fork-sync
 
 on:
@@ -17,8 +16,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: fork-sync
@@ -35,9 +32,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          gh api user --jq '"sync token: \(.login)"' || {
-            echo "SYNC_TOKEN is missing, expired, or lacks access to this repository." >&2
-            echo "Mint a new fine-grained token and update the repository secret." >&2
+          login="$(gh api user --jq .login)" || {
+            echo "SYNC_TOKEN is missing or not valid; the gh error is above." >&2
+            echo "Mint a new fine-grained token and replace the repository secret." >&2
+            exit 1
+          }
+          [[ "$login" == "$GITHUB_REPOSITORY_OWNER" ]] || {
+            echo "SYNC_TOKEN belongs to $login, not $GITHUB_REPOSITORY_OWNER." >&2
+            echo "Replace the secret with a token on $GITHUB_REPOSITORY_OWNER." >&2
+            exit 1
+          }
+          gh api "repos/$GITHUB_REPOSITORY" --jq .full_name >/dev/null || {
+            echo "SYNC_TOKEN cannot read $GITHUB_REPOSITORY; the gh error is above." >&2
+            echo "Add that repository to the token's access." >&2
             exit 1
           }
       - name: Merge upstream/main into main
