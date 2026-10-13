@@ -139,14 +139,25 @@ uint signed4(uint g, uint s)
     return r;
 }
 
+/* the grid in the workgroup's shared memory: a constant array read at a
+   varying index is far slower on some GPUs (iq4xs_matvec.comp) */
+shared uint GS[512];
+
 void main()
 {
+    for (uint i = gl_LocalInvocationID.x; i < 512u; i += 64u)
+        GS[i] = GRID[i];
+    barrier();
     U1 W = U1(p.w);
     U4 X = U4(p.x);
     F Y = F(p.y);
     uint lane = gl_SubgroupInvocationID;
-    uint row = min(gl_GlobalInvocationID.x, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.y * NV;
+    /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
+       of the same rows go out together and the weights the first reads
+       from memory the others find in the L3 */
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
@@ -173,7 +184,7 @@ void main()
             for (uint k = 0; k < 8u; k++) {
                 uint idx = byte_at(wd, 2u + 8u * g + k) | (((qh >> k) & 1u) << 8);
                 uint sg = byte_at(wd, 74u + 4u * g + k / 2u) >> (4u * (k & 1u));
-                q[8u * g + k] = signed4(GRID[idx], sg & 15u);
+                q[8u * g + k] = signed4(GS[idx], sg & 15u);
             }
             sc[g] = 1 + 2 * int((byte_at(wd, 106u + g / 2u) >> (4u * (g & 1u))) & 15u);
         }
@@ -195,7 +206,7 @@ void main()
             xo[v] += 20u;
         }
     }
-    if (gl_GlobalInvocationID.x < p.rows)
+    if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
             if (v0 + v < p.nv)
                 Y.v[(v0 + v) * p.ys + row] = acc[v];

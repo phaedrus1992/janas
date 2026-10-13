@@ -459,9 +459,18 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     set_rope(m, n, pos0);
     /* a token (or, with JANAS_GPU_BLOCK=1, a block) on the GPU, whole,
        where it can (model_gpu.c) */
-    if (logits && janas_m_gpu_token(m, pos0, n, all_logits, logits) == 0) {
+    int gpu = logits ? janas_m_gpu_token(m, pos0, n, all_logits, logits) : -1;
+    if (gpu == -2)
+        return -1; /* the GPU failed after replaying on the base in place:
+                      no state to go on from (base_pos stays invalid) */
+    if (gpu == 0) {
         m->ring_hi = pos0 + n;
-        if (m->a->rec) { /* a long block (model_gpu.c): as at the end */
+        if (m->a->rec && n <= JANAS_LLM_MAX_BLOCK) {
+            /* replayed and logged by the GPU: as at the end */
+            m->base = m->src;
+            m->base_pos = pos0;
+            m->log_n = n;
+        } else if (m->a->rec) { /* a long block: as at the end */
             m->base = 1 - m->src;
             m->base_pos = pos0 + n;
             m->log_n = 0;

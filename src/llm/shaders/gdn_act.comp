@@ -1,0 +1,34 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// A Gated DeltaNet layer's betas and decays from the raw dot products of a
+// long block (dense_mm.comp's: per token the nv b, then the nv a): beta =
+// sigmoid(b), decay = exp(softplus(a + dt[h]) A[h]), as gdn_ba.comp makes
+// them for a short one, into bd (the same layout). A thread a number.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+
+// ba, bd: n rows of 2 nv; dt, A: nv
+layout(push_constant) uniform P { uvec2 ba, bd, dt, a; uint nv, n; } p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n * 2u * p.nv)
+        return;
+    uint r = i % (2u * p.nv);
+    float s = F(p.ba).v[i], y;
+    if (r < p.nv) {
+        y = 1.0 / (1.0 + exp(-s));
+    } else {
+        float al = s + F(p.dt).v[r - p.nv];
+        float sp = al > 20.0 ? al : log(1.0 + exp(al));
+        y = exp(sp * F(p.a).v[r - p.nv]);
+    }
+    W(p.bd).v[i] = y;
+}

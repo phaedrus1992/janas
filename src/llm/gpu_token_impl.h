@@ -43,26 +43,35 @@ struct push_am {
 };
 /* the Gated DeltaNet shaders (gdn_*.comp) */
 struct push_gconv {
-    uint32_t mixed[2], out[2], w[2], state[2], pos[2];
-    uint32_t cc, d, hs, so;
+    uint32_t mixed[2], out[2], w[2], state[2], pos[2], log[2];
+    uint32_t cc, d, hs, so, n;
 };
 struct push_gcst {
-    uint32_t mixed[2], state[2], pos[2];
+    uint32_t mixed[2], state[2], pos[2], log[2];
     uint32_t cc, d, hs, so, n;
 };
 struct push_gl2 {
-    uint32_t x[2];
+    uint32_t x[2], pos[2];
     uint32_t cc;
     float eps;
+    uint32_t n;
 };
 struct push_grec {
-    uint32_t co[2], ba[2], att[2], state[2], pos[2], dt[2], a[2];
+    uint32_t co[2], att[2], state[2], pos[2], lb[2], ld[2], bd[2];
     uint32_t cc, nv, nkh, n, hs, so, vmap_mod;
     float scale;
 };
+struct push_gba { /* gdn_ba.comp */
+    uint32_t w[2], x[2], y[2], dt[2], a[2];
+    uint32_t rows, cols, n, ys;
+};
+struct push_gact { /* gdn_act.comp */
+    uint32_t ba[2], bd[2], dt[2], a[2];
+    uint32_t nv, n;
+};
 struct push_ggate {
-    uint32_t att[2], z[2], w[2], q256[2], q32[2];
-    uint32_t d;
+    uint32_t att[2], z[2], w[2], q256[2], q32[2], bd[2], lb[2], ld[2], pos[2];
+    uint32_t d, nv;
     float eps;
 };
 struct push_dm { /* gpu.c's dense_mm.comp */
@@ -109,7 +118,12 @@ _Static_assert(offsetof(struct push_qk, pos) % 8 == 0, "push layout");
 _Static_assert(offsetof(struct push_at, pos) % 8 == 0, "push layout");
 _Static_assert(offsetof(struct push_am, pos) % 8 == 0, "push layout");
 _Static_assert(sizeof(struct push_grec) <= JANAS_G_PUSH_BYTES, "push size");
+_Static_assert(sizeof(struct push_ggate) <= JANAS_G_PUSH_BYTES, "push size");
 _Static_assert(sizeof(struct push_cb) <= JANAS_G_PUSH_BYTES, "push size");
+/* The most tokens of a block whose beta and alpha gdn_ba.comp makes (more:
+   dense_mm.comp's tiles) */
+#define GBA_MAX_N 16
+#define GBA_RW 4 /* its rows a workgroup (gdn_ba.comp RW) */
 /* The most tokens a block takes (the model's own blocks: model.h
    JANAS_LLM_MAX_BLOCK), and the memory the attention's runs may take for
    them. */
@@ -129,6 +143,14 @@ enum {
     PH_ACT,
     PH_DOWN,
     PH_OUT,
+    /* a Gated DeltaNet layer: its products (q|k|v and z), beta and alpha,
+       the convolution (with its state and the q and k norms), the
+       recurrence, the gate (its output product counts as wo) */
+    PH_SSM_PROD,
+    PH_SSM_BA,
+    PH_SSM_CONV,
+    PH_SSM_REC,
+    PH_SSM_GATE,
     PH_N
 };
 #define MAX_TS 1024
@@ -149,14 +171,16 @@ struct janas_gpu_tok {
     uint32_t n_ts;      /* written this token */
     uint8_t ph_of[MAX_TS]; /* the phase each timestamp closes */
     double ph_ns[PH_N];
-    double wall_ns; /* submission to the fence, as the CPU sees it */
-    double copy_ns; /* the logits copied out */
-    uint64_t tokens;
+    double wall_ns;       /* submission to the fence, as the CPU sees it */
+    double copy_ns;       /* the logits copied out */
+    uint64_t tokens;      /* with profiling: passes measured */
+    uint64_t pass_tokens; /* ... and their tokens */
     VkShaderModule sm_nq, sm_qk, sm_at, sm_am;
     VkPipeline p_nq, p_qk, p_at, p_am;
-    /* qwen3.5's recurrent layers */
-    VkShaderModule sm_gc, sm_gs, sm_gl, sm_gr, sm_gg;
-    VkPipeline p_gc, p_gs, p_gl, p_gr, p_gg;
+    /* qwen3.5's recurrent layers (sm_gb: the betas and decays of a short
+       block, sm_gx: those of a long one's raw dot products) */
+    VkShaderModule sm_gc, sm_gs, sm_gl, sm_gr, sm_gg, sm_gb, sm_gx;
+    VkPipeline p_gc, p_gs, p_gl, p_gr, p_gg, p_gb, p_gx;
     size_t *par;      /* per layer: its parameters' offsets in buf (PAR_*) */
     struct stage buf; /* every intermediate, one allocation */
     /* offsets into buf, each nb tokens' worth */
@@ -167,9 +191,11 @@ struct janas_gpu_tok {
     size_t o_x, o_x1, o_q256, o_q32, o_qkv, o_ywo, o_gu, o_h, o_yd, o_rope,
         o_logits, o_pos;
     /* qwen3.5: the normalized input (f32), q|k|v and z of the recurrent
-       layers, their convolution's output, beta and alpha, their raw
-       output, the query's gates, the final hidden states */
-    size_t o_xnf, o_mix, o_z, o_conv, o_ba, o_att, o_gate, o_hid;
+       layers, their convolution's output (the replayed tokens' rows
+       first), beta and alpha, their raw output, the betas and decays used
+       (for the log), the query's gates, the final hidden states */
+    size_t o_xnf, o_mix, o_z, o_conv, o_ba, o_att, o_bd, o_gate, o_hid;
+    int log_ok; /* the model's log is where the GPU reads and writes */
     /* a mixture: a submission a layer ([n][all][hidden], n_layer + 1 of
        them, each recorded for the runs in seg_nch), its shaders; the
        router's logits (n_expert + 1 a token), the pairs' experts and
@@ -184,8 +210,8 @@ struct janas_gpu_tok {
     VkPipeline p_tk, p_ga, p_cb, p_sm;
     size_t o_r, o_pe, o_pw, o_shw, o_sh, o_xg, o_egu, o_eh, o_dout, o_gt, o_inv,
         o_tab1, o_tab2, o_ind;
-    /* a shared expert's activation as floats and in blocks of 32, for a
-       down matrix in blocks of 32 */
+    /* a dense layer's or a shared expert's activation as floats and in
+       blocks of 32, where a down matrix is in blocks of 32 */
     size_t o_hf, o_h32;
     uint32_t tiles1, tiles2;
     uint32_t n_seg; /* n_layer + 1 */

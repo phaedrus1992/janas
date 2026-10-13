@@ -426,6 +426,10 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         .vmap_mod = m->vmap_mod,
         .ssm_state = m->ssm_buf,
         .conv_state = m->conv_buf,
+        .log_mixed = m->a->rec ? m->log_mixed : NULL,
+        .log_beta = m->a->rec ? m->log_beta : NULL,
+        .log_decay = m->a->rec ? m->log_decay : NULL,
+        .log_rows = JANAS_LLM_MAX_BLOCK,
         .n_expert = moe ? m->n_expert : 0,
         .k = moe ? m->k_use : 0,
         .eff = eff,
@@ -460,6 +464,28 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
     return m->gtok ? 0 : -1;
 }
 
+/* The passes of a few tokens (a chain of drafts) whole on the GPU, asked
+   for (JANAS_GPU_SHORT=1): see janas_m_gpu_token. */
+static int shorts_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("JANAS_GPU_SHORT") && atoi(getenv("JANAS_GPU_SHORT")) > 0;
+    return on;
+}
+
+uint32_t janas_llm_model_pass_cap(const struct janas_llm_model *m)
+{
+    /* where such passes go whole to the GPU: asked for, the tuner's choice
+       for them (class 1, 2 to 16 tokens) the GPU, the token's shaders not
+       refused, a dense model or a recurrent one (janas_m_gpu_token) */
+    if (!shorts_on() || !m->gpu || m->gpu_off || m->gtok_state < 0 ||
+        m->n_expert > 1 || m->tuner.n_cand <= 0 ||
+        !m->tuner.cand[janas_tuner_best(&m->tuner, 1)].gpu)
+        return 0;
+    return (uint32_t)janas_gpu_few_max(m->gpu);
+}
+
 int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits)
 {
@@ -482,12 +508,30 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
     }
     int prompt =
         janas_gpu_fast_prompt() && n >= JANAS_GPU_FAST_N && blocks != 0;
-    if (!prompt && !(tok && (n == 1 || blocks > 0)))
+    /* A short pass (a chain of drafts to verify) where the tuner chose the
+       GPU for it: the whole pass in one submission, the CPU idle, rather
+       than the products by groups beside the CPU - on the development
+       laptop's integrated GPU the CPU's work beside it took the power its
+       clock needed (670-840 MHz against ~1050), and Qwen3-4B's passes of
+       8 and 16 tokens ran at 12.7 and 10.1 ms a token whole against 27.5
+       and 17.5 by groups and 15.5 and 14.5 on the CPU alone (13 Oct 2026).
+       Dense models for now (a mixture's layers need the CPU's routing);
+       a recurrent model's too, the GPU replaying and logging its state as
+       the CPU does.
+       Asked for only (JANAS_GPU_SHORT=1): with drafts it lost on Qwen3-4B,
+       22-23 tokens/s against 28-32 on the CPU, a pass of 2 tokens costing
+       78-92 ms against 46 - some 40 ms a pass besides reading the weights -
+       and the text not the same as without drafts (the GPU's norms and
+       attention sum in its own order; 13 Oct 2026). */
+    int short_pass = shorts_on() && m->gpu_use && n >= 2 &&
+                     n <= JANAS_LLM_MAX_BLOCK && m->n_expert <= 1;
+    if (!prompt && !short_pass && !(tok && (n == 1 || blocks > 0)))
         return -1;
-    /* a recurrent model: blocks that need no log (longer than a draft's)
-       and replay nothing - the state read whole from one half, written to
-       the other, as forward() expects of such a block */
-    if (m->a->rec && (n <= JANAS_LLM_MAX_BLOCK || m->replay))
+    /* a recurrent model: the GPU replays first what forward() asks (the
+       m->replay tokens of the last call that were kept, at most
+       JANAS_GPU_TOK_MAX_REPLAY) and logs a block short enough to be taken
+       back, as the CPU's path does, in the same log */
+    if (m->a->rec && m->replay > JANAS_GPU_TOK_MAX_REPLAY)
         return -1;
     const char *why = not_for_gpu(m);
     if (why) {
@@ -522,25 +566,30 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         return -1;
     /* the recurrent state: the first piece from half src to the other,
        the later ones on that one in place; each piece at least the
-       convolution's rows of state long. With an MTP block or a drafting
-       model, every token's final hidden state */
+       convolution's rows of state long. The first replays, every piece of
+       a block short enough logs its tokens at its row. With an MTP block
+       or a drafting model, every token's final hidden state */
     uint32_t src = m->src, dst = 1 - m->src, rows = m->a->rec ? m->d_conv : 1;
+    int logged = m->a->rec && n <= JANAS_LLM_MAX_BLOCK;
     float *hid = m->mtp || m->asst ? m->hid : NULL;
     for (uint32_t j = 0, k; j < n; j += k) {
         uint32_t nb = janas_gpu_tok_block_at(m->gtok, &m->gtok_md, pos + j);
         k = n - j < nb ? n - j : nb;
         if (n - j - k > 0 && n - j - k + 1 < rows)
             k -= rows; /* the last piece long enough */
-        if (janas_gpu_tok_run(m->gpu, m->gtok, &m->gtok_md,
-                              m->x + (size_t)j * m->d_model,
-                              m->rope_cos + (size_t)j * half,
-                              m->rope_sin + (size_t)j * half, pos + j, k,
-                              j + k < n ? 2
-                              : all     ? 1
-                                        : 0,
-                              logits, hid ? hid + (size_t)j * m->d_model : NULL,
-                              j ? dst : src, dst) != 0)
-            return -1;
+        int rc = janas_gpu_tok_run(
+            m->gpu, m->gtok, &m->gtok_md, m->x + (size_t)j * m->d_model,
+            m->rope_cos + (size_t)j * half, m->rope_sin + (size_t)j * half,
+            pos + j, k,
+            j + k < n ? 2
+            : all     ? 1
+                      : 0,
+            logits, hid ? hid + (size_t)j * m->d_model : NULL, j ? dst : src,
+            dst, j ? 0 : m->replay, logged ? j : UINT32_MAX);
+        /* -2, or any failure after a first piece that replayed: the base
+           was updated in place, the CPU cannot replay on it again */
+        if (rc != 0)
+            return rc == -2 || (j && m->replay) ? -2 : -1;
     }
     return 0;
 }

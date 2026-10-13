@@ -1,0 +1,100 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// IQ4_XS weights times 2 to 8 Q8_K vectors with the lanes on the vectors,
+// as q4k_mvd.comp: lane v of a subgroup of 8 is vector v, and a subgroup
+// takes R rows one after the other. Lane i reads group i's 16 bytes of
+// nibbles of a row's block - the subgroup 128 contiguous bytes - and turns
+// them into IQ4_NL's levels through the table in shared memory (as
+// iq4xs_matvec.comp), once for all the vectors; the levels reach every
+// lane's dot products through subgroupBroadcast. iq4xs_matvec puts a row
+// on a lane, and its loads of the weights touch eight rows each. A block is
+// 136 bytes, its nibbles from byte 8: words, read four at a time. As
+// janas_iq4xs_dot_ref: each group's integer dot times its scale (ls - 32),
+// the block's exact integer sum in one fma - the CPU's result bit for bit.
+// Subgroups of 8 lanes; workgroup x: a group of 8 vectors, y: the rows (32
+// a workgroup, gpu_impl.h MVD_ROWS).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8; /* unused: the lanes are the vectors */
+layout(constant_id = 1) const uint SG = 8;
+const uint R = 4; /* rows a subgroup */
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+
+const int IQ4[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
+                            1, 13, 25, 38, 53, 69, 89, 113);
+shared uint T[16];
+
+/* the uvec4 at byte lo of the 4 GB whose high word is hi: neither buffer
+   crosses a 4 GB boundary (the host checks) */
+uvec4 at(uint lo, uint hi) { return U4(uvec2(lo, hi)).v[0]; }
+int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+/* each byte of w (a nibble) through the IQ4_NL table */
+uint iq4(uint w)
+{
+    return T[w & 15u] | (T[(w >> 8) & 15u] << 8) | (T[(w >> 16) & 15u] << 16) |
+           (T[(w >> 24) & 15u] << 24);
+}
+
+void main()
+{
+    if (gl_LocalInvocationID.x < 16u)
+        T[gl_LocalInvocationID.x] = uint(IQ4[gl_LocalInvocationID.x]) & 0xffu;
+    barrier();
+    F Y = F(p.y);
+    uint lane = gl_SubgroupInvocationID;
+    uint row0 = (gl_WorkGroupID.y * (64u / SG) + gl_SubgroupID) * R;
+    uint v = gl_WorkGroupID.x * SG + lane, vv = min(v, p.nv - 1u);
+    /* this lane's vector: its blocks from byte xl */
+    uint xl = p.x.x + vv * p.xs * 320u;
+    float acc[R];
+    for (uint r = 0; r < R; r++)
+        acc[r] = 0.0;
+    for (uint b = 0; b < p.nb; b++) {
+        /* the vector's block: 256 quants (group g: 2g, 2g + 1), the scale */
+        uvec4 xq[16];
+        for (uint k = 0; k < 16u; k++)
+            xq[k] = at(xl + b * 320u + 16u * k, p.x.y);
+        float d8 = uintBitsToFloat(at(xl + b * 320u + 288u, p.x.y).x);
+        for (uint r = 0; r < R; r++) {
+            uint row = min(row0 + r, p.rows - 1u);
+            U1 B = U1(uvec2(p.w.x + (row * p.nb + b) * 136u, p.w.y));
+            /* d and scales_h, scales_l: every lane the same */
+            uint w0 = B.v[0], sl = B.v[1];
+            /* group lane's nibbles: weights 0-15 low, 16-31 high */
+            uvec4 q = uvec4(B.v[2u + 4u * lane], B.v[3u + 4u * lane],
+                            B.v[4u + 4u * lane], B.v[5u + 4u * lane]);
+            uvec4 lo = uvec4(iq4(q.x & 0x0f0f0f0fu), iq4(q.y & 0x0f0f0f0fu),
+                             iq4(q.z & 0x0f0f0f0fu), iq4(q.w & 0x0f0f0f0fu));
+            uvec4 hi = uvec4(iq4((q.x >> 4) & 0x0f0f0f0fu), iq4((q.y >> 4) & 0x0f0f0f0fu),
+                             iq4((q.z >> 4) & 0x0f0f0f0fu), iq4((q.w >> 4) & 0x0f0f0f0fu));
+            uint sh = w0 >> 16;
+            int isum = 0;
+            [[unroll]] for (uint g = 0; g < 8u; g++) {
+                uvec4 l = subgroupBroadcast(lo, g), u = subgroupBroadcast(hi, g);
+                uvec4 a = xq[2u * g], e = xq[2u * g + 1u];
+                int dg = dp(l.x, a.x) + dp(l.y, a.y) + dp(l.z, a.z) + dp(l.w, a.w) +
+                         dp(u.x, e.x) + dp(u.y, e.y) + dp(u.z, e.z) + dp(u.w, e.w);
+                uint ls = ((sl >> (8u * (g >> 1) + 4u * (g & 1u))) & 15u) |
+                          (((sh >> (2u * g)) & 3u) << 4);
+                isum += (int(ls) - 32) * dg;
+            }
+            float d = unpackHalf2x16(w0).x;
+            acc[r] = fma(d * d8, float(isum), acc[r]);
+        }
+    }
+    if (v < p.nv)
+        for (uint r = 0; r < R; r++)
+            if (row0 + r < p.rows)
+                Y.v[v * p.ys + row0 + r] = acc[r];
+}

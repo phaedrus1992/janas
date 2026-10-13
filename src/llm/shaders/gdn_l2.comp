@@ -3,8 +3,9 @@
 #version 450
 // After gdn_conv.comp: each q and k head (the first 2 n_kh of the
 // convolution's heads of ds = 128 channels) over its L2 norm, x / sqrt(sum
-// x^2 + eps), in place. A workgroup per head (x) and token (y), a channel a
-// thread.
+// x^2 + eps), in place. A workgroup per head (x) and row (y) - the a rows
+// replayed (the position buffer's word 3) and the call's n - a channel a
+// thread; a whole workgroup past a + n leaves at once.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -13,14 +14,17 @@
 layout(local_size_x = 128) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
 
-layout(push_constant) uniform P { uvec2 x; uint cc; float eps; } p;
+layout(push_constant) uniform P { uvec2 x, pos; uint cc; float eps; uint n; } p;
 
 shared float sg_part[64];
 
 void main()
 {
     uint i = gl_LocalInvocationID.x, h = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+    if (t >= RP(p.pos).v[3] + p.n)
+        return; /* the same for the whole workgroup: before any barrier */
     F X = F(p.x);
     uint o = t * p.cc + h * 128u + i;
     float v = X.v[o];

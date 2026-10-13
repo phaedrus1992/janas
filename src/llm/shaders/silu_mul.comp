@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 Maurizio Cammalleri */
 #version 450
-// h = SiLU(gate) * up as floats, n values (gpu_token.c: a shared expert
-// whose down matrix is in blocks of 32, quantized afterwards by
-// norm_quant.comp into both layouts). The GPU's exp: NOT bit for bit with
+// h = SiLU(gate) * up as floats, n values (gpu_token_rec.c: a dense
+// layer's or a shared expert's feed-forward whose down matrix is in blocks
+// of 32, quantized afterwards by norm_quant.comp into both layouts). The GPU's exp: NOT bit for bit with
 // the CPU.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require

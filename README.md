@@ -8,7 +8,7 @@
 
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)]() [![Platform: Linux | Windows x86-64](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20x86--64-lightgrey.svg)]() [![LinkedIn](https://img.shields.io/badge/LinkedIn-Maurizio%20Cammalleri-0077B5?logo=linkedin)](https://www.linkedin.com/in/maurizio-cammalleri-80a89a11/) [![Substack](https://img.shields.io/badge/Substack-Maurizio%20Cammalleri-FF6719?logo=substack)](https://cammalleri.substack.com/)
 
-**37 tok/s from Qwen3-Next-80B (a 48 GB model) on a laptop with 32 GB of memory, 24 without drafts, where llama.cpp manages 2.8; reading a prompt, 62 tok/s against 16.** Janas-LLM was faster than llama.cpp on every model compared on the same laptop (Debian 13 Linux, Intel Core Ultra 9 185H, its integrated Arc GPU, 32 GB, an NVMe SSD; 9-11 October 2026; the whole machine [below](#the-machine-it-grew-on)):
+**37 tok/s from Qwen3-Next-80B (a 48 GB model) on a laptop with 32 GB of memory, 24 without drafts, where llama.cpp manages 2.8; reading a prompt, 62 tok/s against 16.** Janas-LLM was faster than llama.cpp on every model compared on the same laptop (Debian 13 Linux, Intel Core Ultra 9 185H, its integrated Arc GPU, 32 GB, an NVMe SSD; 9-12 October 2026; the whole machine [below](#the-machine-it-grew-on)):
 
 | Model | reading 1,024 tokens: Janas-LLM | llama.cpp | writing: Janas-LLM | llama.cpp |
 |---|---:|---:|---:|---:|
@@ -17,6 +17,7 @@
 | Qwen3.6-35B-A3B | 104 tok/s | 79 tok/s | 19 tok/s | 12 tok/s |
 | Qwen3-30B-A3B | 135 tok/s | 122 tok/s | 32 tok/s | 15 tok/s |
 | Gemma-4-26B-A4B-it | 84 tok/s | 76 tok/s | 18 tok/s | 12 tok/s |
+| Qwen3.8-27B (dense, 17.6 GB) | 30.6 tok/s | 25.6 tok/s | 4.4 tok/s | 2.1 tok/s |
 | Gemma-4-12B-it | 65 tok/s | 46 tok/s | 9.9 tok/s | 7.1 tok/s |
 | Qwen3.5-9B | 111 tok/s | 78 tok/s | 14 tok/s | 8.7 tok/s |
 | Gemma-4-E4B-it | 122 tok/s | 109 tok/s | 20 tok/s | 15 tok/s |
@@ -34,7 +35,7 @@ The same models from other hands, in the catalog beside them:
 | Qwen3-30B-A3B, unsloth's UD-Q3_K_XL (3 bits) | 100 tok/s | **112 tok/s** | 36 tok/s | 11 tok/s |
 | Qwen3-4B, bartowski's Q4_K_M (importance matrix) | 191 tok/s | 160 tok/s | 26 tok/s | 18 tok/s |
 
-One exception: the 3-bit Qwen3-30B reads a prompt slower than llama.cpp, since its Q3_K weights do not go to the GPU's fast prompt yet; it writes three times as fast.
+Qwen3.8-27B: llama.cpp measured on 12 October 2026 (`llama-bench -r 2`), Janas-LLM on 13 October (`janas-bench --prompt 1024 --gen 16`, two rounds), once its prompt went whole to the GPU in one submission: 30.6 tok/s, where it read 26.4 the day before and 18.7 before the GPU's tiles for the IQ4_XS, IQ3_S and IQ4_NL weights of unsloth's UD mix. One exception: the 3-bit Qwen3-30B reads a prompt slower than llama.cpp, since its Q3_K weights do not go to the GPU's fast prompt yet; it writes three times as fast.
 
 How they were measured, and the speeds with the drafts: [What works now](#what-works-now). On another machine the figures will be other ones: `janas-bench` measures yours.
 
@@ -118,7 +119,7 @@ The last column is a draft guessing the next tokens and the model checking them,
 
 **This column was wrong until 26 September 2026**, and higher: it measured the block continuing a paragraph that repeated itself, which a model copies and the block guesses almost every time - 107 tok/s for Qwen3.5-2B, 26 for Qwen3.5-9B. The MoE figures of the time (29 and 30) happened to be lower than today's; the ChangeLog has the details.
 
-The comparison with llama.cpp at the top of this page was measured so: llama.cpp (build `2b18470` of 18 September 2026) with its Vulkan backend on the same integrated GPU, everything on it (`llama-bench -p 1024 -n 16 -ngl 99 -t 12`; the largest model otherwise, below), against `janas-bench --prompt 1024 --gen 16` on the same files the same days (9-11 October 2026; llama.cpp's best configuration, Janas-LLM's own choice; on 11 October three rounds each, `llama-bench -r 3` and `janas-bench --rounds 3`, for Qwen3-0.6B, Qwen3.5-0.8B, Qwen3.6-35B-A3B and the models from other hands; Qwen3-Coder-Next as Qwen3-Next-80B, below).
+The comparison with llama.cpp at the top of this page was measured so: llama.cpp (build `2b18470` of 18 September 2026) with its Vulkan backend on the same integrated GPU, everything on it (`llama-bench -p 1024 -n 16 -ngl 99 -t 12`; the largest model otherwise, below), against `janas-bench --prompt 1024 --gen 16` on the same files the same days (9-12 October 2026; llama.cpp's best configuration, Janas-LLM's own choice; on 11 October three rounds each, `llama-bench -r 3` and `janas-bench --rounds 3`, for Qwen3-0.6B, Qwen3.5-0.8B, Qwen3.6-35B-A3B and the models from other hands; Qwen3-Coder-Next as Qwen3-Next-80B, below).
 
 On Qwen3-Next-80B-A3B, whose file is larger than this laptop's 30 GB, llama.cpp with its usual build ran out of memory as soon as the GPU took part, even with the experts left on the CPU (`-ngl 99 -ncmoe 48`): its CPU backend copies the weights into memory of its own to repack them, and the Vulkan backend copies those it leaves to the CPU into buffers the system cannot reclaim. It ran with a build without repacking (`GGML_CPU_REPACK=OFF`) and two options more, `--no-host 1 -lm mmap`, which leave the experts in the file, read through the page cache: 16 tok/s reading with the GPU, and 2.8 writing on the CPU alone (with the GPU, 2.0); these are its two figures in the table. Janas-LLM ran the same model with no option of its own, the experts it uses most in a cache of about 19 GB and the rest read from the disk. Janas-LLM's figures are one round each; the writing column is without drafts on both sides. The two tools do not measure in exactly the same way (`llama-bench` writes without a prompt before it; `janas-bench` after the 1,024 tokens), and it is one machine. llama.cpp's own CPU backend did worse on this laptop than its Vulkan one at reading (Qwen3-4B 70 tok/s on 20 threads) and as well at writing.
 

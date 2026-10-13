@@ -1,0 +1,120 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// Q4_K weights times NV Q8_K vectors (a chain of drafts, a short block),
+// one row per invocation, with as few instructions per multiply-add as the
+// layout allows: a block is taken a quarter at a time (sub-blocks 2c and
+// 2c + 1), its nibbles unpacked once for all the vectors; the activations
+// of a quarter come two vectors to a load of eight lanes (lane i: vector
+// 2m + i / 4, uvec4 i % 4 of the quarter) and reach the dot products as
+// scalar operands (subgroupBroadcast with a constant lane); the sums of 32
+// activations that the minimums weigh are made by the lanes in parallel,
+// four to a lane. The buffers of the weights and of the activations never
+// cross a 4 GB boundary (the host checks), so an address is its low word
+// plus an offset. The same integer sums and float operations as the CPU
+// kernels (janas_q4k_dot_ref): bit for bit. NV even; subgroups of 8 lanes
+// or more (beyond 8 the loads repeat).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8;
+layout(constant_id = 1) const uint SG = 8;
+const uint NM = NV / 2u; /* loads of a quarter: two vectors each */
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+
+// w: the first row; x: vector v, block b at uvec4 (v * xs + b) * 20;
+// y: row r of vector v at y[v * ys + r]
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+
+/* the uvec4 at byte lo of the 4 GB whose high word is hi */
+uvec4 at(uint lo, uint hi) { return U4(uvec2(lo, hi)).v[0]; }
+
+int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+int dp4(uvec4 a, uvec4 b) { return dp(a.x, b.x) + dp(a.y, b.y) + dp(a.z, b.z) + dp(a.w, b.w); }
+
+void main()
+{
+    F Y = F(p.y);
+    uint lane = gl_SubgroupInvocationID % 8u;
+    /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
+       of the same rows go out together and the weights the first reads
+       from memory the others find in the L3 */
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
+    /* this lane's share of each load of the activations: vector
+       2m + lane / 4, uvec4 lane % 4 (of a quarter, or of the tail) */
+    uint xl[NM];
+    for (uint m = 0; m < NM; m++)
+        xl[m] = p.x.x + (min(v0 + 2u * m + lane / 4u, p.nv - 1u) * p.xs * 20u + lane % 4u) * 16u;
+    float acc[NV], accm[NV];
+    for (uint v = 0; v < NV; v++) {
+        acc[v] = 0.0;
+        accm[v] = 0.0;
+    }
+    uint wl = p.w.x + row * p.nb * 144u;
+    for (uint b = 0; b < p.nb; b++, wl += 144u) {
+        uvec4 hd = at(wl, p.w.y);
+        /* the scales and minimums of sub-blocks 0-3 and 4-7, a byte each */
+        uint sc03 = hd.y & 0x3f3f3f3fu, mn03 = hd.z & 0x3f3f3f3fu;
+        uint sc47 = (hd.w & 0x0f0f0f0fu) | ((hd.y >> 2) & 0x30303030u);
+        uint mn47 = ((hd.w >> 4) & 0x0f0f0f0fu) | ((hd.z >> 2) & 0x30303030u);
+        int isum[NV];
+        for (uint v = 0; v < NV; v++)
+            isum[v] = 0;
+        [[unroll]] for (uint c = 0; c < 4u; c++) {
+            uvec4 xr[NM];
+            for (uint m = 0; m < NM; m++)
+                xr[m] = at(xl[m] + b * 320u + 64u * c, p.x.y);
+            uvec4 q0 = at(wl + 16u + 32u * c, p.w.y), q1 = at(wl + 32u + 32u * c, p.w.y);
+            uvec4 l0 = q0 & 0x0f0f0f0fu, l1 = q1 & 0x0f0f0f0fu;
+            uvec4 h0 = (q0 >> 4) & 0x0f0f0f0fu, h1 = (q1 >> 4) & 0x0f0f0f0fu;
+            uint scw = c < 2u ? sc03 : sc47;
+            int sl = int(bitfieldExtract(scw, int(16u * (c & 1u)), 8));
+            int sh = int(bitfieldExtract(scw, int(16u * (c & 1u) + 8u), 8));
+            for (uint v = 0; v < NV; v++) {
+                uint m = v / 2u, o = 4u * (v % 2u);
+                int dl = dp4(l0, subgroupBroadcast(xr[m], o)) +
+                         dp4(l1, subgroupBroadcast(xr[m], o + 1u));
+                int dh = dp4(h0, subgroupBroadcast(xr[m], o + 2u)) +
+                         dp4(h1, subgroupBroadcast(xr[m], o + 3u));
+                isum[v] += dl * sl + dh * sh;
+            }
+        }
+        /* the tail of a vector's block, uvec4 16-19: the sums of 16 quants
+           two a word, then the scale; a lane adds its word's halves (lanes
+           4h and 4h + 1: the sums of 32 of sub-blocks 0-3 and 4-7 of vector
+           2m + h; lane 4h + 2 has its scale) */
+        ivec4 ps[NM];
+        uint d8w[NM];
+        for (uint m = 0; m < NM; m++) {
+            uvec4 t = at(xl[m] + b * 320u + 256u, p.x.y);
+            ps[m] = bitfieldExtract(ivec4(t), 0, 16) + (ivec4(t) >> 16);
+            d8w[m] = t.x;
+        }
+        int mn[8];
+        for (uint s = 0; s < 8u; s++)
+            mn[s] = int(bitfieldExtract(s < 4u ? mn03 : mn47, int(8u * (s & 3u)), 8));
+        vec2 dd = unpackHalf2x16(hd.x);
+        for (uint v = 0; v < NV; v++) {
+            uint m = v / 2u, o = 4u * (v % 2u);
+            ivec4 p0 = subgroupBroadcast(ps[m], o), p1 = subgroupBroadcast(ps[m], o + 1u);
+            float d8 = uintBitsToFloat(subgroupBroadcast(d8w[m], o + 2u));
+            int imin = mn[0] * p0.x + mn[1] * p0.y + mn[2] * p0.z + mn[3] * p0.w +
+                       mn[4] * p1.x + mn[5] * p1.y + mn[6] * p1.z + mn[7] * p1.w;
+            acc[v] = fma(dd.x * d8, float(isum[v]), acc[v]);
+            accm[v] = fma(dd.y * d8, float(imin), accm[v]);
+        }
+    }
+    if (grow < p.rows)
+        for (uint v = 0; v < NV; v++)
+            if (v0 + v < p.nv)
+                Y.v[(v0 + v) * p.ys + row] = acc[v] - accm[v];
+}

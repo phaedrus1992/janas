@@ -113,6 +113,13 @@ aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223  Qwen3.5-2B-Q4_
 e40ec6c58ef2390c7a4ce8c9b7b6b384ed4e55c9980f646d1c98e83e2c018115  qwen3.5-9b-q4km.jns   (gguf2jns)
 ```
 
+**Qwen3.8-27B**, dense, from [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) at revision `4ca72078`, unsloth's UD-Q4_K_XL mix (Q4_K, Q5_K, Q6_K and Q8_0 with IQ4_XS, IQ3_S, IQ4_NL and Q3_K); its multi-token prediction block is in the GGUF, and so in the converted file. Converted in one step:
+
+```
+3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e  Qwen3.8-27B-UD-Q4_K_XL.gguf
+138d1db3af7e48d3bd36a428f7a81dfd8813434521aced84459c546e4830ab5b  qwen3.8-27b-ud-q4kxl.jns   (gguf2jns)
+```
+
 **Qwen3-30B-A3B**, from [`Qwen/Qwen3-30B-A3B-GGUF`](https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF):
 
 ```
@@ -212,7 +219,7 @@ The same tensors from shards on disk give the same bytes. A private or gated rep
 
 **The converter, always. The weights, only when their licence plainly allows it.** In order:
 
-1. **Models under Apache 2.0, MIT or a similar licence.** Every model Janas supports today is under **Apache 2.0** and none is gated: Qwen3-Next (including Qwen3-Coder-Next), Qwen3.5 and Qwen3.6, and Qwen3 MoE — checked on their pages, not in their files. Converted files may be published, and when they are, they carry:
+1. **Models under Apache 2.0, MIT or a similar licence.** Every model Janas supports today is under **Apache 2.0** and none is gated: Qwen3-Next (including Qwen3-Coder-Next), Qwen3.5, Qwen3.6 and Qwen3.8-27B, and Qwen3 MoE — checked on their pages, not in their files. Converted files may be published, and when they are, they carry:
    - a link to the original model and to its licence;
    - the original `LICENSE` and, where there is one, the `NOTICE`;
    - a statement of what was changed (the list above) and which version of the tools did it;

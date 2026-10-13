@@ -74,6 +74,13 @@ struct janas_gpu_tok_model {
     int vmap_mod;
     uint16_t *ssm_state;
     float *conv_state;
+    /* their log (the model's, model_impl.h): per recurrent layer log_rows
+       rows of conv_ch floats (the convolution's inputs) and of nv floats
+       (betas, decays), what a call replays of the last one when that one's
+       last tokens were taken back (rejected drafts); NULL: blocks short
+       enough to be logged stay on the CPU */
+    float *log_mixed, *log_beta, *log_decay;
+    uint32_t log_rows;
     /* a mixture (n_expert > 1, 0 for a dense model): k experts a token, of
        eff rows each; ff above is the shared expert's (eff without one).
        Its layers run one at a time, the CPU between two of them: the
@@ -92,6 +99,10 @@ struct janas_gpu_tok_model {
 };
 
 struct janas_gpu_tok;
+
+/* The most tokens of the last call a block replays before its own (see
+   janas_gpu_tok_run): a chain of drafts is shorter. */
+#define JANAS_GPU_TOK_MAX_REPLAY 16
 
 /* Buffers and shaders for a model of that shape; NULL (the GPU cannot, or
    out of memory) with the reason in err. */
@@ -116,18 +127,21 @@ uint32_t janas_gpu_tok_block_at(const struct janas_gpu_tok *t,
  * the last token (all 0), of every token (1) or of none (2) into logits;
  * with hidden, the final hidden states (n x dm: the last norm's output, an
  * MTP block's input) there. The recurrent layers read their state from
- * half src and write it to half dst (the same for a block's later pieces).
- * 0, or -1 with nothing changed but the cache rows pos .. pos + n - 1 (the
- * caller runs the block on the CPU then).
+ * half src and write it to half dst (the same for a block's later pieces);
+ * first they replay the first replay tokens (at most
+ * JANAS_GPU_TOK_MAX_REPLAY) of the log on half src in place, as the CPU
+ * does when a call starts before the end of the last one (src is then the
+ * base); with log_row other than UINT32_MAX they log the block's tokens
+ * from that row of the log on.
+ * 0; -1 with nothing changed but the cache rows pos .. pos + n - 1 (the
+ * caller runs the block on the CPU then); -2 the GPU failed after it had
+ * started, with the state no longer what it was.
  */
 int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
                       const struct janas_gpu_tok_model *md, const float *x,
                       const float *cs, const float *sn, uint32_t pos,
                       uint32_t n, int all, float *logits, float *hidden,
-                      uint32_t src, uint32_t dst);
-
-/* Whether the GPU reads the host's memory in place (an integrated GPU with
-   the host-memory import, not JANAS_GPU_COPY): what the token needs. */
-int janas_gpu_shares_host(const struct janas_gpu *g);
+                      uint32_t src, uint32_t dst, uint32_t replay,
+                      uint32_t log_row);
 
 #endif

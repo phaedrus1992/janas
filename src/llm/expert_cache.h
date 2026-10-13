@@ -72,6 +72,8 @@ const uint8_t *janas_expert_cache_resident(struct janas_expert_cache *c,
    slot (JANAS_ARENA_GUARD): the GPU's shaders read a few bytes beyond a
    matrix (Q6_K: 4), and the last slot's had nowhere to go. */
 #define JANAS_ARENA_GUARD 4096
+/* the boundary of the memory a GPU may import: a huge page */
+#define JANAS_HUGE_PAGE ((size_t)2 << 20)
 const uint8_t *janas_expert_cache_arena(const struct janas_expert_cache *c,
                                         uint64_t *bytes);
 uint64_t janas_expert_cache_loads(const struct janas_expert_cache *c);

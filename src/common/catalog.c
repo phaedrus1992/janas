@@ -131,6 +131,22 @@ const struct janas_model_entry janas_catalog[] = {
          "67f31f57dbc78ca8c02ef5e3aa137c5df3836a3decda20b6ea057d004089c361",
      .ram_gb = 8,
      .fast = "--head 4"},
+    /* unsloth's UD mix (Q4_K, Q5_K, Q6_K, Q8_0 with IQ4_XS, IQ3_S, IQ4_NL
+       and Q3_K), its multi-token prediction block inside the GGUF; the
+       Qwen team publishes no GGUF of its own (12 Oct 2026) */
+    {.name = "qwen3.8-27b",
+     .what = "Qwen3.8-27B, dense, unsloth's UD mix, with its MTP block",
+     .repo = "unsloth/Qwen3.8-27B-GGUF",
+     .parts = {"Qwen3.8-27B-UD-Q4_K_XL.gguf"},
+     .part_sha =
+         {"3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"},
+     .gguf_gb = 17.56,
+     .out = "qwen3.8-27b-ud-q4kxl.jns",
+     .jns_repo = "prabanta-dev/Qwen3.8-27B-JNS",
+     .jns_gb = 17.56,
+     .flat_sha =
+         "138d1db3af7e48d3bd36a428f7a81dfd8813434521aced84459c546e4830ab5b",
+     .ram_gb = 32},
     {.name = "qwen3-30b-a3b",
      .what = "Qwen3-30B-A3B, mixture of experts",
      .repo = "Qwen/Qwen3-30B-A3B-GGUF",

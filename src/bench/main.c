@@ -16,6 +16,10 @@
  *                    the configurations measured on a warm cache, as a
  *                    chat runs after its first minutes)
  *
+ * With the fast prompt the GPU reads a prompt's blocks in every
+ * configuration, "+ GPU" or not, and the report says so under the table;
+ * "+ GPU" is its part in the shorter passes.
+ *
  * The model is taken as janas-chat takes it (common/model_pick.c): a .jns
  * file, a name of the catalog (qwen3-4b), downloaded if it is not there
  * yet, or nothing, and then the list to choose from. Its prediction file
@@ -434,6 +438,18 @@ int main(int argc, char **argv)
         out("%-22s %8.1f tok/s %6.1f tok/s %12s %12s %8.1f%%\n", name,
             r->prefill, r->decode, mt, ms, r->hits);
     }
+    /* the fast prompt runs on the GPU in every row, so that a prompt gives
+       the same results whatever the configuration: the rows without
+       "+ GPU" are not the CPU alone (issue #16 read them so, and found the
+       GPU of no help where it read the prompt 5.2 times faster) */
+    int cpu_rows = 0;
+    for (int c = 0; c < nc; c++)
+        cpu_rows += !gp[c];
+    if (cpu_rows && janas_llm_model_gpu_prompts(m))
+        out("note:    in every row the GPU reads a prompt's blocks of %d "
+            "tokens or more (the fast prompt); \"+ GPU\" also gives it a "
+            "part in the shorter passes\n",
+            JANAS_GPU_FAST_N);
     janas_llm_model_force(m, -1);
     char tune[512];
     int32_t tn;

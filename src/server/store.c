@@ -176,7 +176,8 @@ struct srv_store *srv_store_open(size_t cap, const char *dir, char *err,
     }
     struct loaded l = {0};
     int skipped = srv_disk_load(st->disk, take, &l);
-    qsort(l.e, l.n, sizeof(*l.e), by_seq);
+    if (l.n) /* none: l.e is NULL, which qsort may not be given */
+        qsort(l.e, l.n, sizeof(*l.e), by_seq);
     for (size_t i = 0; i < l.n; i++) {
         struct entry *e = l.e[i];
         e->prev = st->tail;

@@ -5,9 +5,14 @@
  * the logits with a reference (llama.cpp dump: float32 x n_tokens x n_vocab).
  *
  * Usage: llm_eval <model.jns> <tokens.int32> [reference.logits]
- *                 [cache_MiB] [compute_cpus] [io_cpus] [block=B] [dump=F]
+ *                 [cache_MiB] [compute_cpus] [io_cpus] [block=B] [reject=R]
+ *                 [dump=F]
  * With block=B the tokens are also run in blocks of B (the prefill path) and
  * the logits compared with the token-by-token ones: they must be identical.
+ * With reject=R (R < B) each block but the last keeps only its first B - R
+ * tokens and the next starts after them, as when the last R tokens of a
+ * chain of drafts are rejected: a recurrent model then replays the kept
+ * tokens of its log on the state before the block.
  * With dump=F the logits are written to F in the reference format.
  * Reports, per position, whether the most likely token agrees, the largest and
  * mean absolute logit difference, and the time per token.
@@ -143,10 +148,17 @@ int main(int argc, char **argv)
            "%.1f token/s), cold cache: %.1f%% of experts from RAM\n",
            n, dt, dt / n * 1e3, t2 / (n - n / 2) * 1e3, (n - n / 2) / t2,
            100.0 * st.hits / (st.requests ? st.requests : 1));
-    int block = 0;
-    for (int i = 7; i < argc; i++)
+    int block = 0, reject = 0;
+    for (int i = 7; i < argc; i++) {
         if (strncmp(argv[i], "block=", 6) == 0)
             block = atoi(argv[i] + 6);
+        if (strncmp(argv[i], "reject=", 7) == 0)
+            reject = atoi(argv[i] + 7);
+    }
+    if (reject < 0 || (block > 0 && reject >= block)) {
+        fprintf(stderr, "reject=R wants 0 <= R < B\n");
+        return 2;
+    }
     if (block > 0) {
         /* token by token, keeping every logit row, then the same in blocks */
         size_t nn = n < 256 ? n : 256;
@@ -157,8 +169,8 @@ int main(int argc, char **argv)
         double pb0[JANAS_PH_COUNT], pb1[JANAS_PH_COUNT];
         janas_llm_model_phases(m, pb0);
         double tb = now(), maxd = 0, sumd = 0, rsum = 0;
-        size_t same = 0, top = 0, rtop = 0;
-        for (size_t p0 = 0; p0 < nn; p0 += (size_t)block) {
+        size_t same = 0, top = 0, rtop = 0, passes = 0;
+        for (size_t p0 = 0, kept; p0 < nn; p0 += kept) {
             uint32_t b =
                 (uint32_t)(nn - p0 < (size_t)block ? nn - p0 : (size_t)block);
             if (janas_llm_model_forward(m, tokens + p0, b, (uint32_t)p0, blk,
@@ -166,7 +178,11 @@ int main(int argc, char **argv)
                 fprintf(stderr, "block forward failed at %zu\n", p0);
                 return 1;
             }
-            for (uint32_t j = 0; j < b; j++) {
+            passes++;
+            /* the last block keeps all its tokens, the others b - reject:
+               the positions after them come again in the next block */
+            kept = p0 + b >= nn ? b : b - (uint32_t)reject;
+            for (uint32_t j = 0; j < kept; j++) {
                 const float *a = seq + (p0 + j) * nv, *c = blk + (size_t)j * nv;
                 int eq = 1;
                 for (uint32_t i = 0; i < nv; i++) {
@@ -192,6 +208,10 @@ int main(int argc, char **argv)
         double tbs = now() - tb;
         janas_llm_model_phases(m, pb1);
         print_phases("blocks", pb0, pb1, nn);
+        if (reject)
+            printf("blocks of %d keeping %d: %zu passes, the kept tokens "
+                   "replayed by the next\n",
+                   block, block - reject, passes);
         printf(
             "blocks of %d: %zu/%zu positions bit-identical to token by token, "
             "max |diff| %g; %.1f ms/token in blocks (%.1f token/s)\n",

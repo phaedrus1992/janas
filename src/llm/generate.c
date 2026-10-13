@@ -12,7 +12,7 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_SPEC_K 16
+#define MAX_SPEC_K JANAS_GEN_MAX_K
 /* passes without drafting before spec_auto retries: doubles after every
    retry that still does not pay, back to the minimum when one does */
 #define AUTO_RETRY_MIN 32
@@ -175,6 +175,16 @@ static int plan_lookup(const struct planner *p, int avail, double per_draft)
         }
     }
     return best;
+}
+
+/* At most k drafts, and no more than the pass the model holds worth
+   asking for takes (janas_llm_model_pass_cap: the GPU's shaders of a few
+   vectors): the planner's line through the costs it has measured cannot
+   see the step past them, and paid for one pass to learn it. */
+static int drafts_cap(const struct janas_llm_model *m, int k)
+{
+    uint32_t cap = janas_llm_model_pass_cap(m);
+    return cap > 1 && k > (int)cap - 1 ? (int)cap - 1 : k;
 }
 
 static int plan_drafts(const struct planner *p, const float *survs, int avail)
@@ -897,7 +907,7 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     int copies =
         o->spec_mode == JANAS_SPEC_LOOKUP || o->spec_mode == JANAS_SPEC_DRAFT;
     if (o->spec_mode == JANAS_SPEC_LOOKUP && s->off_left == 0 && !probe) {
-        nd = lookup_draft(s->hist, s->n, o->spec_k, block + 1);
+        nd = lookup_draft(s->hist, s->n, drafts_cap(m, o->spec_k), block + 1);
         if (nd > 0) {
             int want = plan_lookup(&s->pl, nd, 0.0);
             if (!want && s->st.passes % 16 == 0)
@@ -906,7 +916,7 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         }
     }
     if (o->spec_mode == JANAS_SPEC_DRAFT && s->off_left == 0 && !probe) {
-        int want = plan_lookup(&s->pl, o->spec_k, s->pl.dcost);
+        int want = plan_lookup(&s->pl, drafts_cap(m, o->spec_k), s->pl.dcost);
         if (!want && s->st.passes % 16 == 0)
             want = 1;
         if (want > 0) {
@@ -924,7 +934,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         }
     }
     if (s->mtp && drafts_wanted && s->off_left == 0 && !probe) {
-        nd = plan ? plan_drafts(&s->pl, s->msurv, s->n_mdraft) : s->n_mdraft;
+        nd = plan ? plan_drafts(&s->pl, s->msurv, drafts_cap(m, s->n_mdraft))
+                  : s->n_mdraft;
         /* one pass in sixteen drafts anyway, as the copies do: a pass of
            two tokens timed once while the disk was busy made the planner
            refuse every draft, and with none its cost was never timed again
@@ -968,6 +979,14 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     s->n_kv = pos + (uint32_t)acc + 1;
     s->st.new_tokens += (uint32_t)acc + 1;
     int settling_now = janas_llm_model_settling(s->m);
+    for (int i = 0; i < nd; i++) {
+        s->st.pos_tried[i]++;
+        s->st.pos_won[i] += i < acc;
+    }
+    if (!settling_now) {
+        s->st.pass_count[nd + 1]++;
+        s->st.pass_seconds[nd + 1] += dt;
+    }
     if ((plan || copies) && !settling_now) {
         double *tt = &s->pl.t[nd + 1];
         *tt = *tt > 0 ? 0.8 * *tt + 0.2 * dt : dt;
@@ -1032,7 +1051,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     /* the MTP rows of the new tokens always (the block's KV cache must stay
        complete for later turns), drafts only when generation goes on */
     if (s->mtp) {
-        if (mtp_step(m, s->hist, pos, (uint32_t)acc, o->spec_k,
+        if (mtp_step(m, s->hist, pos, (uint32_t)acc,
+                     plan ? drafts_cap(m, o->spec_k) : o->spec_k,
                      s->off_left == 0 && !is_stop(o, t), o->spec_min_conf,
                      plan ? &s->pl : NULL, s->hrow, s->mdraft, s->msurv,
                      &s->n_mdraft) != 0)
