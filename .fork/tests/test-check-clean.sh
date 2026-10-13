@@ -31,12 +31,37 @@ bad() {
   fails=$((fails + 1))
 }
 
-# make_ref <name> <path> <content>...  Builds a commit on top of clean.
-# A content of "-" removes the path.
+# make_ref <name> <base> <path> <content>...  Builds a commit on top of the
+# base branch. A content of "-" removes the path.
 make_ref() {
+  local name="$1" base="$2" index="$scratch/index.$1"
+  shift 2
+  GIT_INDEX_FILE="$index" git read-tree "$base"
+  add_to_index "$index" "$@"
+  local tree commit
+  tree="$(GIT_INDEX_FILE="$index" git write-tree)"
+  commit="$(git commit-tree "$tree" -p "$base" -m "fixture: $name")"
+  git branch "$name" "$commit"
+  fixtures+=("$name")
+}
+
+# make_orphan_ref <name> <path> <content>...  A commit with no parent, so it
+# shares no history with clean.
+make_orphan_ref() {
   local name="$1" index="$scratch/index.$1"
   shift
-  GIT_INDEX_FILE="$index" git read-tree clean
+  GIT_INDEX_FILE="$index" git read-tree --empty
+  add_to_index "$index" "$@"
+  local tree commit
+  tree="$(GIT_INDEX_FILE="$index" git write-tree)"
+  commit="$(git commit-tree "$tree" -m "fixture: $name")"
+  git branch "$name" "$commit"
+  fixtures+=("$name")
+}
+
+add_to_index() {
+  local index="$1"
+  shift
   while (($#)); do
     local path="$1" content="$2"
     shift 2
@@ -48,17 +73,20 @@ make_ref() {
       GIT_INDEX_FILE="$index" git update-index --add --cacheinfo "100644,$blob,$path"
     fi
   done
-  local tree commit
-  tree="$(GIT_INDEX_FILE="$index" git write-tree)"
-  commit="$(git commit-tree "$tree" -p clean -m "fixture: $name")"
-  git branch "$name" "$commit"
-  fixtures+=("$name")
 }
 
-make_ref fix-engine src/llm/quant.c '/* fixture */'
-make_ref fix-tooling .llmenv.yaml 'id: fixture'
-make_ref fix-header README.md '> **This is a fork.**'
-make_ref fix-deleted README.md '-'
+make_ref fix-engine clean src/llm/quant.c '/* fixture */'
+make_ref fix-tooling clean .llmenv.yaml 'id: fixture'
+make_ref fix-header clean README.md '> **This is a fork.**'
+make_ref fix-deleted clean README.md '-'
+make_ref fix-case clean .LLMENV.yaml 'id: fixture'
+make_ref fix-forkfile clean .fork 'not a directory'
+make_ref fix-prefix clean docs/superpowers/plans/note.md 'note'
+make_ref fix-glob clean .github/workflows/fork-x.yml 'name: x'
+make_ref fix-glob-yaml clean .github/workflows/fork-y.yaml 'name: y'
+make_ref fix-neighbour clean .github/workflows/release.yml 'name: release'
+make_ref fix-nonascii clean .fork/café.sh 'echo hi'
+make_orphan_ref fix-orphan README.md 'no history' .llmenv.yaml 'id: fixture'
 
 expect_pass() {
   if "$guard" "$1" >/dev/null 2>&1; then return 0; fi
@@ -70,6 +98,20 @@ expect_pass fix-engine
 expect_fail fix-tooling
 expect_fail fix-header
 expect_fail fix-deleted
+expect_fail fix-case
+expect_fail fix-forkfile
+expect_fail fix-prefix
+expect_fail fix-glob
+expect_fail fix-glob-yaml
+expect_pass fix-neighbour
+expect_fail fix-nonascii
+expect_fail fix-orphan
+
+# The guard's marker and the header block it prepends must stay one text.
+header_marker="$(head -1 "$root/.fork/readme-header.md")"
+if ! grep -qF "$header_marker" "$guard"; then
+  bad "the guard must look for the header's first line"
+fi
 
 # A clone with no clean anywhere must fail with the fix in the message.
 clone="$scratch/noclean"
@@ -81,28 +123,8 @@ elif ! grep -q "clean" "$scratch/noclean.err"; then
   bad "the failure message must name the fix"
 fi
 
-# The pre-push hook runs the guard on every port/* line of its stdin.
-zero=0000000000000000000000000000000000000000
-tooling_sha="$(git rev-parse fix-tooling)"
-port_line="refs/heads/port/x $tooling_sha refs/heads/port/x $zero"
-feat_line="refs/heads/feat/x $tooling_sha refs/heads/feat/x $zero"
-delete_line="(delete) $zero refs/heads/port/gone $tooling_sha"
-
-if printf '%s\n' "$port_line" | "$hook" >/dev/null 2>&1; then
-  bad "a port/* push of a tooling ref must fail"
-fi
-if ! printf '%s\n' "$feat_line" | "$hook" >/dev/null 2>&1; then
-  bad "a feat/* push must pass"
-fi
-if printf '%s\n%s\n' "$feat_line" "$port_line" | "$hook" >/dev/null 2>&1; then
-  bad "a multi-ref push with a port/* line must fail"
-fi
-if ! printf '%s\n' "$delete_line" | "$hook" >/dev/null 2>&1; then
-  bad "a deleted port/* ref must pass"
-fi
-
-# A port/* checkout carries no tooling. The hook must read the guard from
-# main there, and it must block the push when main is missing.
+# The hook. It reads its guard from origin/main, so the cases run in a scratch
+# checkout that has one. That checkout models a port/* tree: no tooling files.
 bare="$scratch/tiny.git"
 work="$scratch/tiny-work"
 git init --quiet --bare "$bare"
@@ -112,6 +134,8 @@ git -C "$work" remote add origin "$bare"
 git -C "$work" fetch --quiet origin
 git -C "$work" branch --no-track main origin/main
 git -C "$work" switch --quiet --detach origin/clean
+
+# A commit that touches .llmenv.yaml, built in the scratch repository.
 tiny_index="$scratch/index.tiny"
 GIT_INDEX_FILE="$tiny_index" git -C "$work" read-tree origin/clean
 blob="$(printf 'id: tiny' | git -C "$work" hash-object --stdin -w)"
@@ -121,13 +145,41 @@ tiny_commit="$(git -C "$work" commit-tree "$tree" -p origin/clean -m "fixture: t
 git -C "$work" branch --force port/x "$tiny_commit"
 cp "$hook" "$work/.git/hooks/pre-push"
 chmod +x "$work/.git/hooks/pre-push"
-if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" |
-  (cd "$work" && .git/hooks/pre-push) >/dev/null 2>&1; then
-  bad "a port/* push from a checkout without tooling must fail"
+
+zero=0000000000000000000000000000000000000000
+run_hook() { (cd "$work" && .git/hooks/pre-push); }
+
+if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" | run_hook >/dev/null 2>&1; then
+  bad "a port/* push of a tooling ref must fail"
 fi
+if ! printf 'refs/heads/feat/x %s refs/heads/feat/x %s\n' "$tiny_commit" "$zero" | run_hook >/dev/null 2>&1; then
+  bad "a feat/* push must pass"
+fi
+# The destination decides. A push that creates port/x from another local ref
+# must be checked.
+if printf 'refs/heads/scratch %s refs/heads/port/from-scratch %s\n' "$tiny_commit" "$zero" | run_hook >/dev/null 2>&1; then
+  bad "a push that creates a port/* ref from another local ref must fail"
+fi
+if printf '%s\n%s\n' "refs/heads/feat/x $tiny_commit refs/heads/feat/x $zero" \
+  "refs/heads/port/x $tiny_commit refs/heads/port/x $zero" | run_hook >/dev/null 2>&1; then
+  bad "a multi-ref push with a port/* line must fail"
+fi
+if ! printf '(delete) %s refs/heads/port/gone %s\n' "$zero" "$tiny_commit" | run_hook >/dev/null 2>&1; then
+  bad "a deleted port/* ref must pass"
+fi
+
+# The tree is the content under review: a guard file there must not be used.
+mkdir -p "$work/.fork"
+printf 'exit 0\n' >"$work/.fork/check-clean.sh"
+if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" | run_hook >/dev/null 2>&1; then
+  bad "a guard file in the working tree must not be used"
+fi
+rm -rf "$work/.fork"
+
+# With no main and no origin/main, the hook must fail and name the fix.
 git -C "$work" branch --move main main-hidden
-if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" |
-  (cd "$work" && .git/hooks/pre-push) 2>"$scratch/nomain.err"; then
+git -C "$work" update-ref -d refs/remotes/origin/main
+if printf 'refs/heads/port/x %s refs/heads/port/x %s\n' "$tiny_commit" "$zero" | run_hook 2>"$scratch/nomain.err"; then
   bad "a port/* push with no main must fail"
 elif ! grep -q "main" "$scratch/nomain.err"; then
   bad "the failure must name main"

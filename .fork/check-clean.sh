@@ -38,20 +38,28 @@ if ! git rev-parse --verify --quiet "$ref" >/dev/null; then
 fi
 
 # Tooling paths (design.md §5). Port branches must not change them.
-exact_paths=(.llmenv.yaml docs/fork.md CLAUDE.md AGENTS.md .github/dependabot.yml)
-prefix_paths=(docs/superpowers/ .claude/ .fork/)
-
+# The compare is case-insensitive: a checkout on a case-insensitive file
+# system cannot hold two names that differ only in case. The bare names
+# match a file where a directory is expected.
 is_tooling() {
-  local path="$1" pattern
-  for pattern in "${exact_paths[@]}"; do
-    [[ "$path" == "$pattern" ]] && return 0
-  done
-  for pattern in "${prefix_paths[@]}"; do
-    [[ "$path" == "$pattern"* ]] && return 0
-  done
-  [[ "$path" == .github/workflows/fork-*.yml ]] && return 0
+  local path
+  path="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$path" in
+  .llmenv.yaml | docs/fork.md | claude.md | agents.md | .github/dependabot.yml) return 0 ;;
+  docs/superpowers | docs/superpowers/*) return 0 ;;
+  .claude | .claude/*) return 0 ;;
+  .fork | .fork/*) return 0 ;;
+  .github/workflows/fork-*.yml | .github/workflows/fork-*.yaml) return 0 ;;
+  esac
   return 1
 }
+
+# A failed diff must not read as an empty diff. --no-renames turns a rename
+# into a delete plus an add, so both paths reach the match.
+if ! changed="$(git -c core.quotePath=false diff --name-only --no-renames "$clean...$ref")"; then
+  echo "check-clean: cannot diff $ref against $clean (no shared history?)." >&2
+  exit 1
+fi
 
 status=0
 while IFS= read -r path; do
@@ -60,10 +68,10 @@ while IFS= read -r path; do
     echo "check-clean: $path is a fork tooling path; a port branch must not change it" >&2
     status=1
   fi
-done < <(git diff --name-only "$clean...$ref")
+done <<<"$changed"
 
 if ! readme="$(git show "$ref:README.md" 2>/dev/null)"; then
-  echo "check-clean: cannot read README.md at $ref" >&2
+  echo "check-clean: cannot read README.md at $ref; it is missing or unreadable." >&2
   status=1
 elif [[ "$readme" == *'> **This is a fork.**'* ]]; then
   echo "check-clean: README.md at $ref carries the fork header" >&2
