@@ -84,11 +84,16 @@ The PR merge adds a second merge commit on top of the sync branch's own merge co
 This is cosmetic and keeps the record of each sync.
 
 CI runs the same script.
-`fork-sync.yml` sets `permissions: contents: write, issues: write, pull-requests: write`, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
-The `issues` scope is for the conflict path, which opens a fork issue.
+`fork-sync.yml` sets `permissions: contents: write` for the workflow token, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+`contents: write` covers the pushes, including a `clean` mirror that carries upstream's workflow files.
 The runner checks out with `fetch-depth: 0`.
 
-One repo setting must change once, by hand or with `gh api`:
+The workflow's `gh` calls run with the `SYNC_TOKEN` repository secret, a fine-grained token owned by the fork account.
+The workflow token cannot create a pull request in this repository, whatever the repository settings and the workflow `permissions` say.
+Run 38443285506 failed at `gh pr create` with `Resource not accessible by integration` while the run's token held `pull-requests: write` and the repository setting below was already on.
+A first step of the workflow checks the secret: the token must belong to the repository owner and be able to read the repository.
+
+Two repo settings change once, by hand or with `gh api`:
 
 ```
 PUT /repos/phaedrus1992/janas/actions/permissions/workflow
@@ -96,7 +101,9 @@ PUT /repos/phaedrus1992/janas/actions/permissions/workflow
 ```
 
 The current value is `read` and pull request creation is off.
-With those values, the sync workflow cannot push `clean`, and `gh pr create` fails with the workflow token.
+With those values, the sync workflow cannot push `clean`.
+Pull request creation needs the `SYNC_TOKEN` secret either way.
+Its rotation steps are in `docs/fork.md`.
 
 ## 5. Guard mechanics
 
