@@ -19,7 +19,7 @@ The maintainer answers the three questions in `design.md` §5.
 | Sync policy | Auto-resolve + auto-merge | Upstream releases several times a day and edits `README.md` with each release. The fork header at the top of `README.md` therefore conflicts on nearly every sync. A human per sync cannot keep up. |
 | Sync landing | A `sync/YYYY-MM-DD` branch, merged into `main` through an auto-merged PR | `main` only ever moves through PR merges. `clean` stays a pure mirror forever. Each sync leaves a record. |
 | README auto-resolve | Take upstream's `README.md`, then prepend the fork header block from `.fork/readme-header.md` | The header block is fixed text. The resolve is deterministic. |
-| Guard hook | A prek config on `main`, with one local hook at the pre-push stage | prek 0.3.2 supports the pre-push stage, and this environment already mandates `prek install`. |
+| Guard hook | `.fork/hooks/pre-push.sh`, copied into `.git/hooks/pre-push` by `.fork/install-hooks.sh` | The hook must run on a `port/*` checkout, and that checkout carries no tooling files. prek refuses to run when its config is absent, and it consumes git's stdin refs. prek therefore cannot run this hook. |
 | Upstream issue | Filed first, before the plumbing is built | The maintainer's answer gates E1. The clock starts as soon as the issue is up. |
 | Local commits to `main` | Not possible; every `main` change arrives as a PR merge | The llmenv hook blocks commits on the default branch. The branch model in `design.md` §5 agrees. |
 
@@ -29,12 +29,12 @@ The maintainer answers the three questions in `design.md` §5.
    `sync-upstream.sh` creates it if a clone lacks it.
 2. `.fork/sync-upstream.sh`: one sync implementation, used by the local session and by CI.
 3. `.fork/check-clean.sh`: the guard.
-4. `.fork/hooks/pre-push.sh`: a thin wrapper. It reads the pushed refs from stdin and calls the guard for `port/*` refs only.
+4. `.fork/hooks/pre-push.sh`: the hook. It reads the pushed refs from stdin and calls the guard for `port/*` refs only. On a checkout without tooling files it reads the guard from `main`.
 5. `.fork/readme-header.md`: the fork header block. The sync applies it. The guard checks for it.
-6. `.pre-commit-config.yaml`: the prek config on `main`. It defines one local hook at the pre-push stage.
+6. `.fork/install-hooks.sh`: copies the hook into `.git/hooks/pre-push`. Each clone runs it once.
 7. `.github/workflows/fork-sync.yml`: daily schedule plus manual dispatch. It checks out and runs `sync-upstream.sh`.
 8. `.github/workflows/fork-guard.yml`: runs the guard on every PR whose head branch is `port/*`.
-9. An amendment to `design.md` §5: add `.pre-commit-config.yaml` to the tooling paths list.
+9. An amendment to `design.md` §5: add `.github/dependabot.yml` to the tooling paths list.
 10. Fork issue E0, milestone E0, labels `area/build`, `P1`, `size/M`.
     Create it with the dev-sprint `create-issue.sh` script.
     That script validates the milestone and the labels.
@@ -54,17 +54,22 @@ The script resolves `clean` in this order:
 
 1. The local branch `clean`, when it exists.
 2. `origin/clean`, which is what CI sees after a full checkout.
-3. Otherwise the script fails. The message names the fix: run `sync-upstream.sh` once to create `clean`.
+3. Otherwise the script creates `clean` from `upstream/main`.
+   This is the first run in a fresh clone.
+   Artifact 1 and sync step 2 say the same.
 
 The sync steps:
 
 1. Fetch `upstream/main`.
-2. Create `clean` from it when `clean` is missing. Fast-forward `clean`. Exit 0 when it did not move.
+2. Create `clean` from it when `clean` is missing. Fast-forward `clean`.
+   Exit 0 when `main` already contains every commit `clean` has.
+   The test is containment, not "clean moved": a run whose pull request never merged must try again on the next run.
 3. Push `clean` to origin.
 4. Fetch `origin/main`. Cut `sync/YYYY-MM-DD` from it.
    When an open PR with the same head exists, exit 0. The script says so.
    When the branch exists without an open PR, delete it and cut it again.
-5. Merge `clean` into the sync branch with `git merge clean`, no commit.
+5. Merge `clean` into the sync branch with `git merge --no-ff --no-commit clean`.
+   The `--no-ff` keeps the merge commit that the paragraph after the steps names.
    On a `README.md` conflict: take upstream's `README.md` with `git checkout clean -- README.md`, prepend `.fork/readme-header.md`, stage it.
    On any other conflict, do these:
    - Abort the merge.
@@ -79,17 +84,19 @@ The PR merge adds a second merge commit on top of the sync branch's own merge co
 This is cosmetic and keeps the record of each sync.
 
 CI runs the same script.
-`fork-sync.yml` sets `permissions: contents: write, pull-requests: write`, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+`fork-sync.yml` sets `permissions: contents: write, issues: write, pull-requests: write`, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+The `issues` scope is for the conflict path, which opens a fork issue.
 The runner checks out with `fetch-depth: 0`.
 
 One repo setting must change once, by hand or with `gh api`:
 
 ```
 PUT /repos/phaedrus1992/janas/actions/permissions/workflow
-{"default_workflow_permissions": "write"}
+{"default_workflow_permissions": "write", "can_approve_pull_request_reviews": true}
 ```
 
-The current value is `read`. With it, the sync workflow cannot push `clean`.
+The current value is `read` and pull request creation is off.
+With those values, the sync workflow cannot push `clean`, and `gh pr create` fails with the workflow token.
 
 ## 5. Guard mechanics
 
@@ -106,7 +113,7 @@ Then two checks run:
    - `AGENTS.md`
    - `.fork/`
    - `.github/workflows/fork-*.yml`
-   - `.pre-commit-config.yaml`
+   - `.github/dependabot.yml`
 
    Other files under `.github/workflows/` stay allowed.
    A `port/*` branch may change upstream CI.
@@ -114,29 +121,28 @@ Then two checks run:
 2. README marker. `git show ref:README.md` must not contain `> **This is a fork.**`.
 
 The guard prints each offending path and exits 1.
+A failed diff is an error, not an empty diff: a ref with no shared history with `clean` fails.
+The path match ignores case, includes the bare names (`.fork` where a directory is expected), and covers `fork-*.yaml` as well as `fork-*.yml`.
 
-The pre-push wrapper reads the ref lines from stdin.
-For each pushed ref whose short name starts with `port/`, it runs the guard on the ref's local SHA.
+The hook reads the ref lines from stdin.
+For each line whose destination ref starts with `port/`, it runs the guard on the pushed commit.
+The destination decides, so a push that creates `port/*` from any local ref is checked.
 One failure blocks the push.
+The guard comes from `main`, never from the working tree: the tree is the content under review.
+A push with no `port/*` destination needs no guard and never blocks.
+A `port/*` checkout carries no tooling files, so the hook reads the guard from `main` when the working tree has none.
+When `main` is missing, the hook fails and names the fix: it never passes in silence.
 
-The prek config is the whole hook wiring:
+`.fork/install-hooks.sh` copies the hook into `.git/hooks/pre-push`.
+Each clone runs it once.
 
-```yaml
-repos:
-  - repo: local
-    hooks:
-      - id: check-clean
-        name: port branch guard
-        entry: .fork/hooks/pre-push.sh
-        language: system
-        pass_filenames: false
-        stages: [pre-push]
-```
-
-Each clone runs `prek install` once.
+prek cannot install this hook.
+The installed prek hook refuses to run when its config is absent, and a `port/*` checkout must not carry that config.
+prek also consumes git's stdin, so the hook would never see the refs.
 
 `fork-guard.yml` runs on pull requests whose head branch starts with `port/`.
-It checks out with `fetch-depth: 0`, then runs `.fork/check-clean.sh` on the PR head SHA.
+It checks out with `fetch-depth: 0`, reads `main`'s copy of `.fork/check-clean.sh`, and runs it on the PR head SHA.
+The guard must not come from the pull request's own tree: an added or changed guard would check itself.
 
 A known limit: a PR opened against upstream runs upstream's CI, not the fork's.
 The local pre-push hook is the only guard on that path.
@@ -188,10 +194,10 @@ The scripts get fixture tests before the workflows trust them:
 For the later implementation plan, not now:
 
 1. File the upstream issue after its final text review.
-2. Amend `design.md` §5: add `.pre-commit-config.yaml` to the tooling paths.
+2. Amend `design.md` §5: add `.github/dependabot.yml` to the tooling paths.
 3. Create `clean` and push it to the fork.
 4. Write the `.fork/` scripts and run the fixture tests from §7.
-5. Add the prek config and run `prek install`.
+5. Add `.fork/install-hooks.sh` and run it.
 6. Flip the Actions token permission to `write`.
 7. Add `fork-sync.yml` and `fork-guard.yml`.
 8. Dispatch one real sync run and watch the PR open and merge.
