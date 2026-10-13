@@ -38,11 +38,12 @@ jobs:
               && { echo "CREATED: $out"; GH_TOKEN="$3" gh pr close "${out##*/}" || true; return 0; } \
               || { echo "REFUSED: $out"; return 1; }
           }
-          mkhead probe2/gh-immediate
-          try_pr probe2/gh-immediate "github.token, immediate" "${{ github.token }}" || true
-          mkhead probe2/pat-immediate
-          try_pr probe2/pat-immediate "PAT, immediate" "$PUSH_TOKEN" || true
-          mkhead probe2/pat-retry
-          try_pr probe2/pat-retry "PAT, immediate" "$PUSH_TOKEN" || true
+          suffix="${GITHUB_RUN_ID}"
+          mkhead "probe2/gh-immediate-$suffix"
+          try_pr "probe2/gh-immediate-$suffix" "github.token, immediate" "${{ github.token }}" || true
+          mkhead "probe2/pat-immediate-$suffix"
+          try_pr "probe2/pat-immediate-$suffix" "PAT, immediate" "$PUSH_TOKEN" || true
+          mkhead "probe2/pat-retry-$suffix"
+          try_pr "probe2/pat-retry-$suffix" "PAT, immediate" "$PUSH_TOKEN" || true
           sleep 15
-          try_pr probe2/pat-retry "PAT, after 15 s" "$PUSH_TOKEN" || true
+          try_pr "probe2/pat-retry-$suffix" "PAT, after 15 s" "$PUSH_TOKEN" || true
