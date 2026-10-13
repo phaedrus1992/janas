@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # The port-branch guard in CI: a port/* pull request must not carry fork
-# tooling, and its README.md must not carry the fork header. The pre-push hook
-# runs the same guard in a local clone: .fork/check-clean.sh
+# tooling, and its README.md must not carry the fork header. The guard comes
+# from main, never from the pull request's own tree. The pre-push hook runs
+# the same guard in a local clone: .fork/check-clean.sh
 name: fork-guard
 
 on:
@@ -20,6 +21,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Check the port branch against clean
-        run: .fork/check-clean.sh ${{ github.event.pull_request.head.sha }}
+      - name: Run main's guard on the port branch
+        run: |
+          git show origin/main:.fork/check-clean.sh > "$RUNNER_TEMP/check-clean.sh"
+          bash "$RUNNER_TEMP/check-clean.sh" "${{ github.event.pull_request.head.sha }}"

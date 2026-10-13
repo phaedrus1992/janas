@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # The daily sync of upstream/main into the fork's main. The script
 # fast-forwards clean, then merges it into main through an auto-merged pull
-# request. A local session runs the same script: .fork/sync-upstream.sh
+# request, and opens an issue when a conflict stops it. A local session runs
+# the same script: .fork/sync-upstream.sh
 name: fork-sync
 
 on:
@@ -11,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 concurrency:

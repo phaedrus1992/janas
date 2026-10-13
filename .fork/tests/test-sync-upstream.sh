@@ -113,6 +113,8 @@ if [[ "$clean_sha" == "$fork_clean" ]]; then ok "clean mirrors upstream"; else b
 
 readme="$(git -C "$fork" show "origin/$sync_branch:README.md")"
 if [[ "$readme" == '> **This is a fork.**'* ]]; then ok "the header is back"; else bad "the header must be back"; fi
+header_count="$(printf '%s' "$readme" | grep -cF '> **This is a fork.**')"
+if [[ "$header_count" -eq 1 ]]; then ok "the header appears once"; else bad "the header must appear once, not $header_count times"; fi
 if [[ "$readme" == *"two"* ]]; then ok "upstream's README text is kept"; else bad "upstream's text must be kept"; fi
 
 parents="$(git --git-dir="$origin" rev-list --parents --no-walk "$sync_branch" | wc -w)"
