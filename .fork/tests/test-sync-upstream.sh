@@ -73,7 +73,13 @@ case "$1 ${2:-}" in
     echo "${GH_STUB_OPEN_PRS:-0}"
     ;;
   "pr create") echo "https://example.invalid/pull/1" ;;
-  "pr merge") echo "merged" ;;
+  "pr merge")
+    if [[ "${GH_STUB_FAIL_PR_MERGE:-0}" == "1" ]]; then
+      echo "gh-stub: pr merge failed" >&2
+      exit 1
+    fi
+    echo "merged"
+    ;;
   "issue list")
     if [[ "${GH_STUB_FAIL_ISSUE_LIST:-0}" == "1" ]]; then
       echo "gh-stub: issue list failed" >&2
@@ -264,7 +270,7 @@ git push --quiet origin main
 cd "$fork"
 rm -f "$GH_STUB_LOG"
 export GH_STUB_FAIL_ISSUE_LIST=1
-if run_sync "$fork" 2>"$scratch/conflict2.err"; then
+if run_sync "$fork" >"$scratch/conflict2.out" 2>"$scratch/conflict2.err"; then
   bad "sync 9 must fail"
 else
   ok "sync 9 fails"
@@ -275,10 +281,46 @@ if grep -q "a fork issue has the details" "$scratch/conflict2.err"; then
 else
   ok "the failure does not claim a filed issue"
 fi
+if grep -q "cannot list the issues" "$scratch/conflict2.out"; then
+  ok "the failed issue search is reported"
+else
+  bad "a failed issue search must be reported"
+fi
+if grep -q "issue create" "$GH_STUB_LOG"; then
+  ok "the issue is still created after a failed search"
+else
+  bad "the issue must be created after a failed search"
+fi
 if [[ "$(git -C "$fork" rev-parse --abbrev-ref HEAD)" == "main" ]]; then
   ok "sync 9 returned to main"
 else
   bad "sync 9 must return to main"
+fi
+
+# Scenario 10: the merge of the pull request fails. The run must fail and name
+# the recovery, because the branch and the pull request stay behind.
+cd "$fork"
+git fetch --quiet upstream
+git checkout --quiet upstream/main -- src/engine.c
+git commit --quiet -am "fork: take upstream's engine again"
+git push --quiet origin main
+cd "$seed"
+printf 'five\n' >>README.md
+git commit --quiet -am "upstream: readme five"
+git push --quiet origin main
+cd "$fork"
+rm -f "$GH_STUB_LOG"
+export GH_STUB_FAIL_PR_MERGE=1
+if run_sync "$fork" 2>"$scratch/merge.err"; then
+  bad "sync 10 must fail when the merge fails"
+else
+  ok "sync 10 fails"
+fi
+unset GH_STUB_FAIL_PR_MERGE
+if grep -q "cannot merge" "$scratch/merge.err"; then
+  ok "the failure names the recovery"
+else
+  bad "the failure must name the recovery"
 fi
 
 if [[ "$fails" -gt 0 ]]; then

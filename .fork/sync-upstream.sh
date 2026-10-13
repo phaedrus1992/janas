@@ -131,7 +131,12 @@ if ! git merge --no-ff --no-commit clean; then
     git branch --delete --force "$sync_branch"
     [[ -n "$conflicted" ]] || die "the merge failed; see the errors above"
     title="sync blocked: $conflicted conflicts with upstream"
-    open_issues="$(gh issue list --state open --search "$title in:title" --json number --jq 'length')" || open_issues=0
+    # A failed search is not proof that no such issue exists. Say so, rather
+    # than reading the failure as "none open".
+    if ! open_issues="$(gh issue list --state open --search "$title in:title" --json number --jq 'length')"; then
+      note "cannot list the issues; skipping the duplicate check"
+      open_issues=0
+    fi
     if [[ "$open_issues" == "0" ]]; then
       gh issue create --title "$title" \
         --body "The sync could not merge upstream/main into main. Conflicting paths: $conflicted. Resolve them by hand, then run .fork/sync-upstream.sh again." ||
@@ -150,7 +155,8 @@ pr_url="$(gh pr create --base main --head "$sync_branch" \
   die "cannot open the pull request for $sync_branch"
 # Merge the pull request this run opened, by its URL. The branch name alone
 # could name a pull request from another fork.
-gh pr merge "$pr_url" --merge --delete-branch
+gh pr merge "$pr_url" --merge --delete-branch ||
+  die "cannot merge $pr_url; merge it by hand and delete $sync_branch"
 
 git switch --quiet main
 if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
