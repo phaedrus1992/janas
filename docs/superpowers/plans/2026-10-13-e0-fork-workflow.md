@@ -79,11 +79,17 @@ Write the approved text, and nothing else, to `.tmp/upstream-issue-body.md`. Kee
 Run:
 
 ```bash
-gh auth status                                   # the active account must be phaedrus1992
-gh issue create --repo prabanta-dev/janas \
+GH_SHIM_ACCOUNT=phaedrus1992 gh issue create --repo prabanta-dev/janas \
   --title "arm64 and apple silicon port (neon + metal) — three questions first" \
   --body-file .tmp/upstream-issue-body.md
 ```
+
+`GH_SHIM_ACCOUNT` is not decoration.
+The gh identity shim picks the account from the repository owner, and it falls back to the personal account (`RangerRick`) when the owner matches no login.
+`prabanta-dev` matches none, so a bare call files the issue as `RangerRick`.
+`GH_SHIM_ACCOUNT` is the shim's documented override, and it names the account directly.
+`gh auth status` reads as `phaedrus1992` either way: the shim replaces `GH_TOKEN` after that check.
+Check the author after filing (`gh issue view <N> --repo prabanta-dev/janas --json author`).
 
 Expected: a URL on stdout, `https://github.com/prabanta-dev/janas/issues/<N>`.
 
