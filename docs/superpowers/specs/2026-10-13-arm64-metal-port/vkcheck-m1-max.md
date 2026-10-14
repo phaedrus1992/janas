@@ -52,14 +52,10 @@ Janas-LLM would run on the CPU alone: no GPU it takes
 
 ## What the gate says
 
-- MoltenVK imports host memory in place (zero-copy), with 16384-byte alignment.
-  The design's old concern about host-memory import on MoltenVK does not hold.
-- The integer dot product works.
-- Every subgroup operation works.
-- The subgroup size is 32, and it varies.
-  It is not selectable.
-  The engine requires a selectable subgroup size.
-  The gate therefore answers: Janas-LLM would not take this GPU through MoltenVK.
+- The design's old concern about host-memory import on MoltenVK does not hold:
+  the output shows zero-copy import, aligned to 16384 bytes.
+- The subgroup size is not selectable.
+  That line alone fails the gate.
 
 The maintainer set the rule: native Metal is weighed on these numbers if MoltenVK cannot do it.
 The output above is the evidence for that call.
