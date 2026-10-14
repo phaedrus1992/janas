@@ -29,7 +29,7 @@ The causes fall into a small number of groups.
 | Cause | Files | Nature |
 | --- | --- | --- |
 | `src/llm/json.h:68` uses `__attribute__((format(gnu_printf, 2, 3)))` | 143 (only cause) | Apple clang rejects `gnu_printf` |
-| A name declared inside `#if defined(__x86_64__)`, used or left unused outside it | 5 sites | Not macOS-specific |
+| A name declared inside `#if defined(__x86_64__)`, used or left unused outside it | 6 sites | Not macOS-specific |
 | A Linux-only call with no macOS spelling | 7 sites | OS portability |
 | `build.sh` uses GNU `find -printf` and GNU `stat -c` | 2 lines | BSD has neither |
 | The committed libmicrohttpd configuration is a Linux x86-64 configure output | 8 files | Needs a second configuration |
@@ -58,7 +58,7 @@ Two entries that look like failures are not:
 | --- | --- | --- |
 | Slice unit | One concern per `port/*` branch, six in total | The maintainer asked for small PRs, one change each. Each slice below carries one reason a reviewer can check on its own. |
 | Order of the slices | Any; the six are independent | They touch disjoint files, and each is inert on x86-64. They can be reviewed in any order. |
-| The x86 guards | Keep them. Repair the names they leak. | The scalar reference already compiles on every platform, because the reference functions are unguarded. Only five names leak out of a guard. |
+| The x86 guards | Keep them. Repair the names they leak. | The scalar reference already compiles on every platform, because the reference functions are unguarded. Six names leak out of a guard. |
 | macOS thread placement | QoS classes and no pinning. See §5. | macOS has no CPU affinity. `pthread_setaffinity_np` has no equivalent. |
 | libmicrohttpd on macOS | A second committed configuration in `darwin/` | `w32/` already sets this precedent. A build-time `configure` would need autoconf on every machine. |
 | The `_GNU_SOURCE` duplicate | Drop the second define in `tp_flags` | `-D_GNU_SOURCE` and `-D_GNU_SOURCE=` are different definitions. Both compilers warn. |
@@ -95,10 +95,11 @@ A name that a `#if defined(__x86_64__)` block declares, and the code outside tha
 | File | Name | Note |
 | --- | --- | --- |
 | `src/llm/quant.c` | `e8m0_tab` | Declared at `:1127`, inside the block that opens at `:1104`. Used at `:1194`. A hard error on every non-x86 architecture. |
-| `src/llm/attention.c` | `pf` (`:661`) | Unused on arm64; `-Werror` makes that a failure. |
+| `src/llm/quant.c` | `use_avx2_fma` (`:113`) | Read only inside guards. The `e8m0_tab` error hides it until that one is fixed. |
+| `src/llm/attention.c` | `pf` (`:661`) | Used only inside guards. All four readers are guarded, so the declaration moves inside one. |
 | `src/llm/model_ple.c` | `v` (`:133`, `:229`) | Set by `have_avx2()`, then used only inside an x86 block. |
-| `tests/test_quant.c` | `b` (`:481`) | One of four arrays; used only by the AVX2 path. |
-| `src/llm/deltanet.c` | `use_f16c` (`:173`) | Apple clang reports it; GCC does not. |
+| `tests/test_quant.c` | the whole comparison | `g`, `u`, `a`, `b` and the `CHECK` are x86-only; `g` and `u` are set-but-unused on arm64, which GCC reports and clang does not. |
+| `src/llm/deltanet.c` | `use_f16c` (`:173`) | Apple clang reports it; GCC does not. `use_avx2` must stay outside the guard: `janas_gdn_kernel_name` reads it on every architecture. |
 
 `attention.c:610-613` already shows the pattern this file uses when a parameter is unused on a non-x86 build.
 

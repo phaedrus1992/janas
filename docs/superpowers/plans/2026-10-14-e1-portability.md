@@ -27,6 +27,11 @@ Every task's requirements implicitly include this section.
 - x86-64 is verified by the owner on their own x86-64 Linux box. It is a required step, not a hand-off to the maintainer.
 - Re-measure every line number before cutting each branch. Upstream releases several times a day and the spec's §2 numbers are a 2026-10-14 snapshot.
 - The endianness, the arithmetic order, and the results on x86-64 must not move. A change that could alter a computed value needs an explicit reason in the commit message.
+- Every container command needs `tzdata`, not `gcc` alone: four tests assert `Europe/Rome` local times and report failures without it. Install `gcc tzdata` and pass `-e TZ=Europe/Rome`. Verified both ways on the same binary.
+- `./build.sh release clean-test` runs 34 test programs on Linux arm64, of which 30 print `: ok`; one more prints `skipped` when the build has no GPU. Report the run count, never the `: ok` count.
+- Commit as `Phaedrus <phaedrus1992x@gmail.com>`. The repo's configured identity is the sync bot, which must not carry a DCO sign-off to a third party. Use `git -c user.name=... -c user.email=...` and leave the config alone.
+- A branch that is already pushed cannot be amended. Review fixes land as a further commit on the same branch; the maintainer squashes on import, so the branch's commit count does not matter.
+- A `port/*` branch carries no `.fork/`, so the guard cannot be run from the working tree. Read it from `main`: `git show main:.fork/check-clean.sh > .tmp/check-clean.sh`.
 
 ## Review Focus
 
@@ -47,12 +52,14 @@ Closes #422. Spec §4 (`port/21`), §9 step 1.
 The only slice that fixes a defect in shipped code, and the only one a Linux arm64 machine can verify with no Mac.
 
 **Files:**
-- Modify: `src/llm/quant.c` (`dot_kernels_init`, the `e8m0_tab` fill loop)
+- Modify: `src/llm/quant.c` (`use_avx2_fma` at `:113`, and the `e8m0_tab` fill loop in `dot_kernels_init`)
 - Modify: `src/llm/attention.c:661` (`attn_item`)
 - Modify: `src/llm/deltanet.c:173`
 - Modify: `src/llm/model_ple.c:133`, `src/llm/model_ple.c:229`
 - Modify: `tests/test_quant.c:481`
 - Test: the compiler itself. There is no unit test for a guard leak; the failing build is the test.
+
+There are six sites, not five. `src/llm/quant.c:113 use_avx2_fma` is invisible at first: the hard error on `e8m0_tab` stops the compiler before it reports the unused-variable warning. It surfaces only after that error is gone. Expect the same masking elsewhere as each fix lands.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -88,13 +95,15 @@ Expected: five matches, near the spec's line numbers. If a site is gone, stop an
 This is the failing test. It must fail before any edit.
 
 ```bash
-docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -lc '
+docker run --rm -e TZ=Europe/Rome -v "$PWD:/w" -w /w ubuntu:24.04 bash -lc '
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq && apt-get install -y -qq gcc
+  apt-get update -qq && apt-get install -y -qq gcc tzdata
   uname -m && ./build.sh release build'
 ```
 
 Expected: `aarch64`, then FAIL at `src/llm/attention.c:661: error: unused variable 'pf' [-Werror=unused-variable]`.
+
+`tzdata` is not optional: without it four tests assert the wrong local time and report failures that have nothing to do with the code.
 
 - [ ] **Step 4: Fix `quant.c` — move the fill loop inside the guard**
 
@@ -124,13 +133,14 @@ At `attn_item`, `pf` is declared and then used only inside `#if defined(__x86_64
 #endif
 ```
 
-- [ ] **Step 6: Fix `deltanet.c` — put the two flags inside the guard**
+- [ ] **Step 6: Fix `deltanet.c` — guard `use_f16c` only**
 
-Both flags are written and read only inside `#if defined(__x86_64__)`. Move the declaration into a guard, so the file reads:
+`use_f16c` is read only inside `#if defined(__x86_64__)`. `use_avx2` is not: `janas_gdn_kernel_name` (`:212-215`) reads it on every architecture and returns "avx2" or "ref". Guarding `use_avx2` breaks the build on arm64, so the two must be split:
 
 ```c
+static int use_avx2; /* read by janas_gdn_kernel_name on every architecture */
 #if defined(__x86_64__)
-static int use_avx2, use_f16c;
+static int use_f16c;
 #endif
 
 __attribute__((constructor)) static void gdn_init(void)
@@ -139,7 +149,7 @@ __attribute__((constructor)) static void gdn_init(void)
     __builtin_cpu_init();
 ```
 
-The constructor and both dispatch sites at `:184` and `:197` already carry their own guards, so nothing else changes.
+On arm64 `use_avx2` stays 0 and the name reported is "ref", which is the kernel that actually runs. The constructor and both dispatch sites at `:191` and `:204` already carry their own guards, so nothing else changes.
 
 - [ ] **Step 7: Fix `model_ple.c` — cast `v` in both workers**
 
@@ -152,16 +162,30 @@ The constructor and both dispatch sites at `:184` and `:197` already carry their
 #endif
 ```
 
-- [ ] **Step 8: Fix `tests/test_quant.c` — cast the unused array**
+- [ ] **Step 8: Fix `tests/test_quant.c` — guard the whole comparison**
 
-In `test_det`, `b` is filled and compared only inside `#if defined(__x86_64__)`. Add after the declaration:
+In `test_det`, the scalar-versus-AVX2 comparison is x86-only in its entirety. Guarding only the inner block is not enough: `g` and `u` are then set but never read, and GCC reports `-Wunused-but-set-variable` (Apple clang does not — the two compilers disagree, so check both). Move `g`, `u`, `bad`, the round loop and the `CHECK` under one guard:
 
 ```c
-    float g[1024], u[1024], a[1024], b[1024];
-#if !defined(__x86_64__)
-    (void)b;
+#if defined(__x86_64__)
+    float g[1024], u[1024];
+    int bad = 0;
+    for (int round = 0; round < 1000; round++) {
+        ...
+        float a[1024], b[1024];
+        for (int i = 0; i < 1024; i++)
+            a[i] = janas_silu_mul_det(g[i], u[i]);
+        if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+            det8(g, u, b, 1024);
+            for (int i = 0; i < 1024; i++)
+                bad += memcmp(&a[i], &b[i], 4) != 0;
+        }
+    }
+    CHECK(bad == 0, "silu_mul_det: %d scalar/AVX2 differences", bad);
 #endif
 ```
+
+Do not move `a` and `b` back to the top declaration: on arm64 they would be unused there, which is the warning this step exists to remove. The x86-64 result is unchanged — the same comparisons run, in the same order.
 
 - [ ] **Step 9: Verify Linux arm64**
 
@@ -200,13 +224,19 @@ Expected: PASS, and no change in any number it prints. If the owner is unavailab
 ```bash
 clang-format -i src/llm/quant.c src/llm/attention.c src/llm/deltanet.c \
     src/llm/model_ple.c tests/test_quant.c
-./.fork/check-clean.sh
+git diff            # clang-format 23 also reflows pre-existing lines; revert those
+git show main:.fork/check-clean.sh > .tmp/check-clean.sh
+bash .tmp/check-clean.sh "$(git branch --show-current)"
 git add src/llm/quant.c src/llm/attention.c src/llm/deltanet.c \
     src/llm/model_ple.c tests/test_quant.c
 git commit -s -m "fix: names the x86 guards hide break every arm64 build"
 ```
 
 Expected: `check-clean: ... is clean.` The commit carries a `Signed-off-by` line.
+
+The guard cannot be run from the working tree on a `port/*` branch: `.fork/` is fork tooling and a port branch carries none. Read it from `main`, exactly as the pre-push hook does.
+
+`clang-format` reflows lines it did not author when its version differs from the one upstream used. Revert those hunks by hand and keep the diff to the change under review.
 
 - [ ] **Step 13: Push and open the upstream pull request**
 
