@@ -21,15 +21,14 @@ keeps fork tooling off `port/*` branches. The hook tests are in
 No port code exists yet.
 Each epic gets its own design session before work starts.
 
-The daily sync's git pushes run on the `SYNC_TOKEN` repository secret, a
-fine-grained token with `Contents` and `Workflows` write: GitHub never lets
-the workflow token push a change to a workflow file, and upstream edits
-`.github/workflows/` regularly (#33).
-The `gh` calls run on the workflow token, which the workflow's `permissions`
-block scopes.
-Pull request creation needs the repository setting "Allow GitHub Actions to
-create and approve pull requests" left on; with it off, GitHub refuses the
-call.
+The daily sync runs on a GitHub App installation token, minted per run by
+`actions/create-github-app-token` from the `SYNC_APP_ID` and
+`SYNC_APP_PRIVATE_KEY` secrets (#410).
+The App carries `Contents`, `Workflows`, `Issues`, and `Pull requests` write,
+so it can push upstream's workflow-file changes (#33) and open the sync pull
+request, which the workflow token intermittently cannot (#410).
+It expires hourly and nothing needs rotating, and the repository setting for
+workflow-created pull requests no longer affects the sync.
 Each run gets its own branch, `sync/YYYY-MM-DD-HHMMSS`, because GitHub refuses
 to open a pull request in the seconds after a branch is deleted and
 re-created (#31). Stale `sync/*` branches are deleted after a successful
