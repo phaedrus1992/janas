@@ -84,14 +84,15 @@ The PR merge adds a second merge commit on top of the sync branch's own merge co
 This is cosmetic and keeps the record of each sync.
 
 CI runs the same script.
-`fork-sync.yml` sets `permissions: contents: write, issues: write, pull-requests: write` for the workflow token, a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
-The runner checks out with `fetch-depth: 0` and the `SYNC_TOKEN` secret as the git credential, so the pushes run as that fine-grained PAT.
-All of the workflow's `gh` calls run on the workflow token.
+`fork-sync.yml` declares no workflow-token permissions (`permissions: {}`), a daily cron, `workflow_dispatch`, and a concurrency group so two runs never overlap.
+Every step runs on a GitHub App installation token, minted per run by `actions/create-github-app-token` from the `SYNC_APP_ID` and `SYNC_APP_PRIVATE_KEY` secrets; a missing secret fails fast at the workflow's first step.
+The App carries `Contents`, `Workflows`, `Issues`, and `Pull requests` write.
 
-The git pushes need a token with `Workflows: write`.
-`GITHUB_TOKEN` cannot be granted that permission, so it can never push a commit that creates or updates a workflow file.
-Run 38458882999 failed at the `clean` push with `refusing to allow a GitHub App to create or update workflow .github/workflows/release.yml without workflows permission` after upstream's Release 2026-10-13 (3–5) touched `.github/workflows/release.yml` (#33).
-`SYNC_TOKEN` carries `Contents: write` and `Workflows: write` for the pushes, and a missing secret fails fast at the workflow's first step.
+The sync moved through three token schemes, each pinned by a run.
+The workflow token cannot push a workflow-file change: run 38458882999 failed at the `clean` push with `refusing to allow a GitHub App to create or update workflow .github/workflows/release.yml without workflows permission` after upstream's Release 2026-10-13 (3–5) touched `.github/workflows/release.yml` (#33).
+`SYNC_TOKEN`, a fine-grained PAT with `Contents` and `Workflows` write, then carried the pushes.
+Finally in-workflow pull request creation started failing in long, unpredictable stretches — the same call succeeds from outside any workflow (PR #409) — and toggling the repository setting did not change it; the App-token control cell (run 38576549134) created its pull request while the workflow-token control refused on the same push (#410).
+The App token expires hourly and nothing needs rotating.
 
 Two repo settings were set once, by hand or with `gh api`:
 
@@ -102,12 +103,13 @@ PUT /repos/phaedrus1992/janas/actions/permissions/workflow
 
 Pull request creation stays off while `can_approve_pull_request_reviews` is false, whatever the workflow's `permissions` block says.
 Run 38443285506 failed at `gh pr create` with `Resource not accessible by integration` while that setting was off; with it on, probe run 38453455883 opened pull requests with the workflow token, including one about two seconds after its push.
+With every step on the App token, the sync no longer depends on that setting (#410).
 
 An earlier revision routed the `gh` calls through a `SYNC_TOKEN` fine-grained PAT.
 Probes on 2026-10-13 showed the PAT was never scope-limited — run 38453180562 opened pull requests with it for every probed head — and the workflow token works with the setting above on.
 The real refusal was timing: every failed run (38451890753, 38452548732, 38453721431) opened its pull request about 1.5 seconds after the sync deleted and re-created `sync/2026-10-13`, and GitHub refuses `createPullRequest` for the seconds after such a delete.
 The sync gives each run a unique branch, `sync/YYYY-MM-DD-HHMMSS`, and deletes stale `sync/*` branches only after a merge (#31).
-`SYNC_TOKEN` returns for the git pushes alone (#33); the GitHub App token (#18) is the replacement that removes the 90-day rotation.
+`SYNC_TOKEN` returned for the git pushes alone (#33); the GitHub App token (#18) replaced it and removes the 90-day rotation (#410).
 
 ## 5. Guard mechanics
 
