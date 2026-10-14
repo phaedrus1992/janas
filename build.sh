@@ -302,15 +302,20 @@ for html in src/*/*.html; do
 done
 CFLAGS+=(-I"$GEN")
 
-# one object, rebuilt when its source or any header is newer
+# one object, rebuilt when its source or any header is newer. The newest
+# header is chosen in the shell, not by a pipeline: a reader that stops
+# early (head, grep -q) would trip pipefail on the writer's SIGPIPE
+newest_h=
+while IFS= read -r -d '' h; do
+    if [ -z "$newest_h" ] || [ "$h" -nt "$newest_h" ]; then
+        newest_h=$h
+    fi
+done < <(find src include "$SPV" "$GEN" -name '*.h' -print0)
 headers_newest=0
-newest_h=$(find src include "$SPV" "$GEN" -name '*.h' -print0 |
-    xargs -0 ls -td 2>/dev/null)
-newest_h=${newest_h%%$'\n'*}
 if [ -n "$newest_h" ]; then
     # GNU stat spells the mtime in seconds -c %Y, BSD -f %m. The GNU
     # spelling goes first: a failing BSD stat prints nothing, where a
-    # failing GNU stat in -f mode still prints the file system
+    # failing GNU stat in -f mode still prints the file system info
     headers_newest=$(stat -c %Y "$newest_h" 2>/dev/null || stat -f %m "$newest_h")
 fi
 compile()
