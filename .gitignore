@@ -16,6 +16,10 @@
 /janas-try/
 janas-bench-*.txt
 
+# The vkcheck gate binary (tools/vkcheck.c) and dev-sprint scratch
+/vkcheck
+.tmp/
+
 # Editors and OS
 *~
 *.swp
