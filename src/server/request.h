@@ -23,6 +23,10 @@ char *srv_dup_n(const char *s, size_t n);
 /* A number between lo and hi: 1 with *out set, 0 absent (or null), -1 not a
    number or out of range. */
 int srv_num(yyjson_val *v, double lo, double hi, double *out);
+/* A ceiling on the reasoning by llama.cpp's names, reasoning_budget_tokens
+   or thinking_budget_tokens: -1 none, 0 no reasoning, N at most N tokens of
+   it, then the answer. 0, or -1 when the value is not one of those. */
+int srv_reasoning_budget(yyjson_val *root, struct janas_llm_chat_params *p);
 /* A value as JSON text (NULL on memory). */
 char *srv_json_text(yyjson_val *v, size_t *n);
 

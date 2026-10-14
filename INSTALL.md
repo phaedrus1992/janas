@@ -22,7 +22,9 @@ sudo apt install libvulkan-dev glslang-tools vulkan-tools
 
 On Fedora: `sudo dnf install gcc make` and, for the GPU, `vulkan-loader-devel glslang vulkan-tools`. On Arch: `sudo pacman -S base-devel` and `vulkan-headers vulkan-icd-loader glslang vulkan-tools`.
 
-The GPU also needs its Vulkan driver: Mesa (`mesa-vulkan-drivers` on Debian/Ubuntu) for Intel and AMD, the proprietary driver for NVIDIA. `vulkaninfo --summary` should list your GPU with Vulkan 1.3 or later. When the engine takes none, `janas-bench` and the model's description say why: a build without GPU support (`glslangValidator` was missing: install it and build again), no Vulkan loader, a GPU whose driver lacks something (named), or the GPU turned off.
+The shaders need glslang 15.2 or later (`glslangValidator --version`). Ubuntu 24.04's `glslang-tools` is 15.1, too old: the build then goes on without the GPU and says why. A newer one is the prebuilt release from <https://github.com/KhronosGroup/glslang/releases> (`glslang-16.6.0-linux-x86_64-release.tar.gz`, the one Janas's own packages are built with): unpack it and put its `bin/` first in the `PATH` before building.
+
+The GPU also needs its Vulkan driver: Mesa (`mesa-vulkan-drivers` on Debian/Ubuntu) for Intel and AMD, the proprietary driver for NVIDIA. `vulkaninfo --summary` should list your GPU with Vulkan 1.3 or later. When the engine takes none, `janas-bench` and the model's description say why: a build without GPU support (`glslangValidator` missing or older than 15.2: see above, and build again), no Vulkan loader, a GPU whose driver lacks something (named), or the GPU turned off.
 
 Then, in the source directory:
 

@@ -1,0 +1,139 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// The fast prompt for a mixture's experts in MXFP4 (gpu.c experts_id, and
+// the whole token's mixture, gpu_token_moe.c): q4k_mmid.comp's table and
+// tiles (64 rows by 16 vectors, each invocation 2 rows by 4, groups of 32
+// staged 4 at a time), the weights read as iq4nl_mmq.comp reads MXFP4 (17
+// bytes a block: its E8M0 byte, then 16 of nibbles through MXFP4's levels,
+// 0 to 12 and their negatives, the power of two 2^(e - 128) for a scale),
+// the activations in blocks of 32, each group with its own scale. NOT bit
+// for bit with the CPU: rounded group by group.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint NV = 8; // unused: the table's constants
+layout(constant_id = 1) const uint SG = 8;
+
+const uint BM = 64u, BN = 16u, KS = 4u, S = 17u, XB = 20u;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+
+// t: the table, 3 uvec4 an expert: (w, x), (y, nv, ys), (unused); then
+// from uvec4 tiles on, one a workgroup's z: (expert, first vector)
+layout(push_constant) uniform P { uvec2 t; uint rows, nb, tiles; } p;
+
+struct ACache { int qs[8]; float d; }; // a group: its 32 levels, its scale
+struct BCache { int qs[8]; float d; }; // a group: quants, its d32
+shared ACache sa[BM * KS];
+shared BCache sb[BN * KS];
+
+const int MX[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+/* the levels in the workgroup's shared memory: a constant array read at a
+   varying index is far slower on some GPUs (iq4xs_matvec.comp) */
+shared uint T[16];
+
+/* each byte of w (a nibble) through the table */
+uint lv(uint w)
+{
+    return T[w & 15u] | (T[(w >> 8) & 15u] << 8) | (T[(w >> 16) & 15u] << 16) |
+           (T[(w >> 24) & 15u] << 24);
+}
+
+// word i of the 32-bit words from byte off of w
+uint bword(U1 W, uint off, uint i)
+{
+    uint a = (off >> 2) + i, sh = 8u * (off & 3u);
+    return sh != 0u ? (W.v[a] >> sh) | (W.v[a + 1u] << (32u - sh)) : W.v[a];
+}
+
+/* an E8M0 byte as MXFP4's scale, 2^(e - 128) (quant.c janas_e8m0_half) */
+float e8m0_half(uint e)
+{
+    return uintBitsToFloat(e < 2u ? 0x00200000u << e : (e - 1u) << 23);
+}
+
+void main()
+{
+    if (gl_LocalInvocationID.x < 16u)
+        T[gl_LocalInvocationID.x] = uint(MX[gl_LocalInvocationID.x]) & 0xffu;
+    barrier();
+    U4 TB = U4(p.t);
+    uvec4 tl = TB.v[p.tiles + gl_WorkGroupID.z];
+    uint e = tl.x;
+    uvec4 t0 = TB.v[3u * e], t1 = TB.v[3u * e + 1u];
+    uint nv = t1.z, ys = t1.w;
+    uint r0 = gl_WorkGroupID.x * BM, v0 = tl.y;
+    U4 X = U4(t0.zw);
+    U1 W1 = U1(t0.xy);
+    F Y = F(t1.xy);
+    uint id = gl_LocalInvocationID.x;
+    uint rq = (id % 32u) * 2u, vq = (id / 32u) * 4u;
+    float sums[8];
+    [[unroll]] for (uint i = 0; i < 8u; i++) sums[i] = 0.0;
+    uint ngroups = p.nb * 8u;
+    for (uint g0 = 0; g0 < ngroups; g0 += KS) {
+        // weights: 4 invocations a row, 2 words each of the group's 8
+        {
+            uint iqs = id % 4u, rl = id / 4u;
+            [[unroll]] for (uint l = 0; l < BM; l += 32u) {
+                uint r = min(r0 + rl + l, p.rows - 1u);
+                [[unroll]] for (uint k = 0; k < KS; k++) {
+                    uint off = (r * ngroups + g0 + k) * S;
+                    [[unroll]] for (uint t = 0; t < 2u; t++) {
+                        uint kw = 2u * iqs + t, q = bword(W1, off + 1u, kw & 3u);
+                        sa[k * BM + rl + l].qs[kw] =
+                            int(lv(kw < 4u ? q & 0x0f0f0f0fu : (q >> 4) & 0x0f0f0f0fu));
+                    }
+                    if (iqs == 0u)
+                        sa[k * BM + rl + l].d = e8m0_half(bword(W1, off, 0u) & 0xffu);
+                }
+            }
+        }
+        // activations: 2 invocations a vector, each half a group's quants
+        {
+            uint k = id / 32u, c = (id % 32u) / 2u, iqs = id % 2u;
+            uint v = min(v0 + c, nv - 1u);
+            uint g = g0 + k, b = g / 8u, j = g % 8u;
+            uint xo = (v * p.nb + b) * XB;
+            uvec4 q = X.v[xo + 2u * j + iqs];
+            sb[k * BN + c].qs[4u * iqs] = int(q.x);
+            sb[k * BN + c].qs[4u * iqs + 1u] = int(q.y);
+            sb[k * BN + c].qs[4u * iqs + 2u] = int(q.z);
+            sb[k * BN + c].qs[4u * iqs + 3u] = int(q.w);
+            if (iqs == 0u) {
+                uvec4 dq = X.v[xo + 18u + j / 4u];
+                uint dw = j % 4u == 0u ? dq.x : j % 4u == 1u ? dq.y : j % 4u == 2u ? dq.z : dq.w;
+                sb[k * BN + c].d = uintBitsToFloat(dw);
+            }
+        }
+        barrier();
+        for (uint k = 0; k < KS; k++) {
+            ACache ca[2];
+            [[unroll]] for (uint r = 0; r < 2u; r++)
+                ca[r] = sa[k * BM + rq + r];
+            [[unroll]] for (uint c = 0; c < 4u; c++) {
+                BCache cb = sb[k * BN + vq + c];
+                [[unroll]] for (uint r = 0; r < 2u; r++) {
+                    int q = 0;
+                    [[unroll]] for (uint i = 0; i < 8u; i++)
+                        q += dotPacked4x8EXT(ca[r].qs[i], cb.qs[i]);
+                    sums[c * 2u + r] += ca[r].d * cb.d * float(q);
+                }
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (uint c = 0; c < 4u; c++)
+        [[unroll]] for (uint r = 0; r < 2u; r++) {
+            uint row = r0 + rq + r, v = v0 + vq + c;
+            if (row < p.rows && v < nv)
+                Y.v[v * ys + row] = sums[c * 2u + r];
+        }
+}

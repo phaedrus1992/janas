@@ -47,6 +47,7 @@ Janas-LLM, the inference engine of Janas, runs large language models on ordinary
 | `jns_planes` | cuts the experts of a converted mixture into bit planes, so that fewer bits can be read when the memory is short |
 | `hf2jns_mtp` | makes a model's multi-token prediction block from its original checkpoint |
 | `jns_check` | what a `.jns` file says about itself: architecture, sizes, types, licence |
+| `vkcheck` | whether this computer's GPU can run Janas's GPU backend, and why not: what the backend needs with the driver's answer, then three short tests on the GPU |
 | `services/` | Janas's services, which bring data of the world to a model: flights, weather, maps, prices, earthquakes, Wikipedia, GitHub, git, this computer. `janas-chat` starts them by itself; any other MCP client can use them. See `services/README.md` |
 | `lib/`, `include/` | `libjanas_llm` and `libjanas_mcp` with their C headers and FreeBASIC bindings, for programs of your own; the programs above do not need them |
 

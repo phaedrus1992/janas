@@ -9,7 +9,8 @@
  * the figure of merit is multiply-accumulates per second.
  *
  * Usage: bench_gemm [rows cols
- * q4k|q5k|q6k|q3k|q80|iq4xs|iq3s|iq4nl|q6kp1|q6kp2|q6kp3 threads [gpu|gpufew]]
+ * q4k|q5k|q6k|q3k|q80|iq4xs|iq3s|iq4nl|mxfp4|q6kp1|q6kp2|q6kp3 threads
+ * [gpu|gpufew]]
  * q6kpL is Q6_K in bit planes with L of the three planes in memory.
  * Defaults: 12288 x 2048 Q4_K (Qwen3-Next ssm_in), 12 threads on CPUs 0-11.
  * gpu: the products of a prompt's blocks on the GPU (the fast prompt's
@@ -101,6 +102,8 @@ int main(int argc, char **argv)
         type = JANAS_IQ3_S;
     else if (!strcmp(kind, "iq4nl"))
         type = JANAS_IQ4_NL;
+    else if (!strcmp(kind, "mxfp4"))
+        type = JANAS_MXFP4;
     else if (!strncmp(kind, "q6kp", 4)) {
         type = JANAS_Q6_K_P;
         level = kind[4] ? kind[4] - '0' : 3;
@@ -153,10 +156,13 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < wbytes; i++)
         w[i] = (uint8_t)rand();
     /* blocks of 32 weights: eight to a block of 256 */
-    for (size_t b = 0;
-         b < rows * nb * (type == JANAS_IQ4_NL || type == JANAS_Q8_0 ? 8 : 1);
-         b++) {
-        if (type == JANAS_Q8_0) {
+    size_t per =
+        type == JANAS_IQ4_NL || type == JANAS_Q8_0 || type == JANAS_MXFP4 ? 8
+                                                                          : 1;
+    for (size_t b = 0; b < rows * nb * per; b++) {
+        if (type == JANAS_MXFP4) {
+            ((struct janas_block_mxfp4 *)w)[b].e = 118; /* 2^-10 */
+        } else if (type == JANAS_Q8_0) {
             ((struct janas_block_q8_0 *)w)[b].d = janas_fp32_to_fp16(0.001f);
         } else if (type == JANAS_Q5_K) {
             ((struct janas_block_q5k *)w)[b].d = janas_fp32_to_fp16(0.001f);

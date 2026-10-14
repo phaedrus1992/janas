@@ -301,7 +301,8 @@ static void usage(void)
         "  --mode <m>       auto (default), eco or max\n"
         "  --think <on|off> reasoning before replying, for models that do\n"
         "                   it (default off: it is slow, and a small model\n"
-        "                   reasons at length about very little)\n"
+        "                   reasons at length about very little); a number\n"
+        "                   N: on, at most N tokens of it, then the answer\n"
         "  --stats          speed report after every reply\n"
         "  --no-markdown    print the model's marks instead of "
         "reading them\n"
@@ -353,9 +354,10 @@ static const struct {
     {"/mode [auto|eco|max]", "power mode, and what the engine chose"},
     {"/experts [n]",
      "experts per token (fewer: faster, a little less accurate)"},
-    {"/think [on|off]",
+    {"/think [on|off|N]",
      "reasoning before replying, for models that do it (off by default: the "
-     "bar says reasoning while it is on)"},
+     "bar says reasoning while it is on); N: on, at most N tokens of it, "
+     "then the answer"},
     {"/markdown [on|off]", "read the model's marks, or print them"},
     {"/gpu [on|off]", "whether the GPU may be given work"},
     {"/mcp", "the MCP servers running and the tools they give the model"},
@@ -968,9 +970,17 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
         else if (strcmp(a, "--draft") == 0)
             o->mp->draft_path = v;
         else if (strcmp(a, "--think") == 0) {
-            if ((k = opt_choice(a, v, ON_OFF, 2, why, why_len)) < 0)
-                return -1;
-            o->cp->thinking = k;
+            char *end;
+            long b = strtol(v, &end, 10);
+            if (*v && !*end && b > 0 && b <= INT32_MAX) {
+                o->cp->thinking = 1; /* on, at most b tokens of it */
+                o->cp->max_reasoning = (int32_t)b;
+            } else {
+                if ((k = opt_choice(a, v, ON_OFF, 2, why, why_len)) < 0)
+                    return -1;
+                o->cp->thinking = k;
+                o->cp->max_reasoning = 0;
+            }
         } else if (strcmp(a, "--mode") == 0) {
             if ((k = opt_choice(a, v, MODES, 3, why, why_len)) < 0)
                 return -1;
@@ -1200,7 +1210,10 @@ static void conf_write(const char *path, const struct chat_opts *o)
             (double)c->min_p);
     if (c->max_reply)
         fprintf(f, "--max %d\n", c->max_reply);
-    fprintf(f, "--think %s\n", c->thinking ? "on" : "off");
+    if (c->thinking && c->max_reasoning > 0)
+        fprintf(f, "--think %d\n", c->max_reasoning);
+    else
+        fprintf(f, "--think %s\n", c->thinking ? "on" : "off");
     if (!c->speculate)
         fprintf(f, "--no-spec\n");
     if (*o->stats)
@@ -2012,10 +2025,26 @@ int main(int argc, char **argv)
                 if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
                     term_printf(&term, "%s\n", janas_llm_last_error());
             } else if (strcmp(msg, "/think") == 0) {
-                cp.thinking = strcmp(arg, "off") == 0  ? 0
-                              : strcmp(arg, "on") == 0 ? 1
-                                                       : !cp.thinking;
-                if (janas_llm_chat_set_params(c, &cp) == JANAS_LLM_OK)
+                char *end;
+                long b = strtol(arg, &end, 10);
+                if (*arg && !*end && b > 0 && b <= INT32_MAX) {
+                    cp.thinking = 1; /* on, at most b tokens of it */
+                    cp.max_reasoning = (int32_t)b;
+                } else {
+                    cp.thinking = strcmp(arg, "off") == 0  ? 0
+                                  : strcmp(arg, "on") == 0 ? 1
+                                                           : !cp.thinking;
+                    if (strcmp(arg, "on") == 0)
+                        cp.max_reasoning = 0;
+                }
+                if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
+                    term_printf(&term, "%s\n", janas_llm_last_error());
+                else if (cp.thinking && cp.max_reasoning > 0)
+                    term_printf(&term,
+                                "reasoning on, at most %d tokens of it (for "
+                                "models that reason)\n",
+                                cp.max_reasoning);
+                else
                     term_printf(&term,
                                 "reasoning %s (for models that reason)\n",
                                 cp.thinking ? "on" : "off");

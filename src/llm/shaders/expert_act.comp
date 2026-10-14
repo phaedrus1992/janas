@@ -6,14 +6,20 @@
 // janas_q8k_quantize_det): h = SiLU(gate) * up with the deterministic e^x
 // and reciprocal, then Q8_K quantization of h, written in the layout the
 // product shaders read (320 bytes a block: 256 quants, 16 pair sums, d).
+// KIND 1, for a down matrix in blocks of 32 (MXFP4): the layout of the
+// blocks of 32 instead (norm_quant.comp's q32: eight groups of 32 quants,
+// each with its own scale, the sums of 16, the eight scales), as
+// janas_q8k_quantize_det makes qs32, bsums32 and d32.
 // One workgroup per 256-value block; gate and up of block b of item i at
 // g[(i * nb + b) * 256 ...], u likewise; the output block at x.
 #extension GL_EXT_buffer_reference : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 
 layout(local_size_x = 256) in;
+layout(constant_id = 2) const uint KIND = 0;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U { uint v[]; };
@@ -38,6 +44,8 @@ float wg_max(float s)
 }
 
 shared int q_s[256];
+shared float m8[32]; /* KIND 1: the maxima of eight values */
+shared int s8[32];   /* ... and the sums of their quants */
 
 float exp_det(float x)
 {
@@ -79,6 +87,42 @@ void main()
     precise float s = recip_det(1.0 + e);
     precise float gs = gv * s;
     precise float h = gs * uv;
+    if (KIND == 1u) {
+        /* each group of 32 its largest magnitude and scale */
+        float mc = subgroupClusteredMax(abs(h), 8u);
+        if (t % 8u == 0u)
+            m8[t / 8u] = mc;
+        barrier();
+        uint l = t / 32u;
+        float m32 = max(max(m8[4u * l], m8[4u * l + 1u]), max(m8[4u * l + 2u], m8[4u * l + 3u]));
+        precise float d32 = m32 * 0.007874015718698502;
+        precise float id32 = d32 > 0.0 ? recip_det(d32) : 0.0;
+        precise float q32 = roundEven(h * id32);
+        int q = int(clamp(q32, -127.0, 127.0));
+        q_s[t] = q;
+        int cs = subgroupClusteredAdd(q, 8u);
+        if (t % 8u == 0u)
+            s8[t / 8u] = cs;
+        barrier();
+        uint o32 = blk * 80u;
+        if (t < 64u)
+            X.v[o32 + t] = uint(q_s[4u * t] & 0xff) | (uint(q_s[4u * t + 1u] & 0xff) << 8) |
+                           (uint(q_s[4u * t + 2u] & 0xff) << 16) |
+                           (uint(q_s[4u * t + 3u] & 0xff) << 24);
+        else if (t < 72u) {
+            /* two sums of 16 quants a word */
+            uint k = t - 64u;
+            int s0 = s8[4u * k] + s8[4u * k + 1u], s1 = s8[4u * k + 2u] + s8[4u * k + 3u];
+            X.v[o32 + t] = uint(s0 & 0xffff) | (uint(s1 & 0xffff) << 16);
+        } else if (t < 80u) {
+            uint k = t - 72u;
+            precise float dk =
+                max(max(m8[4u * k], m8[4u * k + 1u]), max(m8[4u * k + 2u], m8[4u * k + 3u])) *
+                0.007874015718698502;
+            X.v[o32 + t] = floatBitsToUint(dk);
+        }
+        return;
+    }
     /* the block's largest magnitude (max is exact in any order) */
     float amax = wg_max(abs(h));
     precise float d = amax * 0.007874015718698502;

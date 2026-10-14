@@ -63,10 +63,10 @@ static const struct {
     const char *name;
     int type;
 } TYPES[] = {
-    {"Q4_K", JANAS_Q4_K},     {"Q5_K", JANAS_Q5_K},  {"Q6_K", JANAS_Q6_K},
-    {"Q3_K", JANAS_Q3_K},     {"Q8_0", JANAS_Q8_0},  {"Q4_0", JANAS_Q4_0},
-    {"Q4_1", JANAS_Q4_1},     {"Q5_1", JANAS_Q5_1},  {"IQ4_NL", JANAS_IQ4_NL},
-    {"IQ4_XS", JANAS_IQ4_XS}, {"IQ3_S", JANAS_IQ3_S}};
+    {"Q4_K", JANAS_Q4_K},     {"Q5_K", JANAS_Q5_K},   {"Q6_K", JANAS_Q6_K},
+    {"Q3_K", JANAS_Q3_K},     {"Q8_0", JANAS_Q8_0},   {"Q4_0", JANAS_Q4_0},
+    {"Q4_1", JANAS_Q4_1},     {"Q5_1", JANAS_Q5_1},   {"IQ4_NL", JANAS_IQ4_NL},
+    {"IQ4_XS", JANAS_IQ4_XS}, {"IQ3_S", JANAS_IQ3_S}, {"MXFP4", JANAS_MXFP4}};
 
 /* Seconds per product, the best of passes run for at least 0.3 s. */
 static double timed(struct janas_pool *pool, struct janas_matvec_task *t)
@@ -142,6 +142,11 @@ int main(int argc, char **argv)
         }
         for (size_t i = 0; i < bytes; i++)
             w[i] = (unsigned char)(rand() % 0x7c);
+        /* MXFP4's scale byte is a power of two: the ones of real weights,
+           not subnormal floats, whose products take the slow path */
+        if (TYPES[k].type == JANAS_MXFP4)
+            for (size_t i = 0; i < bytes; i += sizeof(struct janas_block_mxfp4))
+                w[i] = (unsigned char)(118 + rand() % 12);
 #if defined(__linux__)
         if (mem_kind == 2)
             madvise(w, bytes, MADV_COLLAPSE);

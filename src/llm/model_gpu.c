@@ -486,6 +486,16 @@ uint32_t janas_llm_model_pass_cap(const struct janas_llm_model *m)
     return (uint32_t)janas_gpu_few_max(m->gpu);
 }
 
+int janas_m_gpu_token_asked(void)
+{
+    static int asked = -1;
+    if (asked < 0) {
+        const char *e = getenv("JANAS_GPU_TOKEN");
+        asked = e && atoi(e) > 0;
+    }
+    return asked;
+}
+
 int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits)
 {

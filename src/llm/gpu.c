@@ -33,6 +33,7 @@
 #include "iq4xs_mmq.h"    /* janas_spv_iq4xs_mmq */
 #include "iq3s_mmq.h"     /* janas_spv_iq3s_mmq */
 #include "iq4nl_mmq.h"    /* janas_spv_iq4nl_mmq */
+#include "mxfp4_mmid.h"   /* janas_spv_mxfp4_mmid */
 #include "q80_mmq.h"      /* janas_spv_q80_mmq */
 #include "q5k_mmq.h"      /* janas_spv_q5k_mmq */
 #include "dense_mm.h"     /* janas_spv_dense_mm */
@@ -169,7 +170,7 @@ static int pick_device(struct janas_gpu *g, uint32_t *family, char *err,
     const char *want_dev = getenv("JANAS_GPU_DEVICE");
     /* the first device turned down and why, for the message: a tester
        with a GPU the engine does not take has to be able to tell why */
-    char why[160] = "";
+    char why[192] = "";
 #define REJECT(what)                                                           \
     {                                                                          \
         if (!why[0])                                                           \
@@ -214,6 +215,27 @@ static int pick_device(struct janas_gpu *g, uint32_t *family, char *err,
                 !(p11.subgroupSupportedOperations &
                   VK_SUBGROUP_FEATURE_BALLOT_BIT))
                 REJECT("no buffer addresses, integer dot product or ballot")
+            /* besides ballot, 13 shaders use subgroup arithmetic, clustered
+               reductions or shuffles (expert_act, the DeltaNet steps,
+               attention, norms, RoPE, the subgroup-per-row products), all in
+               compute shaders: a device without one of them cannot build them
+               (vkcheck says the same) */
+            VkSubgroupFeatureFlags sg_ops =
+                (p11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT)
+                    ? p11.subgroupSupportedOperations
+                    : 0;
+            char sg_miss[48] = "", sg_why[96];
+            if (!(sg_ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))
+                strcat(sg_miss, ", arithmetic");
+            if (!(sg_ops & VK_SUBGROUP_FEATURE_CLUSTERED_BIT))
+                strcat(sg_miss, ", clustered");
+            if (!(sg_ops & VK_SUBGROUP_FEATURE_SHUFFLE_BIT))
+                strcat(sg_miss, ", shuffle");
+            snprintf(sg_why, sizeof(sg_why),
+                     "no %s subgroup operations in compute shaders",
+                     sg_miss + 2);
+            if (sg_miss[0])
+                REJECT(sg_why)
             /* sharing host memory: needed by an integrated GPU (it reads the
                weights where they are), optional for a discrete one (it gets a
                copy in its own memory) */
@@ -516,7 +538,10 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                                    &g->pipe80, 0)) != VK_SUCCESS ||
         (r = janas_g_make_pipeline(g, janas_spv_expert_act,
                                    sizeof(janas_spv_expert_act), &g->sma,
-                                   &g->pipea, 0)) != VK_SUCCESS) {
+                                   &g->pipea, 0)) != VK_SUCCESS ||
+        (r = janas_g_make_pipeline(g, janas_spv_expert_act,
+                                   sizeof(janas_spv_expert_act), &g->sma32,
+                                   &g->pipea32, 1)) != VK_SUCCESS) {
         set_err(err, err_len, "cannot create the shaders", r);
         goto fail;
     }
@@ -550,6 +575,9 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
         (r = make_pipeline(g, janas_spv_iq4nl_mmq, sizeof(janas_spv_iq4nl_mmq),
                            &g->sm_mmn4, &g->pipe_mmn4, 0, NV_PER_GROUP,
                            g->sg)) != VK_SUCCESS ||
+        (r = make_pipeline(g, janas_spv_iq4nl_mmq, sizeof(janas_spv_iq4nl_mmq),
+                           &g->sm_mmmx, &g->pipe_mmmx, 1, NV_PER_GROUP,
+                           g->sg)) != VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q80_mmq, sizeof(janas_spv_q80_mmq),
                            &g->sm_mm80, &g->pipe_mm80, 0, NV_PER_GROUP,
                            g->sg)) != VK_SUCCESS ||
@@ -570,7 +598,10 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
             VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q6k_mmid, sizeof(janas_spv_q6k_mmid),
                            &g->sm_id6s, &g->pipe_id6s, 0, NV_PER_GROUP,
-                           g->sg)) != VK_SUCCESS) {
+                           g->sg)) != VK_SUCCESS ||
+        (r = make_pipeline(
+             g, janas_spv_mxfp4_mmid, sizeof(janas_spv_mxfp4_mmid), &g->sm_idmx,
+             &g->pipe_idmx, 0, NV_PER_GROUP, g->sg)) != VK_SUCCESS) {
         set_err(err, err_len, "cannot create the shaders", r);
         goto fail;
     }
@@ -592,7 +623,8 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
             {janas_spv_b32_matvec, sizeof(janas_spv_b32_matvec), 3},
             {janas_spv_iq4xs_matvec, sizeof(janas_spv_iq4xs_matvec), 0},
             {janas_spv_q3k_matvec, sizeof(janas_spv_q3k_matvec), 0},
-            {janas_spv_iq3s_matvec, sizeof(janas_spv_iq3s_matvec), 0}};
+            {janas_spv_iq3s_matvec, sizeof(janas_spv_iq3s_matvec), 0},
+            {janas_spv_b32_matvec, sizeof(janas_spv_b32_matvec), 4}};
         for (int i = 0; i < N_PROD; i++)
             if ((r = janas_g_make_pipeline_nv(g, one[i].code, one[i].bytes,
                                               &g->pm1[i], &g->pp1[i],
@@ -680,7 +712,7 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
             goto fail;
         }
     }
-    for (uint32_t k = 0; k < 4; k++)
+    for (uint32_t k = 0; k < N_B32; k++)
         if ((r = janas_g_make_pipeline(
                  g, janas_spv_b32_matvec, sizeof(janas_spv_b32_matvec),
                  &g->sm32[k], &g->pipe32[k], k)) != VK_SUCCESS) {
@@ -877,6 +909,8 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyPipeline(g->dev, g->pipe_mmi3, NULL);
         if (g->pipe_mmn4)
             g->vkDestroyPipeline(g->dev, g->pipe_mmn4, NULL);
+        if (g->pipe_mmmx)
+            g->vkDestroyPipeline(g->dev, g->pipe_mmmx, NULL);
         if (g->pipe_mm80)
             g->vkDestroyPipeline(g->dev, g->pipe_mm80, NULL);
         if (g->pipe_mm5)
@@ -889,11 +923,15 @@ void janas_gpu_destroy(struct janas_gpu *g)
             if (g->sm_dm[i])
                 g->vkDestroyShaderModule(g->dev, g->sm_dm[i], NULL);
         }
-        for (int i = 0; i < 3; i++) {
-            VkPipeline pp = i == 2 ? g->pipe_id6s
-                            : i    ? g->pipe_id6
-                                   : g->pipe_id4;
-            VkShaderModule ss = i == 2 ? g->sm_id6s : i ? g->sm_id6 : g->sm_id4;
+        for (int i = 0; i < 4; i++) {
+            VkPipeline pp = i == 3   ? g->pipe_idmx
+                            : i == 2 ? g->pipe_id6s
+                            : i      ? g->pipe_id6
+                                     : g->pipe_id4;
+            VkShaderModule ss = i == 3   ? g->sm_idmx
+                                : i == 2 ? g->sm_id6s
+                                : i      ? g->sm_id6
+                                         : g->sm_id4;
             if (pp)
                 g->vkDestroyPipeline(g->dev, pp, NULL);
             if (ss)
@@ -909,6 +947,8 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyShaderModule(g->dev, g->sm_mmi3, NULL);
         if (g->sm_mmn4)
             g->vkDestroyShaderModule(g->dev, g->sm_mmn4, NULL);
+        if (g->sm_mmmx)
+            g->vkDestroyShaderModule(g->dev, g->sm_mmmx, NULL);
         if (g->sm_mm80)
             g->vkDestroyShaderModule(g->dev, g->sm_mm80, NULL);
         if (g->sm_mm6)
@@ -923,7 +963,7 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyShaderModule(g->dev, g->smi3, NULL);
         if (g->smx4)
             g->vkDestroyShaderModule(g->dev, g->smx4, NULL);
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < N_B32; k++) {
             if (g->pipe32[k])
                 g->vkDestroyPipeline(g->dev, g->pipe32[k], NULL);
             if (g->sm32[k])
@@ -933,6 +973,10 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyPipeline(g->dev, g->pipea, NULL);
         if (g->sma)
             g->vkDestroyShaderModule(g->dev, g->sma, NULL);
+        if (g->pipea32)
+            g->vkDestroyPipeline(g->dev, g->pipea32, NULL);
+        if (g->sma32)
+            g->vkDestroyShaderModule(g->dev, g->sma32, NULL);
         if (g->sm6)
             g->vkDestroyShaderModule(g->dev, g->sm6, NULL);
         if (g->sm6p)
@@ -1322,6 +1366,7 @@ static int b32_kind(int type)
            : type == JANAS_IQ4_NL ? 1
            : type == JANAS_Q4_1   ? 2
            : type == JANAS_Q5_1   ? 3
+           : type == JANAS_MXFP4  ? 4
                                   : -1;
 }
 
@@ -1467,14 +1512,14 @@ void janas_g_push_addr(uint32_t out[2], VkDeviceAddress a)
 }
 
 /* The index of a type's product shader in the single-vector table, -1 if
-   none: Q4_K, Q6_K, Q6_K_P, Q5_K, Q8_0, the four of b32 (Q4_0, IQ4_NL,
-   Q4_1, Q5_1), IQ4_XS, Q3_K, IQ3_S. */
+   none: Q4_K, Q6_K, Q6_K_P, Q5_K, Q8_0, four of b32 (Q4_0, IQ4_NL, Q4_1,
+   Q5_1), IQ4_XS, Q3_K, IQ3_S, and b32's MXFP4. */
 static int prod_index(int type)
 {
-    static const int types[N_PROD] = {JANAS_Q4_K,   JANAS_Q6_K, JANAS_Q6_K_P,
-                                      JANAS_Q5_K,   JANAS_Q8_0, JANAS_Q4_0,
-                                      JANAS_IQ4_NL, JANAS_Q4_1, JANAS_Q5_1,
-                                      JANAS_IQ4_XS, JANAS_Q3_K, JANAS_IQ3_S};
+    static const int types[N_PROD] = {
+        JANAS_Q4_K, JANAS_Q6_K,   JANAS_Q6_K_P, JANAS_Q5_K, JANAS_Q8_0,
+        JANAS_Q4_0, JANAS_IQ4_NL, JANAS_Q4_1,   JANAS_Q5_1, JANAS_IQ4_XS,
+        JANAS_Q3_K, JANAS_IQ3_S,  JANAS_MXFP4};
     for (int i = 0; i < N_PROD; i++)
         if (types[i] == type)
             return i;
@@ -1565,7 +1610,7 @@ static int vectors_first(const struct janas_gpu *g, VkPipeline p)
         p == g->pipe_mv || p == g->pipe_mvd || p == g->pipe_mvd6 ||
         p == g->pipe_mvd5 || p == g->pipe_mvdx4)
         return 1;
-    for (int k = 0; k < 4; k++)
+    for (int k = 0; k < N_B32; k++)
         if (p == g->pipe32[k])
             return 1;
     for (int i = 0; i < N_PROD; i++)
@@ -1581,6 +1626,7 @@ static int fast_type(const struct janas_matvec_task *t)
            t->type == JANAS_Q8_0 || t->type == JANAS_Q5_K ||
            t->type == JANAS_Q3_K || t->type == JANAS_IQ4_XS ||
            t->type == JANAS_IQ3_S || t->type == JANAS_IQ4_NL ||
+           t->type == JANAS_MXFP4 ||
            (t->type == JANAS_Q6_K_P && plane_level(t) == 3);
 }
 
@@ -1682,6 +1728,11 @@ int janas_g_record_task(struct janas_gpu *g, VkPipeline *bound,
     } else if (t->type == JANAS_IQ4_NL && nv >= JANAS_GPU_FAST_N &&
                g->pipe_mmn4 && mm_on()) {
         want = g->pipe_mmn4;
+        nvg = 64;
+        rows_wg = 64;
+    } else if (t->type == JANAS_MXFP4 && nv >= JANAS_GPU_FAST_N &&
+               g->pipe_mmmx && mm_on()) {
+        want = g->pipe_mmmx;
         nvg = 64;
         rows_wg = 64;
     } else if (t->type == JANAS_Q5_K && nv >= JANAS_GPU_FAST_N && g->pipe_mm5 &&
@@ -1987,16 +2038,30 @@ static size_t experts_pick(const struct janas_matvec_task *t, size_t n,
     return maxnv;
 }
 
+/* A group experts_id leaves to the CPU, and why, with JANAS_GPU_VERBOSE=2:
+   -1. */
+static int experts_off(const struct janas_gpu *g, size_t n, int type,
+                       const char *why)
+{
+    if (g->verbose > 1)
+        fprintf(stderr,
+                "experts_id: a group of %zu (type %d first) not taken: %s\n", n,
+                type, why);
+    return -1;
+}
+
 static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
                       const struct janas_matvec_task *t, size_t n)
 {
-    if (!mm_on() || g->busy || g->broken || n < 2 || !g->pipe_id4 ||
-        n * 48 > g->ts.bytes || n > 2 * 128 + 8)
+    if (!mm_on() || g->busy || g->broken || n < 2 || !g->pipe_id4)
         return -1;
     int type = t[0].type;
+    if (n * 48 > g->ts.bytes || n > 2 * 128 + 8)
+        return experts_off(g, n, type, "more products than its table");
     if (!(type == JANAS_Q4_K || type == JANAS_Q6_K ||
+          (type == JANAS_MXFP4 && g->pipe_idmx) ||
           (type == JANAS_Q6_K_P && plane_level(&t[0]) == 3)))
-        return -1;
+        return experts_off(g, n, type, "a type without its shader");
     size_t nb = t[0].cols / JANAS_QK, xs = t[0].x_stride ? t[0].x_stride : nb;
     const struct janas_block_q8k *x0 = t[0].x, *x1 = t[0].x;
     for (size_t i = 0; i < n; i++) {
@@ -2025,7 +2090,7 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
     for (size_t i = 1; i < n && !own; i++)
         own = t[i].x != t[0].x;
     if (!own)
-        return -1;
+        return experts_off(g, n, type, "no expert with tokens of its own");
     /* a prompt's block only: generating, each expert has a token or a
        few, and the GPU's share cost the 30B three quarters of its speed */
     size_t tokens = 0;
@@ -2035,15 +2100,15 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
         return -1;
     unsigned char on[2 * 128 + 8];
     size_t maxnv = experts_pick(t, n, on);
-    if (maxnv == 0)
-        return -1; /* no expert worth the GPU: the CPU's as before */
+    if (maxnv == 0) /* no expert worth the GPU: the CPU's as before */
+        return experts_off(g, n, type, "no expert worth the GPU");
     /* the activations: one array of vectors xs blocks apart */
     size_t span = (size_t)(x1 - x0);
     if (span % xs != 0 || span / xs * nb * GPU_BLOCK > X_STAGE_BYTES)
-        return -1;
+        return experts_off(g, n, type, "activations beyond the stage");
     for (size_t i = 0; i < n; i++)
         if ((size_t)(t[i].x - x0) % xs != 0)
-            return -1;
+            return experts_off(g, n, type, "activations off the stride");
     /* the table: weights, activations, outputs (shared with the GPU) */
     uint32_t *tb = (uint32_t *)g->ts.map;
     size_t ng = 0;
@@ -2057,7 +2122,7 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
         const struct region *yr = janas_g_find_region(
             g, t[i].y, ((nv - 1) * ys + t[i].rows) * sizeof(float));
         if (!wr || !yr || !yr->host_shared) /* outputs written in place */
-            return -1;
+            return experts_off(g, n, type, "weights or outputs out of reach");
         uint32_t *e = tb + 12 * ng++;
         janas_g_push_addr(
             e,
@@ -2076,7 +2141,7 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
                 const struct region *pr =
                     plane_region(g, t[i].plane[q], t[i].rows, nb);
                 if (!pr)
-                    return -1;
+                    return experts_off(g, n, type, "a plane out of reach");
                 janas_g_push_addr(
                     e + (q == 0 ? 8 : 10),
                     pr->addr +
@@ -2094,7 +2159,7 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
         for (uint32_t v = 0; v < tb[12 * k + 6]; v += 16)
             nt++;
     if ((3 * ng + nt) * 16 > g->ts.bytes)
-        return -1;
+        return experts_off(g, n, type, "more tiles than its table");
     for (size_t k = 0, at = 3 * ng * 4; k < ng; k++)
         for (uint32_t v = 0; v < tb[12 * k + 6]; v += 16, at += 4) {
             tb[at] = (uint32_t)k;
@@ -2123,9 +2188,10 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
     if (g->vkBeginCommandBuffer(g->cb, &bb) != VK_SUCCESS)
         return -1;
     g->vkCmdBindPipeline(g->cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                         type == JANAS_Q4_K   ? g->pipe_id4
-                         : type == JANAS_Q6_K ? g->pipe_id6s
-                                              : g->pipe_id6);
+                         type == JANAS_Q4_K    ? g->pipe_id4
+                         : type == JANAS_Q6_K  ? g->pipe_id6s
+                         : type == JANAS_MXFP4 ? g->pipe_idmx
+                                               : g->pipe_id6);
     uint32_t pc[5];
     janas_g_push_addr(pc, g->ts.addr);
     pc[2] = (uint32_t)t[0].rows;
@@ -2397,7 +2463,10 @@ struct janas_gpu {
 
 struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
 {
-#if !defined(JANAS_GPU_SPV)
+#if defined(JANAS_GPU_WHY)
+    snprintf(err, err_len, "built without GPU support: it needs %s",
+             JANAS_GPU_WHY);
+#elif !defined(JANAS_GPU_SPV)
     snprintf(err, err_len,
              "built without GPU support: glslangValidator was "
              "not installed when Janas was built");
@@ -2413,6 +2482,18 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
 void janas_gpu_destroy(struct janas_gpu *g)
 {
     (void)g;
+}
+
+/* no fast prompt without a GPU (issue #22: the link failed without them) */
+int janas_gpu_fast_prompt(void)
+{
+    return 0;
+}
+
+void janas_gpu_set_only_fast(struct janas_gpu *g, int on)
+{
+    (void)g;
+    (void)on;
 }
 
 int janas_gpu_import(struct janas_gpu *g, const void *p, size_t bytes)

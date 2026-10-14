@@ -1,0 +1,18 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// vkcheck's zero-copy test: reads x and writes y, both in the host's own
+// memory imported by the GPU (VK_EXT_external_memory_host): y = 3x + 1.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U { uint v[]; };
+layout(push_constant) uniform P { uvec2 x, y; uint n; } p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < p.n)
+        U(p.y).v[i] = U(p.x).v[i] * 3u + 1u;
+}

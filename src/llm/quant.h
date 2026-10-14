@@ -85,6 +85,22 @@ struct janas_block_q4_0 {
 extern const int8_t janas_q4_0_values[16];
 
 /*
+ * MXFP4 (ggml's type 39, the OCP microscaling format): 32 weights, each a
+ * 4-bit E2M1 code into janas_mxfp4_values (0, 1, 2, 3, 4, 6, 8, 12 and
+ * their opposites: twice the format's values), times 2^(e - 128), e the
+ * block's E8M0 byte. IQ4_NL's layout with that byte for a scale: eight
+ * blocks cover a Q8_K block, byte l holds weight l low and l + 16 high.
+ */
+struct janas_block_mxfp4 {
+    uint8_t e; /* E8M0: the power of two, 127 the unit */
+    uint8_t qs[16];
+};
+extern const int8_t janas_mxfp4_values[16];
+/* 2^(e - 128) exactly, as ggml's GGML_E8M0_TO_FP32_HALF (subnormal below
+   e = 2): an MXFP4 block's scale */
+float janas_e8m0_half(uint8_t e);
+
+/*
  * Q5_1: 32 weights d * q + m, q of five bits: the low four as in Q4_0,
  * the fifth of weight l in bit l of qh (little-endian).
  */
@@ -177,6 +193,7 @@ _Static_assert(sizeof(struct janas_block_q6kp) == 82, "q6kp block size");
 _Static_assert(sizeof(struct janas_block_q5k) == 176, "q5k block size");
 _Static_assert(sizeof(struct janas_block_q8_0) == 34, "q8_0 block size");
 _Static_assert(sizeof(struct janas_block_iq4nl) == 18, "iq4_nl block size");
+_Static_assert(sizeof(struct janas_block_mxfp4) == 17, "mxfp4 block size");
 _Static_assert(sizeof(struct janas_block_iq4xs) == 136, "iq4_xs block size");
 _Static_assert(sizeof(struct janas_block_q4_0) == 18, "q4_0 block size");
 _Static_assert(sizeof(struct janas_block_q5_1) == 24, "q5_1 block size");
@@ -198,6 +215,7 @@ enum janas_qtype {
     JANAS_IQ4_NL = 20,
     JANAS_IQ3_S = 21, /* sizes per 256 weights: 8 blocks, 144 bytes */
     JANAS_IQ4_XS = 23,
+    JANAS_MXFP4 = 39, /* sizes per 256 weights: 8 blocks, 136 bytes */
     /* Janas' own, outside the GGUF numbering: the high plane of a Q6_K row
        cut into bit planes. Its block size counts that plane alone; the other
        two are JANAS_Q6KP_PLANE bytes each and are passed separately. */
@@ -247,6 +265,20 @@ void janas_axpy_f32(float *y, float a, const float *x, size_t n);
 
 float janas_fp16_to_fp32(uint16_t h);
 uint16_t janas_fp32_to_fp16(float f);
+
+/* MXFP4 (ggml's type 39): a block of 32 weights is an E8M0 scale byte e and
+   16 bytes of 4-bit codes, the weight kv[code] * 2^(e - 128) with kv the 16
+   integers 0, 1, 2, 3, 4, 6, 8, 12 and their opposites; codes j and j + 16
+   share byte j, low and high half. */
+#define JANAS_MXFP4_BLOCK 17
+
+/* n MXFP4 blocks as Q8_0 blocks, exactly: the codes' integers as the
+   weights, the power of two as the fp16 scale. A block whose power is below
+   fp16's least, 2^-24 (weights under 3.6e-7), is written as zeros and
+   counted in *tiny. -1 for a scale beyond fp16 (2^16 and more, or E8M0's
+   NaN), which no model's weights have. */
+int janas_mxfp4_to_q8_0(const uint8_t *in, struct janas_block_q8_0 *out,
+                        size_t n, size_t *tiny);
 
 /* Quantizes n floats (n multiple of JANAS_QK) into n / JANAS_QK blocks. */
 void janas_q8k_quantize(const float *x, struct janas_block_q8k *y, size_t n);
@@ -337,6 +369,10 @@ float janas_q5k_dot_ref(const struct janas_block_q5k *w,
                         const struct janas_block_q8k *x, size_t nb);
 void janas_q8_0_dequantize(const struct janas_block_q8_0 *x, float *y,
                            size_t n);
+/* n floats (n a multiple of 32) into Q8_0 blocks as llama.cpp's
+   quantize_row_q8_0_ref makes them: d = amax / 127, weights rounded half
+   away from zero */
+void janas_q8_0_quantize(const float *x, struct janas_block_q8_0 *y, size_t n);
 /* IQ4_NL (nb groups of eight blocks, as Q8_0: each block's sum in its own
    accumulator, the eight added as janas_hsum8 does) and IQ4_XS (one exact
    integer sum per 256 weights, scales included, then one fma: as Q4_K). */
@@ -345,6 +381,13 @@ void janas_iq4nl_dequantize(const struct janas_block_iq4nl *x, float *y,
 float janas_iq4nl_dot(const struct janas_block_iq4nl *w,
                       const struct janas_block_q8k *x, size_t nb);
 float janas_iq4nl_dot_ref(const struct janas_block_iq4nl *w,
+                          const struct janas_block_q8k *x, size_t nb);
+/* MXFP4: IQ4_NL's products, the block's power of two for its scale */
+void janas_mxfp4_dequantize(const struct janas_block_mxfp4 *x, float *y,
+                            size_t n);
+float janas_mxfp4_dot(const struct janas_block_mxfp4 *w,
+                      const struct janas_block_q8k *x, size_t nb);
+float janas_mxfp4_dot_ref(const struct janas_block_mxfp4 *w,
                           const struct janas_block_q8k *x, size_t nb);
 void janas_iq4xs_dequantize(const struct janas_block_iq4xs *x, float *y,
                             size_t n);

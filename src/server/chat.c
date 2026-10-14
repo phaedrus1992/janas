@@ -57,7 +57,7 @@ static int create(struct srv_req *r, int chat)
         srv_job_release(j);
         return ret;
     }
-    j->p.thinking = r->srv->cfg.thinking; /* unless the request says */
+    srv_reasoning_default(&r->srv->cfg, &j->p); /* unless the request says */
     if (srv_parse_request(r->body, r->n_body, chat, j, &pr, &e) != 0) {
         ret = e.oom ? srv_reply_error(r, 500, "server_error", NULL, "%s", e.msg)
                     : srv_reply_error(r, 400, "invalid_request_error", e.code,

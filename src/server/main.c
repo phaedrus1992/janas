@@ -53,6 +53,10 @@ static void usage(FILE *f)
         "  --think on|off    reasoning before replying, for models that do\n"
         "                    it, when a request does not say (default: the\n"
         "                    model's own)\n"
+        "  --reasoning-budget N  the longest reasoning, in tokens, when a\n"
+        "                    request does not say: there the reasoning is\n"
+        "                    closed and the model answers (-1: no limit,\n"
+        "                    the default; 0: no reasoning)\n"
         "  --keep N          conversations kept computed besides the one\n"
         "                    in use, so that a client coming back is not\n"
         "                    read again (default 8; 0: none)\n"
@@ -107,23 +111,19 @@ static const char *arg(int argc, char **argv, int *i)
 }
 
 /* every option, for the nearest to one mistyped */
-static const char *const OPTIONS[] = {"--help",       "--version",
-                                      "--host",       "--port",
-                                      "--api-key",    "--name",
-                                      "--ctx",        "--reserve",
-                                      "--cache",      "--mtp",
-                                      "--draft",      "--mode",
-                                      "--think",      "--embedding-model",
-                                      "--no-mtp",     "--no-gpu",
-                                      "--keep",       "--keep-memory",
-                                      "--keep-disk",  "--store",
-                                      "--no-store",   "--queue",
-                                      "--max-body",   "--connections",
-                                      "--max-input",  "--warn-input",
-                                      "--fim-prefix", "--fim-suffix",
-                                      "--fim-max",    "--metrics",
-                                      "--progress",   "--no-mcp",
-                                      "--test",       "--verbose"};
+static const char *const OPTIONS[] = {
+    "--help",        "--version",         "--host",
+    "--port",        "--api-key",         "--name",
+    "--ctx",         "--reserve",         "--cache",
+    "--mtp",         "--draft",           "--mode",
+    "--think",       "--embedding-model", "--reasoning-budget",
+    "--no-mtp",      "--no-gpu",          "--keep",
+    "--keep-memory", "--keep-disk",       "--store",
+    "--no-store",    "--queue",           "--max-body",
+    "--connections", "--max-input",       "--warn-input",
+    "--fim-prefix",  "--fim-suffix",      "--fim-max",
+    "--metrics",     "--progress",        "--no-mcp",
+    "--test",        "--verbose"};
 
 /* the value of option argv[*i], read whole within [lo, hi]; a mistake
    ends the program, as a missing value does */
@@ -206,6 +206,7 @@ int main(int argc, char **argv)
     c->max_connections = 64;
     c->api_key = getenv("JANAS_API_KEY");
     c->thinking = -1;
+    c->reasoning_budget = -1;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
@@ -243,6 +244,8 @@ int main(int argc, char **argv)
         } else if (!strcmp(a, "--think")) {
             static const char *const on_off[] = {"off", "on"};
             c->thinking = choice(argc, argv, &i, on_off, 2);
+        } else if (!strcmp(a, "--reasoning-budget")) {
+            c->reasoning_budget = (int)num(argc, argv, &i, -1, INT32_MAX);
         } else if (!strcmp(a, "--embedding-model")) {
             c->embed_path = arg(argc, argv, &i);
         } else if (!strcmp(a, "--no-mtp")) {

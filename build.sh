@@ -239,25 +239,46 @@ if [ "$OS" = windows ] && [ -d /usr/include/vulkan ] &&
     VK_INC=(-I"$OBJ/vkinc")
     CFLAGS+=("${VK_INC[@]}")
 fi
-command -v glslangValidator >/dev/null 2>&1 ||
-    GPU_MISSING="glslangValidator (glslang-tools, glslang)"
+GLSLANG=""
+if command -v glslangValidator >/dev/null 2>&1; then
+    # the shaders need GL_EXT_integer_dot_product, which glslang knows from
+    # 15.2 on (Ubuntu 24.04's 15.1 does not: issue #22)
+    printf '#version 450\n#extension GL_EXT_integer_dot_product : require\nlayout(local_size_x = 1) in;\nvoid main() {}\n' \
+        >"$SPV/probe.comp"
+    if glslangValidator -V --target-env vulkan1.3 "$SPV/probe.comp" \
+        -o "$SPV/probe.spv" >/dev/null 2>&1; then
+        GLSLANG=yes
+    else
+        GPU_MISSING="a glslangValidator new enough for the shaders (this one, $(glslangValidator --version 2>/dev/null | sed -n 's/^Glslang Version: [0-9]*://p'), lacks GL_EXT_integer_dot_product: 15.2 or later)"
+    fi
+    rm -f "$SPV/probe.comp" "$SPV/probe.spv"
+else
+    GPU_MISSING="glslangValidator (glslang-tools, glslang), 15.2 or later"
+fi
 echo '#include <vulkan/vulkan.h>' | "$CC" "${VK_INC[@]}" -E -x c - >/dev/null 2>&1 ||
     GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }the Vulkan headers (libvulkan-dev, vulkan-headers)"
-[ -z "$GPU_MISSING" ] ||
-    echo "note: building without GPU support: $GPU_MISSING not found"
-if command -v glslangValidator >/dev/null 2>&1; then
+if [ -n "$GLSLANG" ]; then
     for comp in src/*/shaders/*.comp; do
         [ -f "$comp" ] || continue
         name=$(basename "${comp%.comp}")
         out="$SPV/$name.h"
         if [ ! -f "$out" ] || [ "$comp" -nt "$out" ]; then
             echo "SPV $comp"
-            glslangValidator -V --target-env vulkan1.3 --vn "janas_spv_$name" \
-                "$comp" -o "$out" >/dev/null
+            if ! glslangValidator -V --target-env vulkan1.3 \
+                --vn "janas_spv_$name" "$comp" -o "$out" >/dev/null; then
+                rm -f "$out"
+                GLSLANG=""
+                GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a glslangValidator that compiles $comp"
+                break
+            fi
         fi
     done
-    CFLAGS+=(-DJANAS_GPU_SPV -I"$SPV")
 fi
+[ -z "$GPU_MISSING" ] ||
+    echo "note: building without GPU support: it needs $GPU_MISSING"
+# the reason, for the engine to give when asked for the GPU
+[ -z "$GPU_MISSING" ] || CFLAGS+=(-DJANAS_GPU_WHY="\"$GPU_MISSING\"")
+[ -z "$GLSLANG" ] || CFLAGS+=(-DJANAS_GPU_SPV -I"$SPV")
 
 # Web pages of the programs (src/<tool>/*.html) as C arrays, so that the
 # program carries them: janas_<tool>_<name>_html in <tool>_<name>_html.h.

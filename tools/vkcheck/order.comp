@@ -1,0 +1,28 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// vkcheck's float test: what Janas-LLM's shaders rely on to give the CPU's
+// results to the bit. fma() one rounding, a * b + c marked precise two, a
+// precise sum in the order written; and whether a subnormal survives.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+layout(push_constant) uniform P { uvec2 x, y; } p;
+
+void main()
+{
+    F X = F(p.x), Y = F(p.y);
+    float a = X.v[0], b = X.v[1], c = X.v[2];
+    precise float f = fma(a, b, c);
+    precise float m = a * b;
+    precise float u = m + c;
+    float d = X.v[3], e = X.v[4], g = X.v[5];
+    precise float s = (d + e) + g;
+    Y.v[0] = f;
+    Y.v[1] = u;
+    Y.v[2] = s;
+    Y.v[3] = fma(a, b, c);
+    Y.v[4] = X.v[6] * X.v[7];
+}

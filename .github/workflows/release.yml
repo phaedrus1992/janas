@@ -70,7 +70,7 @@ jobs:
           P="$PACKAGE/janas"
           mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
           for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check; do
+                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
             install -m 755 "$B/$f" "$P/"
           done
           for s in src/services/*/; do
@@ -213,7 +213,7 @@ jobs:
           P="$WPACKAGE/janas"
           mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
           for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check; do
+                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
             install -m 755 "$B/$f.exe" "$P/"
           done
           for s in src/services/*/; do

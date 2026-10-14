@@ -147,7 +147,7 @@ On Qwen3-Next-80B-A3B, whose file is larger than this laptop's 30 GB, llama.cpp 
 
 ```sh
 sudo apt install build-essential          # Debian/Ubuntu
-sudo apt install libvulkan-dev glslang-tools vulkan-tools   # optional, GPU
+sudo apt install libvulkan-dev glslang-tools vulkan-tools   # optional, GPU (glslang 15.2 or later: INSTALL.md)
 sudo pacman -S vulkan-headers glslang vulkan-tools           # the same, Arch
 
 ./build.sh                                # everything into bin/x86_64-linux/
