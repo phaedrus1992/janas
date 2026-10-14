@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# The fixture tests for the fork tooling, in CI: every pull request that
-# touches .fork/ or the workflows runs both fixture tests. A local session
-# runs the same fixtures by hand:
-#   .fork/tests/test-check-clean.sh
-#   .fork/tests/test-sync-upstream.sh
-#
-# test-check-clean.sh needs the clean branch as a local branch, which a CI
-# checkout does not have. The first step materializes it from origin/clean.
-# test-sync-upstream.sh is hermetic: two local bare repositories stand in for
-# upstream and origin, and a stub gh stands in for GitHub.
+# The fixture tests for the fork tooling. A pull request that touches .fork/
+# or the workflows runs both fixtures, and the merge push re-runs them as a
+# smoke test. The fixtures come from main, never from the pull request tree,
+# so a changed pull request cannot fake the verdict. test-check-clean.sh
+# needs the clean branch as a local branch; the first step materializes it
+# from origin/clean.
 name: fork-tests
 
 on:
@@ -17,7 +13,11 @@ on:
     paths:
       - '.fork/**'
       - '.github/workflows/**'
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.fork/**'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -32,8 +32,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Make clean a local branch
-        run: git branch --no-track clean origin/clean
-      - name: Run the check-clean fixture
-        run: bash .fork/tests/test-check-clean.sh
-      - name: Run the sync fixture
-        run: bash .fork/tests/test-sync-upstream.sh
+        run: |
+          if ! git rev-parse --verify --quiet refs/remotes/origin/clean >/dev/null; then
+            echo "FAIL: origin/clean is missing; run .fork/sync-upstream.sh once" >&2
+            exit 1
+          fi
+          git branch --no-track clean origin/clean
+      - name: Run the fixtures from main
+        run: |
+          git show origin/main:.fork/tests/test-check-clean.sh > "$RUNNER_TEMP/test-check-clean.sh"
+          git show origin/main:.fork/tests/test-sync-upstream.sh > "$RUNNER_TEMP/test-sync-upstream.sh"
+          bash "$RUNNER_TEMP/test-check-clean.sh"
+          bash "$RUNNER_TEMP/test-sync-upstream.sh"
