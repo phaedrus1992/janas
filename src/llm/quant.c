@@ -75,6 +75,41 @@ uint16_t janas_fp32_to_fp16(float f)
     return (uint16_t)half;
 }
 
+const int8_t janas_mxfp4_values[16] = {0, 1,  2,  3,  4,  6,  8,  12,
+                                       0, -1, -2, -3, -4, -6, -8, -12};
+
+float janas_e8m0_half(uint8_t e)
+{
+    uint32_t bits = e < 2 ? 0x00200000u << e : (uint32_t)(e - 1) << 23;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+int janas_mxfp4_to_q8_0(const uint8_t *in, struct janas_block_q8_0 *out,
+                        size_t n, size_t *tiny)
+{
+    const int8_t *kv = janas_mxfp4_values;
+    for (size_t b = 0; b < n; b++) {
+        const uint8_t *x = in + b * JANAS_MXFP4_BLOCK;
+        int p = (int)x[0] - 128; /* the block's power of two */
+        if (x[0] == 0xFF || p > 15)
+            return -1;
+        /* fp16 of 2^p: normal from 2^-14, subnormal down to 2^-24 */
+        uint16_t d = p >= -14   ? (uint16_t)((p + 15) << 10)
+                     : p >= -24 ? (uint16_t)(1u << (p + 24))
+                                : 0;
+        if (!d)
+            ++*tiny;
+        out[b].d = d;
+        for (int j = 0; j < 16; j++) {
+            out[b].qs[j] = d ? kv[x[1 + j] & 15] : 0;
+            out[b].qs[j + 16] = d ? kv[x[1 + j] >> 4] : 0;
+        }
+    }
+    return 0;
+}
+
 static int use_avx2_fma; /* set by float_helpers_init, further down */
 
 /* The eight blocks of 32 (d32, qs32, bsums32) of one block, as the 256
@@ -698,6 +733,19 @@ float janas_q5k_dot_ref(const struct janas_block_q5k *w,
     return acc - accm;
 }
 
+void janas_q8_0_quantize(const float *x, struct janas_block_q8_0 *y, size_t n)
+{
+    for (size_t b = 0; b < n / 32; b++, x += 32) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++)
+            amax = fmaxf(amax, fabsf(x[j]));
+        float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        y[b].d = janas_fp32_to_fp16(d);
+        for (int j = 0; j < 32; j++)
+            y[b].qs[j] = (int8_t)roundf(x[j] * id);
+    }
+}
+
 void janas_q8_0_dequantize(const struct janas_block_q8_0 *x, float *y, size_t n)
 {
     for (size_t b = 0; b < n / 32; b++) {
@@ -779,6 +827,36 @@ float janas_iq4nl_dot_ref(const struct janas_block_iq4nl *w,
                           const struct janas_block_q8k *x, size_t nb)
 {
     return nib_dot_ref(w, x, nb, janas_iq4_values);
+}
+
+void janas_mxfp4_dequantize(const struct janas_block_mxfp4 *x, float *y,
+                            size_t n)
+{
+    for (size_t b = 0; b < n / 32; b++, y += 32) {
+        float d = janas_e8m0_half(x[b].e);
+        for (int l = 0; l < 16; l++) {
+            y[l] = d * janas_mxfp4_values[x[b].qs[l] & 15];
+            y[l + 16] = d * janas_mxfp4_values[x[b].qs[l] >> 4];
+        }
+    }
+}
+
+/* As IQ4_NL: one lane per block position, each block's exact sum times its
+   power of two and the activations' scale. */
+float janas_mxfp4_dot_ref(const struct janas_block_mxfp4 *w,
+                          const struct janas_block_q8k *x, size_t nb)
+{
+    float acc[8] = {0};
+    for (size_t b = 0; b < nb; b++)
+        for (int k = 0; k < 8; k++) {
+            const struct janas_block_mxfp4 *wk = w + 8 * b + k;
+            int32_t dot =
+                nib_sum32(wk->qs, x[b].qs32 + 32 * k, janas_mxfp4_values);
+            acc[k] =
+                fmaf(janas_e8m0_half(wk->e) * x[b].d32[k], (float)dot, acc[k]);
+        }
+    return ((acc[0] + acc[4]) + (acc[2] + acc[6])) +
+           ((acc[1] + acc[5]) + (acc[3] + acc[7]));
 }
 
 _Static_assert(sizeof(struct janas_block_q4_0) ==
@@ -1041,6 +1119,12 @@ static inline void unpack_scales_u32(const uint8_t *q, uint32_t out[4])
     out[3] = ((c >> 4) & low4) | (((b >> 6) & top2) << 4); /* mins 4-7 */
 }
 
+/* MXFP4's scales, janas_e8m0_half of every byte, for the kernels: read
+   from a table they keep the vector registers the unpacking needs (the
+   shifts and the blend held three constants, spilled on every block: 14%
+   slower than IQ4_NL on 12 threads). Filled before main. */
+static float e8m0_tab[256];
+
 /* The kernels proper: quant_dotn.h, once for AVX2 and once for AVX-VNNI. */
 #define DOTN(name) name##_avx2
 #define DOTN_TARGET __attribute__((target("avx2,fma,f16c")))
@@ -1077,6 +1161,9 @@ typedef float (*dotnl_fn)(const struct janas_block_iq4nl *,
 typedef float (*dotxs_fn)(const struct janas_block_iq4xs *,
                           const struct janas_block_q8k *, size_t);
 static dotnl_fn dotnl_impl = janas_iq4nl_dot_ref;
+typedef float (*dotmx_fn)(const struct janas_block_mxfp4 *,
+                          const struct janas_block_q8k *, size_t);
+static dotmx_fn dotmx_impl = janas_mxfp4_dot_ref;
 static dotxs_fn dotxs_impl = janas_iq4xs_dot_ref;
 typedef float (*dot40_fn)(const struct janas_block_q4_0 *,
                           const struct janas_block_q8k *, size_t);
@@ -1103,6 +1190,8 @@ static int use_vnni;
 /* Resolved before main: the kernels are first called from pool threads. */
 __attribute__((constructor)) static void dot_kernels_init(void)
 {
+    for (int e = 0; e < 256; e++)
+        e8m0_tab[e] = janas_e8m0_half((uint8_t)e);
 #if defined(__x86_64__)
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
@@ -1112,6 +1201,7 @@ __attribute__((constructor)) static void dot_kernels_init(void)
         dot5_impl = q5k_dot_avx2;
         dot80_impl = q8_0_dot_avx2;
         dotnl_impl = iq4nl_dot_avx2;
+        dotmx_impl = mxfp4_dot_avx2;
         dotxs_impl = iq4xs_dot_avx2;
         dot40_impl = q4_0_dot_avx2;
         dot51_impl = q5_1_dot_avx2;
@@ -1128,6 +1218,7 @@ __attribute__((constructor)) static void dot_kernels_init(void)
             dot5_impl = q5k_dot_vnni;
             dot80_impl = q8_0_dot_vnni;
             dotnl_impl = iq4nl_dot_vnni;
+            dotmx_impl = mxfp4_dot_vnni;
             dotxs_impl = iq4xs_dot_vnni;
             dot40_impl = q4_0_dot_vnni;
             dot51_impl = q5_1_dot_vnni;
@@ -1174,6 +1265,12 @@ float janas_iq4xs_dot(const struct janas_block_iq4xs *w,
                       const struct janas_block_q8k *x, size_t nb)
 {
     return dotxs_impl(w, x, nb);
+}
+
+float janas_mxfp4_dot(const struct janas_block_mxfp4 *w,
+                      const struct janas_block_q8k *x, size_t nb)
+{
+    return dotmx_impl(w, x, nb);
 }
 
 float janas_q4_0_dot(const struct janas_block_q4_0 *w,
@@ -1266,6 +1363,8 @@ size_t janas_qtype_block_size(int type)
         return 8 * sizeof(struct janas_block_q8_0);
     case JANAS_IQ4_NL:
         return 8 * sizeof(struct janas_block_iq4nl);
+    case JANAS_MXFP4:
+        return 8 * sizeof(struct janas_block_mxfp4);
     case JANAS_Q4_0:
         return 8 * sizeof(struct janas_block_q4_0);
     case JANAS_Q5_1:
@@ -1300,6 +1399,9 @@ void janas_dequantize(int type, const void *w, float *y, size_t n)
         return;
     case JANAS_IQ4_NL:
         janas_iq4nl_dequantize(w, y, n);
+        return;
+    case JANAS_MXFP4:
+        janas_mxfp4_dequantize(w, y, n);
         return;
     case JANAS_IQ4_XS:
         janas_iq4xs_dequantize(w, y, n);
@@ -1339,6 +1441,8 @@ float janas_dot(int type, const void *w, const struct janas_block_q8k *x,
         return janas_q8_0_dot(w, x, nb);
     case JANAS_IQ4_NL:
         return janas_iq4nl_dot(w, x, nb);
+    case JANAS_MXFP4:
+        return janas_mxfp4_dot(w, x, nb);
     case JANAS_IQ4_XS:
         return janas_iq4xs_dot(w, x, nb);
     case JANAS_Q4_0:
@@ -1468,6 +1572,9 @@ void janas_dot_rows(int type, const void *w, size_t row_bytes,
         case JANAS_IQ4_NL:
             f = use_vnni ? iq4nl_rows_vnni : iq4nl_rows_avx2;
             break;
+        case JANAS_MXFP4:
+            f = use_vnni ? mxfp4_rows_vnni : mxfp4_rows_avx2;
+            break;
         case JANAS_IQ4_XS:
             f = use_vnni ? iq4xs_rows_vnni : iq4xs_rows_avx2;
             break;
@@ -1507,7 +1614,7 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
         (type == JANAS_Q4_K || type == JANAS_Q6_K || type == JANAS_Q5_K ||
          type == JANAS_Q8_0 || type == JANAS_IQ4_NL || type == JANAS_IQ4_XS ||
          type == JANAS_Q4_0 || type == JANAS_Q5_1 || type == JANAS_Q4_1 ||
-         type == JANAS_Q3_K || type == JANAS_IQ3_S)) {
+         type == JANAS_Q3_K || type == JANAS_IQ3_S || type == JANAS_MXFP4)) {
         float r[8];
         int g = 1;
         for (; v < nv; v += (size_t)g) {
@@ -1529,6 +1636,10 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
                 break;
             case JANAS_IQ4_NL:
                 (use_vnni ? iq4nl_dotn_vnni : iq4nl_dotn_avx2)(w, xv, x_stride,
+                                                               g, nb, r);
+                break;
+            case JANAS_MXFP4:
+                (use_vnni ? mxfp4_dotn_vnni : mxfp4_dotn_avx2)(w, xv, x_stride,
                                                                g, nb, r);
                 break;
             case JANAS_IQ4_XS:

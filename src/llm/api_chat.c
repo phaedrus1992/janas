@@ -30,8 +30,8 @@ static int32_t gen_options(const janas_llm_chat *c, struct janas_gen_options *o)
 {
     const struct janas_llm_chat_params *p = &c->p;
     if (!(p->temperature >= 0) || p->top_k < 0 || !(p->top_p >= 0) ||
-        !(p->min_p >= 0) || p->max_reply < 0 || p->top_logprobs < 0 ||
-        p->top_logprobs > JANAS_SAMPLE_MAX_TOP ||
+        !(p->min_p >= 0) || p->max_reply < 0 || p->max_reasoning < 0 ||
+        p->top_logprobs < 0 || p->top_logprobs > JANAS_SAMPLE_MAX_TOP ||
         !(p->presence_penalty >= -2 && p->presence_penalty <= 2) ||
         !(p->frequency_penalty >= -2 && p->frequency_penalty <= 2))
         return janas_api_fail(JANAS_LLM_EINVAL, "invalid chat parameters");
@@ -651,6 +651,7 @@ int janas_api_begin_reply(janas_llm_chat *c, uint32_t reply_at, uint32_t total,
     c->closed = c->ended = 0;
     c->reply_tokens = 0;
     c->answer_tokens = 0;
+    c->n_forced = c->i_forced = 0;
     c->npend = 0;
     c->n_rtext = 0;
     c->reply_at = reply_at;

@@ -212,6 +212,85 @@ static void *rq_worker(void *arg)
     return NULL;
 }
 
+/*
+ * An output head or embedding table in BF16 or F16 - the MXFP4_MOE files
+ * keep output.weight in BF16, 1.02 GB for Qwen3.6-35B-A3B's 248,320 rows -
+ * rewritten once, at load, as Q8_0, as llama.cpp's quantize would make it:
+ * the products read quantized types, and the head, read whole at every
+ * token, is read at half the bytes (BF16 would cost some 12 ms a token at
+ * 81 GB/s). Built beside and copied in place, Q8_0 being the smaller.
+ */
+struct h16_job {
+    const uint8_t *src;
+    struct janas_block_q8_0 *dst;
+    size_t first, count; /* blocks of 32 weights */
+    int bf16;
+};
+
+static void *h16_worker(void *arg)
+{
+    struct h16_job *r = arg;
+    float buf[32];
+    for (size_t b = r->first; b < r->first + r->count; b++) {
+        const uint16_t *s = (const uint16_t *)(r->src + b * 64);
+        for (int j = 0; j < 32; j++) {
+            if (r->bf16) {
+                uint32_t bits = (uint32_t)s[j] << 16;
+                memcpy(&buf[j], &bits, sizeof(float));
+            } else
+                buf[j] = janas_fp16_to_fp32(s[j]);
+        }
+        janas_q8_0_quantize(buf, r->dst + b, 32);
+    }
+    return NULL;
+}
+
+static void head16_to_q8_0(struct janas_llm_model *m, const char *name)
+{
+    struct janas_jns_tensor *t =
+        (struct janas_jns_tensor *)janas_jns_tensor(&m->j, name);
+    if (!t || (t->type != 30 && t->type != 1) || t->dims[0] % JANAS_QK ||
+        t->offset < m->j.h.resident_offset ||
+        t->offset + t->bytes > m->j.h.resident_offset + m->j.h.resident_bytes)
+        return;
+    enum { NT = 16 };
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = cpus < 1 ? 1 : cpus > NT ? NT : (int)cpus;
+    size_t nb = t->bytes / 64;
+    uint8_t *src = (uint8_t *)data(m, t);
+    struct janas_block_q8_0 *dst = malloc(nb * sizeof(*dst));
+    if (!dst)
+        return;
+    pthread_t th[NT];
+    struct h16_job jb[NT];
+    int started = 0;
+    for (int k = 0; k < nt; k++) {
+        size_t a = nb * k / nt, b = nb * (k + 1) / nt;
+        jb[k] = (struct h16_job){.src = src,
+                                 .dst = dst,
+                                 .first = a,
+                                 .count = b - a,
+                                 .bf16 = t->type == 30};
+        if (pthread_create(&th[k], NULL, h16_worker, &jb[k]) == 0)
+            started |= 1 << k;
+        else
+            h16_worker(&jb[k]);
+    }
+    for (int k = 0; k < nt; k++)
+        if (started & 1 << k)
+            pthread_join(th[k], NULL);
+    if (!strcmp(name, "output.weight") ||
+        !janas_jns_tensor(&m->j, "output.weight")) {
+        m->head16 = (int)t->type;
+        m->head16_before = t->bytes;
+        m->head16_after = nb * sizeof(*dst);
+    }
+    t->type = JANAS_Q8_0;
+    t->bytes = nb * sizeof(*dst);
+    memcpy(src, dst, t->bytes);
+    free(dst);
+}
+
 static void requant_head(struct janas_llm_model *m)
 {
     /* tied embeddings (the small Qwen): the table is the head */
@@ -286,7 +365,18 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
                          &ly->beta_own, err, err_len))
                 return -1;
         } else {
-            NEED(ssm_in, "ssm_in.weight", T_QUANT, dm, m->qkvz_dim)
+            /* qwen3next's fused projection, q, k, v and z interleaved per
+               key head; llama.cpp's converter writes it as two since 2026,
+               q|k|v and z each in the heads' order, as qwen35 has them
+               (issue #18: unsloth's Qwen3-Coder-Next files). ssm_ba is the
+               same in both. */
+            snprintf(name, sizeof(name), "blk.%u.attn_qkv.weight", l);
+            if (janas_jns_tensor(j, name)) {
+                NEED(ssm_qkv, "attn_qkv.weight", T_QUANT, dm, m->conv_ch)
+                NEED(ssm_z, "attn_gate.weight", T_QUANT, dm, m->d_inner)
+            } else {
+                NEED(ssm_in, "ssm_in.weight", T_QUANT, dm, m->qkvz_dim)
+            }
             NEED(ssm_ba, "ssm_ba.weight", T_QUANT, dm, 2 * m->n_vh)
         }
         NEED(conv, "ssm_conv1d.weight", T_F32, m->d_conv, m->conv_ch)
@@ -733,6 +823,8 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         }
         done += (uint64_t)r;
     }
+    head16_to_q8_0(m, "output.weight");
+    head16_to_q8_0(m, "token_embd.weight");
     const char *hbe = getenv("JANAS_HEAD_BITS");
     if ((hbe ? atoi(hbe) : o->head_bits) == 4 && !m->resident_gpu)
         requant_head(m);
@@ -1430,6 +1522,14 @@ void janas_llm_model_head_requant(const struct janas_llm_model *m,
     *after = m->head_after;
 }
 
+int janas_llm_model_head16(const struct janas_llm_model *m, uint64_t *before,
+                           uint64_t *after)
+{
+    *before = m->head16_before;
+    *after = m->head16_after;
+    return m->head16;
+}
+
 int janas_llm_model_experts_auto(const struct janas_llm_model *m)
 {
     return m->k_auto;
@@ -1450,8 +1550,6 @@ uint64_t janas_llm_model_warm(const struct janas_llm_model *m, double *seconds)
 /* The GPU region of 4 GB at the most: cut at a multiple of unit (an
    expert slot), or for the resident region (unit 0) where a tensor
    begins, so that no tensor straddles two and each stays in reach */
-#define GPU_REGION_MAX ((uint64_t)4 << 30)
-
 /*
  * Memory the GPU imports, collapsed into huge pages first: the GPU's own
  * page tables map it in 2 MB pages only where it is on them and the region
@@ -1498,38 +1596,53 @@ void janas_m_huge_pages(void *p, uint64_t bytes)
 #endif
 }
 
-static uint64_t resident_cut(const struct janas_llm_model *m, uint64_t from)
+/* The last tensor boundary of the resident memory past from and at most
+   room further (from + room if none). */
+static uint64_t resident_cut(const struct janas_llm_model *m, uint64_t from,
+                             uint64_t room)
 {
     uint64_t base = m->j.h.resident_offset, best = from;
     for (uint64_t i = 0; i < m->j.h.n_tensor; i++) {
         uint64_t at = m->j.tensors[i].offset - base;
-        if (at > from && at <= from + GPU_REGION_MAX && at > best)
+        if (at > from && at <= from + room && at > best)
             best = at;
     }
-    return best > from ? best : from + GPU_REGION_MAX;
+    return best > from ? best : from + room;
+}
+
+/*
+ * Each region from a 2 MB boundary (the memory is allocated on one),
+ * overlapping the one before by what it takes: the GPU maps only such
+ * regions in huge pages (janas_m_huge_pages). The overlap counts in the
+ * region's length: from 13 October 2026, when the regions began on 2 MB
+ * boundaries, until 14 October it did not, and a region past the first
+ * could come to more than the 4 GiB the GPU takes - Qwen3.6-35B-A3B's
+ * MXFP4_MOE file, slots of 1,671,168 bytes, the arena's second region 4 GiB
+ * and 1.9 MB (its Q4_K_M at six bits the third): refused, and the experts
+ * of a cache holding more than 4 GiB (8 GiB) stayed off the GPU.
+ */
+uint64_t janas_m_import_next(uint64_t at, uint64_t bytes, uint64_t unit,
+                             int huge, uint64_t *from)
+{
+    *from = huge ? at / JANAS_HUGE_PAGE * JANAS_HUGE_PAGE : at;
+    uint64_t room = JANAS_M_REGION_MAX - (at - *from);
+    if (bytes - at <= room)
+        return bytes;
+    return unit && room >= unit ? at + room / unit * unit : at + room;
 }
 
 int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
                        uint64_t bytes, uint64_t unit)
 {
+    int huge =
+        ((uintptr_t)p & (JANAS_HUGE_PAGE - 1)) == 0 &&
+        !(getenv("JANAS_GPU_HUGE") && atoi(getenv("JANAS_GPU_HUGE")) == 0);
     for (uint64_t at = 0; at < bytes;) {
-        uint64_t end = at + GPU_REGION_MAX;
-        if (end >= bytes)
-            end = bytes;
-        else if (unit)
-            end = at + GPU_REGION_MAX / unit * unit;
-        else
-            end = resident_cut(m, at);
-        if (end > bytes)
-            end = bytes;
-        /* each region from a 2 MB boundary (the memory is allocated on
-           one), overlapping the one before by what it takes: the GPU maps
-           only such regions in huge pages (janas_m_huge_pages); whole
-           pages, the last one's length rounded up (the allocations are) */
-        uint64_t from = at;
-        if (((uintptr_t)p & (JANAS_HUGE_PAGE - 1)) == 0 &&
-            !(getenv("JANAS_GPU_HUGE") && atoi(getenv("JANAS_GPU_HUGE")) == 0))
-            from = at / JANAS_HUGE_PAGE * JANAS_HUGE_PAGE;
+        uint64_t from, end = janas_m_import_next(at, bytes, unit, huge, &from);
+        if (!unit && end < bytes)
+            end = resident_cut(m, at, end - at);
+        /* whole pages, the last one's length rounded up (the allocations
+           are) */
         uint64_t len = (end - from + 4095) & ~(uint64_t)4095;
         if (janas_gpu_import(m->gpu, p + from, len) != 0)
             return -1;

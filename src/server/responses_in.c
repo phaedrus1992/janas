@@ -533,7 +533,7 @@ int resp_read(struct srv_req *r, struct resp *x, int *ret)
     yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
     struct srv_job *j = x->j;
     j->kind = JOB_CHAT;
-    j->p.thinking = r->srv->cfg.thinking;
+    srv_reasoning_default(&r->srv->cfg, &j->p);
     if (srv_job_choices(j, 1, 1) != 0)
         goto oom;
     double v;
@@ -570,6 +570,12 @@ int resp_read(struct srv_req *r, struct resp *x, int *ret)
     if (eff) {
         j->p.thinking = !strcmp(eff, "none") || !strcmp(eff, "minimal") ? 0 : 1;
         x->reasoning_asked = 1;
+    }
+    if (srv_reasoning_budget(root, &j->p) != 0) {
+        bad(r, ret,
+            "'reasoning_budget_tokens' is -1 (no limit), 0 (no "
+            "reasoning) or a number of tokens.");
+        goto out;
     }
     yyjson_val *st = yyjson_obj_get(root, "store");
     x->store = !st || !yyjson_is_bool(st) || yyjson_get_bool(st); /* default

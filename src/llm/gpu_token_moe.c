@@ -70,7 +70,9 @@ int janas_gt_rec_router(struct janas_gpu *g, struct janas_gpu_tok *t,
 /* A mixture's experts on the block whose router chose them (plan wrote
    their tables and sizes): the activations gathered in the experts'
    order, gate and up, the activation, down, then each token's weighted
-   sum (and the shared expert) into YD. */
+   sum (and the shared expert) into YD. Experts in blocks of 32 (MXFP4)
+   read the activations in that layout: the block's q32, and the
+   activation quantized into it (expert_act.comp's KIND 1). */
 void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           const struct janas_gpu_tok_model *md,
                           const struct janas_gpu_tok_layer *ly,
@@ -78,8 +80,10 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
 {
     VkDeviceAddress B = t->buf.addr;
     uint32_t np = n * md->k, nbd = md->dm / JANAS_QK, nbf = md->eff / JANAS_QK;
+    int dt = ly->down.type;
     struct push_ga pg = {.nb = nbd};
-    janas_g_push_addr(pg.src, B + t->o_q256);
+    janas_g_push_addr(
+        pg.src, B + (janas_g_x_in_32(ly->gate.type) ? t->o_q32 : t->o_q256));
     janas_g_push_addr(pg.dst, B + t->o_xg);
     janas_g_push_addr(pg.tok, B + t->o_gt);
     janas_gt_bind(g, bound, t->p_ga);
@@ -88,7 +92,8 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
     janas_g_compute_barrier(g);
     struct push_id pi = {.rows = md->eff, .nb = nbd, .tiles = t->tiles1};
     janas_g_push_addr(pi.t, B + t->o_tab1);
-    janas_gt_bind(g, bound, g->pipe_id4);
+    janas_gt_bind(g, bound,
+                  ly->gate.type == JANAS_MXFP4 ? g->pipe_idmx : g->pipe_id4);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind);
     janas_g_compute_barrier(g);
@@ -96,16 +101,17 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
     janas_g_push_addr(ac.g, B + t->o_egu);
     janas_g_push_addr(ac.u, B + t->o_egu + (size_t)np * md->eff * 4);
     janas_g_push_addr(ac.x, B + t->o_eh);
-    janas_gt_bind(g, bound, g->pipea);
+    janas_gt_bind(g, bound, janas_g_x_in_32(dt) ? g->pipea32 : g->pipea);
     janas_gt_push(g, &ac, sizeof(ac));
     g->vkCmdDispatch(g->cb, np * nbf, 1, 1);
     janas_g_compute_barrier(g);
     pi = (struct push_id){.rows = md->dm, .nb = nbf, .tiles = t->tiles2};
     janas_g_push_addr(pi.t, B + t->o_tab2);
     janas_gt_bind(g, bound,
-                  ly->down.type == JANAS_Q4_K   ? g->pipe_id4
-                  : ly->down.type == JANAS_Q6_K ? g->pipe_id6s
-                                                : g->pipe_id6);
+                  dt == JANAS_Q4_K    ? g->pipe_id4
+                  : dt == JANAS_Q6_K  ? g->pipe_id6s
+                  : dt == JANAS_MXFP4 ? g->pipe_idmx
+                                      : g->pipe_id6);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind + 16);
     janas_g_compute_barrier(g);
@@ -180,7 +186,7 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
     uint32_t *t1 = (uint32_t *)(t->buf.map + t->o_tab1),
              *t2 = (uint32_t *)(t->buf.map + t->o_tab2);
     uint32_t n1 = 0, n2 = 0; /* tiles */
-    size_t gb = (size_t)md->eff * nbd * janas_qtype_block_size(JANAS_Q4_K),
+    size_t gb = (size_t)md->eff * nbd * janas_qtype_block_size(ly->gate.type),
            db =
                (size_t)md->dm * nbf * janas_qtype_block_size(ly->down.type) + 4,
            pb = (size_t)md->dm * nbf * JANAS_Q6KP_PLANE;

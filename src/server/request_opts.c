@@ -358,5 +358,37 @@ int srv_read_chat_opts(struct srv_perr *e, struct srv_parsed *pr,
     yyjson_val *et = kw ? yyjson_obj_get(kw, "enable_thinking") : NULL;
     if (et && yyjson_is_bool(et))
         j->p.thinking = yyjson_get_bool(et) ? 1 : 0;
+    if (srv_reasoning_budget(root, &j->p) != 0)
+        return srv_pfail(
+            pr, BAD("invalid_value",
+                    "'reasoning_budget_tokens' is -1 (no limit), 0 (no "
+                    "reasoning) or a number of tokens."));
+    return 0;
+}
+
+void srv_reasoning_default(const struct srv_config *cfg,
+                           struct janas_llm_chat_params *p)
+{
+    p->thinking = cfg->thinking;
+    if (cfg->reasoning_budget == 0)
+        p->thinking = 0;
+    else if (cfg->reasoning_budget > 0)
+        p->max_reasoning = cfg->reasoning_budget;
+}
+
+int srv_reasoning_budget(yyjson_val *root, struct janas_llm_chat_params *p)
+{
+    yyjson_val *b = yyjson_obj_get(root, "reasoning_budget_tokens");
+    if (!b)
+        b = yyjson_obj_get(root, "thinking_budget_tokens");
+    double x;
+    int got = srv_num(b, -1, 2147483647.0, &x);
+    if (got < 0 || (got && x != (int32_t)x))
+        return -1;
+    if (got && x == 0) {
+        p->thinking = 0;
+        p->max_reasoning = 0;
+    } else if (got)
+        p->max_reasoning = x < 0 ? 0 : (int32_t)x;
     return 0;
 }

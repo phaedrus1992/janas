@@ -389,7 +389,7 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
     /* each pass measured for the tuner: the configuration never changes
        the results */
     int cls = janas_tune_class(n), cand = janas_tuner_pick(&m->tuner, cls);
-    janas_m_apply_candidate(m, cand);
+    janas_m_apply_candidate(m, cand, n);
     /* measured without the time spent waiting for experts read from disk:
        it depends on the cache, not on the configuration */
     struct janas_expert_cache_stats c0, c1;
@@ -677,8 +677,8 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
     }
     if (janas_llm_mtp_forward(m, tokens, hidden, n, pos0, NULL, 0) != 0)
         return -1;
-    janas_m_apply_candidate(m,
-                            janas_tuner_best(&m->tuner, 0)); /* one-row head */
+    janas_m_apply_candidate(m, janas_tuner_best(&m->tuner, 0),
+                            1); /* one-row head */
     double td = now();
     size_t nbd = m->d_model / JANAS_QK;
     struct janas_matvec_task t = {.type = (int)m->output->type,
@@ -721,8 +721,8 @@ int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
     for (uint32_t j = 0; j < n; j++)
         if (tokens[j] < 0 || (uint32_t)tokens[j] >= m->n_vocab)
             return -1;
-    janas_m_apply_candidate(m,
-                            janas_tuner_best(&m->tuner, janas_tune_class(n)));
+    janas_m_apply_candidate(m, janas_tuner_best(&m->tuner, janas_tune_class(n)),
+                            n);
     uint32_t dm = m->d_model;
     size_t nbd = dm / JANAS_QK, nbc = 2 * dm / JANAS_QK;
     const struct layer *ly = &m->mtp_layer;

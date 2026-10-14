@@ -4,7 +4,10 @@
 // Weights in blocks of 32 with four- or five-bit values, KIND chosen when
 // the pipeline is made: 0 Q4_0 (q - 8), 1 IQ4_NL (a table of sixteen
 // levels), 2 Q4_1 and 3 Q5_1 (d q + m, Q5_1 with a fifth bit per weight in
-// qh). As the CPU computes them (nib_dot_ref and dm_dot_ref in quant.c):
+// qh), 4 MXFP4 (17 bytes a block: its E8M0 byte, the power of two
+// 2^(e - 128) for a scale, then the nibbles, through MXFP4's table of 0 to
+// 12 and their negatives). As the CPU computes them (nib_dot_ref,
+// janas_mxfp4_dot_ref and dm_dot_ref in quant.c):
 // each block's integer dot in one fma into the accumulator of its position
 // in the group of eight, the minimum of Q4_1/Q5_1 (m times the block's
 // activation sum) in accumulators of its own, the eight added at the end as
@@ -13,7 +16,10 @@
 // The activations come in the 32-block layout (20 uvec4 a Q8_K block: qs32
 // in 16, bsums32 in 2, d32 in 2), shared across the subgroup as in
 // q4k_matvec.comp. The low nibbles of a block's 16 bytes are weights 0-15,
-// the high ones 16-31.
+// the high ones 16-31. MXFP4's blocks start at any byte, so its words are
+// realigned by the byte, the others' by the half word. An E8M0 byte of 0 or
+// 1 is a subnormal scale, which a GPU may flush to zero where the CPU does
+// not: such blocks (weights under 2^-125) differ from the CPU's.
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
@@ -26,9 +32,10 @@ layout(constant_id = 1) const uint SG = 8;
 layout(constant_id = 2) const uint KIND = 0;
 const uint NX = (20u + SG - 1u) / SG;
 /* bytes of a block, and of a group of eight in words */
-const uint S = KIND == 3u ? 24u : KIND == 2u ? 20u : 18u;
+const uint S = KIND == 4u ? 17u : KIND == 3u ? 24u : KIND == 2u ? 20u : 18u;
 const uint GW = 2u * S;
-const bool DM = KIND >= 2u;
+const bool DM = KIND == 2u || KIND == 3u;
+const bool TAB = KIND == 1u || KIND == 4u; /* levels through a table */
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
@@ -38,6 +45,13 @@ layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
 
 const int IQ4[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                             1, 13, 25, 38, 53, 69, 89, 113);
+const int MX[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+/* an E8M0 byte as MXFP4's scale, 2^(e - 128) (quant.c janas_e8m0_half) */
+float e8m0_half(uint e)
+{
+    return uintBitsToFloat(e < 2u ? 0x00200000u << e : (e - 1u) << 23);
+}
 
 int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
 int dp4(uvec4 a, uvec4 b) { return dp(a.x, b.x) + dp(a.y, b.y) + dp(a.z, b.z) + dp(a.w, b.w); }
@@ -53,7 +67,7 @@ uint spread5(uint b)
    varying index is far slower on some GPUs (iq4xs_matvec.comp) */
 shared uint T[16];
 
-/* each byte of w through the IQ4_NL table */
+/* each byte of w through the table (IQ4_NL's or MXFP4's) */
 uint iq4(uint w)
 {
     return T[w & 15u] | (T[(w >> 8) & 15u] << 8) | (T[(w >> 16) & 15u] << 16) |
@@ -68,7 +82,8 @@ float hsum8(float a[8])
 void main()
 {
     if (gl_LocalInvocationID.x < 16u)
-        T[gl_LocalInvocationID.x] = uint(IQ4[gl_LocalInvocationID.x]) & 0xffu;
+        T[gl_LocalInvocationID.x] =
+            uint(KIND == 4u ? MX[gl_LocalInvocationID.x] : IQ4[gl_LocalInvocationID.x]) & 0xffu;
     barrier();
     U1 W = U1(p.w);
     U4 X = U4(p.x);
@@ -99,17 +114,22 @@ void main()
         for (uint k = 0; k < 8u; k++) {
             uint B = S * k; /* the block's first byte */
             uint hw = wg[B >> 2];
-            vec2 dm = unpackHalf2x16((B & 2u) != 0u ? (hw >> 16) | (wg[(B >> 2) + 1u] << 16) : hw);
-            d[k] = dm.x;
-            m[k] = dm.y;
-            uint qb = B + S - 16u, wi = qb >> 2;
+            if (KIND == 4u) {
+                d[k] = e8m0_half((hw >> (8u * (B & 3u))) & 0xffu);
+                m[k] = 0.0;
+            } else {
+                vec2 dm = unpackHalf2x16((B & 2u) != 0u ? (hw >> 16) | (wg[(B >> 2) + 1u] << 16) : hw);
+                d[k] = dm.x;
+                m[k] = dm.y;
+            }
+            uint qb = B + S - 16u, wi = qb >> 2, sh = 8u * (qb & 3u);
             uint q[4];
             for (uint i = 0; i < 4u; i++)
-                q[i] = (qb & 2u) != 0u ? (wg[wi + i] >> 16) | (wg[wi + i + 1u] << 16) : wg[wi + i];
+                q[i] = sh != 0u ? (wg[wi + i] >> sh) | (wg[wi + i + 1u] << (32u - sh)) : wg[wi + i];
             uint qh = KIND == 3u ? wg[(B + 4u) >> 2] : 0u;
             for (uint i = 0; i < 4u; i++) {
                 uint l = q[i] & 0x0f0f0f0fu, h = (q[i] >> 4) & 0x0f0f0f0fu;
-                if (KIND == 1u) {
+                if (TAB) {
                     l = iq4(l);
                     h = iq4(h);
                 } else if (KIND == 3u) {

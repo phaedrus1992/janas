@@ -68,6 +68,13 @@ int mp_fetch(const char *url, int keep_s, struct janas_buf *out, char *err,
     (void)url, (void)keep_s, (void)out, (void)err, (void)err_len;
     return -1;
 }
+int mp_fetch_ms(const char *url, int keep_s, int timeout_ms,
+                struct janas_buf *out, char *err, size_t err_len)
+{
+    (void)url, (void)keep_s, (void)timeout_ms, (void)out, (void)err,
+        (void)err_len;
+    return -1;
+}
 const char *mp_base(const char *env, const char *def)
 {
     (void)env;

@@ -52,7 +52,7 @@ Qwen3.5-0.8B does not take `--head 4`: with it, it answered "3" to "2+3". Gemma 
 | `--no-markdown` | print the model's marks instead of reading them |
 | `--no-gpu` | never give the GPU work, whatever the mode says |
 | `--mode auto\|eco\|max` | power mode: `eco` never uses the GPU for speed alone |
-| `--think on\|off` | reasoning before replying, for models that do it |
+| `--think on\|off\|N` | reasoning before replying, for models that do it; a number: on, at most N tokens of it, then a sentence that closes it and the answer |
 | `--stats` | a line of counters after every reply: speeds, time to the first token, threads, memory |
 | `--progress <s>` | a line on stderr every `s` seconds while a long prompt is read (tokens read, rate, time left as an estimate), and one after each reply; on a terminal the status line shows the same while it reads |
 
@@ -76,7 +76,7 @@ In the chat, a line starting with `/` is a command, and it turns grey-blue as so
 | `/context` | how full the context is, and with what: the last prompt by its parts (system message and tools, conversation, last message) |
 | `/reset` | a new conversation, and a clean window |
 | `/system [text\|off]` | show or change the system message |
-| `/temp <t>`, `/spec`, `/think` | sampling, drafts, reasoning |
+| `/temp <t>`, `/spec`, `/think` | sampling, drafts, reasoning (`/think 512`: on, at most 512 tokens of it) |
 | `/mode [auto\|eco\|max]` | power mode, and what the engine chose |
 | `/experts [n]` | experts per token: fewer is faster and a little less accurate; any number, `0` included, turns off the leaving out of light experts not in memory |
 | `/markdown [on\|off]` | read the model's marks, or print them |

@@ -1131,6 +1131,111 @@ static DOTN_TARGET float DOTN(q4_0_dot)(const struct janas_block_q4_0 *w,
     return r;
 }
 
+/* MXFP4: IQ4_NL's body with the block's E8M0 byte for its scale, 2^(e -
+   128) from e8m0_tab - janas_e8m0_half's bits, subnormal below e = 2 - and
+   the codes' levels for the table. */
+static inline DOTN_TARGET __attribute__((always_inline)) void
+DOTN(mx_dotn_body)(const struct janas_block_mxfp4 *w,
+                   const struct janas_block_q8k *x, size_t xs, size_t nb,
+                   float *out, const int nv)
+{
+    const __m256i ones = _mm256_set1_epi16(1),
+                  levels = _mm256_broadcastsi128_si256(
+                      _mm_loadu_si128((const __m128i *)janas_mxfp4_values));
+    __m256 acc[8];
+    _Pragma("GCC unroll 8") for (int v = 0; v < nv; v++) acc[v] =
+        _mm256_setzero_ps();
+    for (size_t b = 0; b < nb; b++) {
+        if (nv <= 2)
+            DOTN(prefetch_ahead)(w + 8 * b, 8 * sizeof(*w));
+        const struct janas_block_mxfp4 *wb = w + 8 * b;
+        __m256 dk = _mm256_setr_ps(e8m0_tab[wb[0].e], e8m0_tab[wb[1].e],
+                                   e8m0_tab[wb[2].e], e8m0_tab[wb[3].e],
+                                   e8m0_tab[wb[4].e], e8m0_tab[wb[5].e],
+                                   e8m0_tab[wb[6].e], e8m0_tab[wb[7].e]);
+        __m256i q[8], aq[8];
+        _Pragma("GCC unroll 8") for (int k = 0; k < 8; k++)
+        {
+            q[k] = DOTN(iq4_unpack32)(wb[k].qs, levels);
+            aq[k] = _mm256_abs_epi8(q[k]);
+        }
+        _Pragma("GCC unroll 8") for (int v = 0; v < nv; v++)
+        {
+            const struct janas_block_q8k *xb = x + (size_t)v * xs + b;
+            __m256i s[8];
+            _Pragma("GCC unroll 8") for (int k = 0; k < 8; k++)
+            {
+                __m256i a =
+                    _mm256_loadu_si256((const __m256i *)(xb->qs32 + 32 * k));
+                __m256i p =
+                    _mm256_maddubs_epi16(aq[k], _mm256_sign_epi8(a, q[k]));
+                s[k] = _mm256_madd_epi16(p, ones);
+            }
+            __m256i s01 = _mm256_hadd_epi32(s[0], s[1]);
+            __m256i s23 = _mm256_hadd_epi32(s[2], s[3]);
+            __m256i s45 = _mm256_hadd_epi32(s[4], s[5]);
+            __m256i s67 = _mm256_hadd_epi32(s[6], s[7]);
+            __m256i t0 = _mm256_hadd_epi32(s01, s23);
+            __m256i t1 = _mm256_hadd_epi32(s45, s67);
+            __m256i is8 =
+                _mm256_add_epi32(_mm256_permute2x128_si256(t0, t1, 0x20),
+                                 _mm256_permute2x128_si256(t0, t1, 0x31));
+            acc[v] =
+                _mm256_fmadd_ps(_mm256_mul_ps(dk, _mm256_loadu_ps(xb->d32)),
+                                _mm256_cvtepi32_ps(is8), acc[v]);
+        }
+    }
+    _Pragma("GCC unroll 8") for (int v = 0; v < nv; v++)
+    {
+        __m128 t = _mm_add_ps(_mm256_castps256_ps128(acc[v]),
+                              _mm256_extractf128_ps(acc[v], 1));
+        t = _mm_add_ps(t, _mm_movehl_ps(t, t));
+        t = _mm_add_ss(t, _mm_movehdup_ps(t));
+        out[v] = _mm_cvtss_f32(t);
+    }
+}
+
+static DOTN_TARGET void DOTN(mxfp4_dotn)(const struct janas_block_mxfp4 *w,
+                                         const struct janas_block_q8k *x,
+                                         size_t xs, int nv, size_t nb,
+                                         float *out)
+{
+    switch (nv) {
+    case 8:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 8);
+        break;
+    case 7:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 7);
+        break;
+    case 6:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 6);
+        break;
+    case 5:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 5);
+        break;
+    case 4:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 4);
+        break;
+    case 3:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 3);
+        break;
+    case 2:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 2);
+        break;
+    default:
+        DOTN(mx_dotn_body)(w, x, xs, nb, out, 1);
+    }
+}
+
+static DOTN_TARGET float DOTN(mxfp4_dot)(const struct janas_block_mxfp4 *w,
+                                         const struct janas_block_q8k *x,
+                                         size_t nb)
+{
+    float r;
+    DOTN(mx_dotn_body)(w, x, 0, nb, &r, 1);
+    return r;
+}
+
 /* The eight sums of eight int32 lanes each, lane k the sum of s[k]: the
    reduction tree of Q8_0. */
 static inline DOTN_TARGET __attribute__((always_inline)) __m256i
@@ -1576,6 +1681,7 @@ DOTN_ROWS(q6k, struct janas_block_q6k)
 DOTN_ROWS(q5k, struct janas_block_q5k)
 DOTN_ROWS(q8_0, struct janas_block_q8_0)
 DOTN_ROWS(iq4nl, struct janas_block_iq4nl)
+DOTN_ROWS(mxfp4, struct janas_block_mxfp4)
 DOTN_ROWS(iq4xs, struct janas_block_iq4xs)
 DOTN_ROWS(q4_0, struct janas_block_q4_0)
 DOTN_ROWS(q5_1, struct janas_block_q5_1)

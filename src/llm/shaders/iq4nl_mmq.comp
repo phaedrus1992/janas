@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 Maurizio Cammalleri */
 #version 450
-// The fast prompt for IQ4_NL: q80_mmq.comp's tiling and activations (blocks
-// of 32), a group's weights its 16 bytes of nibbles through the sixteen
-// signed levels of IQ4_NL (weights 0-15 the low nibbles, 16-31 the high),
-// its scale the block's d. A block is 18 bytes, so its words are read
-// realigned. NOT bit for bit with the CPU: rounded group by group.
+// The fast prompt for IQ4_NL (KIND 0) and MXFP4 (KIND 1): q80_mmq.comp's
+// tiling and activations (blocks of 32), a group's weights its 16 bytes of
+// nibbles through the sixteen signed levels of its table (weights 0-15 the
+// low nibbles, 16-31 the high), its scale the block's d (IQ4_NL) or the
+// power of two of its E8M0 byte (MXFP4, quant.c janas_e8m0_half). A block
+// is 18 bytes (IQ4_NL) or 17 (MXFP4), so its words are read realigned.
+// NOT bit for bit with the CPU: rounded group by group.
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_buffer_reference : require
@@ -14,6 +16,8 @@
 layout(local_size_x = 128) in;
 layout(constant_id = 0) const uint NV = 8; // unused: the table's constants
 layout(constant_id = 1) const uint SG = 8;
+layout(constant_id = 2) const uint KIND = 0;
+const uint S = KIND == 1u ? 17u : 18u; // bytes a block
 
 const uint BM = 64u, BN = 64u, BK = 32u, KS = 4u;
 const uint WM = 32u, WN = 32u, TM = 2u, TN = 2u, WARP = 32u;
@@ -25,7 +29,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
 
-// w: the first row (rows of nb * 8 blocks of 34 bytes); x: vector v, block
+// w: the first row (rows of nb * 8 blocks of S bytes); x: vector v, block
 // b at uvec4 (v * xs + b) * 20; y: row r of vector v at y[v * ys + r]
 layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
 
@@ -34,22 +38,34 @@ struct BCache { int qs[8]; float d; }; // a group: quants, its d32
 shared ACache sa[BM * KS];
 shared BCache sb[BN * KS];
 
-// word i of the 32-bit words from byte off of w, off even
-uint hword(U1 W, uint off, uint i)
+// word i of the 32-bit words from byte off of w
+uint bword(U1 W, uint off, uint i)
 {
-    uint a = (off >> 2) + i;
-    return (off & 2u) != 0u ? (W.v[a] >> 16) | (W.v[a + 1u] << 16) : W.v[a];
+    uint a = (off >> 2) + i, sh = 8u * (off & 3u);
+    return sh != 0u ? (W.v[a] >> sh) | (W.v[a + 1u] << (32u - sh)) : W.v[a];
 }
 
 const int IQ4[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                             1, 13, 25, 38, 53, 69, 89, 113);
+const int MX[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
 
-/* each byte of w (a nibble) through the IQ4_NL table */
+int lvl(uint i) { return KIND == 1u ? MX[i] : IQ4[i]; }
+
+/* each byte of w (a nibble) through the table */
 uint iq4(uint w)
 {
-    return (uint(IQ4[w & 15u]) & 0xffu) | ((uint(IQ4[(w >> 8) & 15u]) & 0xffu) << 8) |
-           ((uint(IQ4[(w >> 16) & 15u]) & 0xffu) << 16) |
-           ((uint(IQ4[(w >> 24) & 15u]) & 0xffu) << 24);
+    return (uint(lvl(w & 15u)) & 0xffu) | ((uint(lvl((w >> 8) & 15u)) & 0xffu) << 8) |
+           ((uint(lvl((w >> 16) & 15u)) & 0xffu) << 16) |
+           ((uint(lvl((w >> 24) & 15u)) & 0xffu) << 24);
+}
+
+/* the scale of the block at byte off */
+float scale(U1 W, uint off)
+{
+    uint w = bword(W, off, 0u);
+    return KIND == 1u ? uintBitsToFloat((w & 0xffu) < 2u ? 0x00200000u << (w & 0xffu)
+                                                          : ((w & 0xffu) - 1u) << 23)
+                      : unpackHalf2x16(w & 0xffffu).x;
 }
 
 void main()
@@ -72,14 +88,14 @@ void main()
             [[unroll]] for (uint l = 0; l < BM; l += 32u) {
                 uint r = min(r0 + rl + l, p.rows - 1u);
                 [[unroll]] for (uint k = 0; k < KS; k++) {
-                    uint off = (r * ngroups + g0 + k) * 18u;
+                    uint off = (r * ngroups + g0 + k) * S;
                     [[unroll]] for (uint t = 0; t < 2u; t++) {
-                        uint kw = 2u * iqs + t, q = hword(W1, off + 2u, kw & 3u);
+                        uint kw = 2u * iqs + t, q = bword(W1, off + S - 16u, kw & 3u);
                         sa[k * BM + rl + l].qs[kw] =
                             int(iq4(kw < 4u ? q & 0x0f0f0f0fu : (q >> 4) & 0x0f0f0f0fu));
                     }
                     if (iqs == 0u)
-                        sa[k * BM + rl + l].d = unpackHalf2x16(hword(W1, off, 0u) & 0xffffu).x;
+                        sa[k * BM + rl + l].d = scale(W1, off);
                 }
             }
         }

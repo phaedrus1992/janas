@@ -130,13 +130,17 @@ one 5476083302 11811160064 8" ;;
 # (checked here: the same with the defaults, AVX2 kernels forced, 4 CPUs,
 # no GPU, no drafts). What the engine would choose by the memory is fixed:
 # all six bits of the down matrix, all the experts, exact attention - or a
-# machine with less memory would compute other numbers, rightly.
+# machine with less memory would compute other numbers, rightly. And so is
+# the prompt: no MCP servers, no saved settings (see level()).
 FP_PROMPT="Write a short paragraph about the island of Sardinia, its history and its landscape."
+# medium's since 27 Sep 2026: its Q8_0 tensors take the activations with a
+# scale per 32 since then (13e2f198c270b826 before), checked again on 14 Oct
+# with the GPU, without it and with the AVX2 kernels forced
 fp_expected()
 {
     case "$1" in
     quick) echo "c08f0f936eeba5cb" ;;
-    medium) echo "13e2f198c270b826" ;;
+    medium) echo "e49b0016cedf6c50" ;;
     full) echo "4aae064b918a0e75" ;;
     gemma) echo "b2c01def5ff6bd5c" ;;
     esac
@@ -314,12 +318,20 @@ level()
     [ "$lv" = full ] && line="$line; with the MTP block \`$mtpn\`, made by hf2jns_mtp from the original checkpoint"
     grep -qF "$line" "$WORK/models" 2>/dev/null || echo "$line" >> "$WORK/models"
 
-    # the answers: the same text as on every other machine
+    # the answers: the same text as on every other machine. Asked without
+    # the MCP servers, whose catalog goes into the system message (from 1
+    # Oct 2026 Janas's services did, and no answer matched: issue #23), and
+    # in directories of their own: no settings saved by /save-config, no
+    # system message kept by an earlier chat, no tuning of the machine
     note "checking the answers (temperature 0)"
-    local text sum want
+    local text sum want x="$WORK/answer-home"
+    rm -rf "$x" && mkdir -p "$x/config" "$x/cache" "$x/data"
     text=$(printf '/experts 0\n%s\n' "$FP_PROMPT" |
-        "$BIN/janas-chat" "$jns" "${mtp[@]}" --bits 6 --attention exact \
-            --temp 0 --max 64 --system "" --no-preload --ctx 4096 2>>"$LOG")
+        XDG_CONFIG_HOME="$x/config" XDG_CACHE_HOME="$x/cache" \
+            XDG_DATA_HOME="$x/data" "$BIN/janas-chat" "$jns" "${mtp[@]}" \
+            --bits 6 --attention exact --temp 0 --max 64 --system "" \
+            --no-preload --ctx 4096 --no-mcp --no-tune 2>>"$LOG")
+    rm -rf "$x"
     sum=$(printf '%s\n' "$text" | sha256sum | cut -c1-16) # as printed
     want=$(fp_expected "$lv")
     if [ "${want#@}" != "$want" ]; then

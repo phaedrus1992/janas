@@ -15,13 +15,16 @@ Converting a GGUF into `.jns` does not retrain, re-quantize or prune anything. I
 - one slot per (layer, expert), so the experts a token needs can be read from disk without reading anything else;
 - the experts laid out by co-activation, so the reads fall near each other;
 - the model's metadata carried over byte for byte;
+- a resident tensor in MXFP4 (unsloth's Qwen3-Coder-Next files have their shared experts so) written as Q8_0, which holds each of its weights exactly: the same values in another encoding, at twice the bytes; routed experts in MXFP4 (the "MXFP4_MOE" files) stay as they are, the engine reads MXFP4;
 - optionally (`tools/jns_planes`) the experts' down matrix cut into three planes of two bits, which is a reordering of the same bits: with all three planes the weights are the ones the file came with, to the last bit.
+
+One thing changes when a model is opened, in memory and not in the file: an output head in BF16 or F16 (the "MXFP4_MOE" files keep theirs in BF16) is read as Q8_0, rewritten once as llama.cpp's quantization makes Q8_0: about half the bytes, and the head is read whole at every token. That is a re-quantization, and the model's description says so. Its cost, measured on noctrex's Qwen3.6-35B-A3B-MXFP4_MOE against llama.cpp on the same file, which keeps the head in BF16: 199 of 200 most likely tokens agree, mean logit difference 0.105, closer than a Q4_K_M file to its own llama.cpp, where nothing is re-quantized (196, 0.146).
 
 Anyone redistributing a converted file has to say this, because the licences that allow redistribution (Apache 2.0 among them) require that a modified work state that it was modified.
 
 ## Converting twice gives the same file
 
-`tools/gguf2jns` and `tools/jns_planes` are deterministic. The layout of the file follows from the sizes in the source, nothing is timed, drawn at random or read from the environment, and the weights are copied, never recomputed. The same GGUF, converted on another machine, gives the same bytes. The converter was a Python script until 25 September 2026; the C one that took its place writes the very same bytes, and the fingerprints below hold for both.
+`tools/gguf2jns` and `tools/jns_planes` are deterministic. The layout of the file follows from the sizes in the source, nothing is timed, drawn at random or read from the environment, and the weights are copied, never recomputed (an MXFP4 tensor's re-encoded as Q8_0, exactly). The same GGUF, converted on another machine, gives the same bytes. The converter was a Python script until 25 September 2026; the C one that took its place writes the very same bytes, and the fingerprints below hold for both.
 
 That is what this project publishes about its models: the recipe, and the fingerprint of what the recipe produces — not forty gigabytes. Convert your own copy, compare, and you know you are running the file the numbers in this repository were measured on.
 

@@ -36,7 +36,7 @@ static int failures;
 static double act(const struct janas_block_q8k *x, int b, int i, int t)
 {
     int b32 = t == JANAS_Q8_0 || t == JANAS_Q4_0 || t == JANAS_Q4_1 ||
-              t == JANAS_Q5_1 || t == JANAS_IQ4_NL;
+              t == JANAS_Q5_1 || t == JANAS_IQ4_NL || t == JANAS_MXFP4;
     return b32 ? (double)x[b].d32[i / 32] * x[b].qs32[i]
                : (double)x[b].d * x[b].qs[i];
 }
@@ -666,6 +666,92 @@ static void test_dot_iq4(void)
 /* Q4_0 and Q5_1: the reference against a float product over the
    dequantized weights (Q5_1's minimum times the activations' sums
    included), the kernels on 1-17 vectors equal to it to the bit. */
+/*
+ * MXFP4: the reference against a float product over the dequantized
+ * weights, the kernels (single, 1-17 vectors, rows) equal to it to the bit,
+ * the scale exactly 2^(e - 128) for every byte, and the same bits as its
+ * exact rewrite into Q8_0 (janas_mxfp4_to_q8_0, gguf2jns's for resident
+ * tensors), whose products take the activations the same way.
+ */
+static void test_dot_mxfp4(void)
+{
+    enum { NB = 8, N = NB * JANAS_QK, NV = 17 };
+    for (int e = 0; e < 256; e++)
+        CHECK(janas_e8m0_half((uint8_t)e) == ldexpf(1.0f, e - 128),
+              "e8m0 %d: %g", e, janas_e8m0_half((uint8_t)e));
+    struct janas_block_mxfp4 *w = malloc(NB * 8 * sizeof(*w));
+    struct janas_block_q8_0 *w8 = malloc(NB * 8 * sizeof(*w8));
+    struct janas_block_q8k *x = malloc(NV * NB * sizeof(*x));
+    float *xf = malloc(N * sizeof(float)), *wf = malloc(N * sizeof(float));
+    float rows[4];
+    for (int trial = 0; trial < 100; trial++) {
+        unsigned char *pw = (unsigned char *)w;
+        for (size_t i = 0; i < NB * 8 * sizeof(*w); i++)
+            pw[i] = (unsigned char)rnd();
+        /* the powers of two of real weights (2^-10 to 2^3), and in some
+           trials the subnormal and the largest ones as well */
+        for (int b = 0; b < NB * 8; b++)
+            w[b].e = (uint8_t)(118 + rnd() % 14);
+        if (trial % 4 == 3) {
+            w[0].e = 0;
+            w[1].e = 1;
+            w[2].e = 2;
+            w[3].e = 254;
+        }
+        for (int v = 0; v < NV; v++) {
+            for (int i = 0; i < N; i++)
+                xf[i] = rndf(-1.0f, 1.0f);
+            janas_q8k_quantize(xf, x + v * NB, N);
+        }
+        janas_mxfp4_dequantize(w, wf, N);
+        double expect = 0.0, mag = 0.0;
+        for (int b = 0; b < NB; b++)
+            for (int i = 0; i < JANAS_QK; i++) {
+                double p =
+                    (double)wf[b * JANAS_QK + i] * act(x, b, i, JANAS_MXFP4);
+                expect += p;
+                mag += fabs(p);
+            }
+        float ref = janas_mxfp4_dot_ref(w, x, NB);
+        if (trial % 4 != 3) /* 2^126 times the rest: no float to compare */
+            CHECK(fabs(ref - expect) <= 1e-5 * mag + 1e-6, "mxfp4 ref %g vs %g",
+                  ref, expect);
+        float fast = janas_dot(JANAS_MXFP4, w, x, NB);
+        CHECK(fast == ref || (isnan(fast) && isnan(ref)),
+              "mxfp4 fast %g vs ref %g", fast, ref);
+        for (int nv = 1; nv <= NV; nv++) {
+            float out[NV];
+            janas_dot_multi(JANAS_MXFP4, w, x, NB, (size_t)nv, NB, out, 1);
+            for (int v = 0; v < nv; v++) {
+                float r = janas_mxfp4_dot_ref(w, x + v * NB, NB);
+                CHECK(out[v] == r || (isnan(out[v]) && isnan(r)),
+                      "mxfp4 multi nv %d v %d: %g vs %g", nv, v, out[v], r);
+            }
+        }
+        /* four rows of two super-blocks each, the matrix read row by row */
+        janas_dot_rows(JANAS_MXFP4, w, 2 * 8 * sizeof(*w), x, 2, 4, rows);
+        for (int r = 0; r < 4; r++) {
+            float one = janas_mxfp4_dot_ref(w + 16 * r, x, 2);
+            CHECK(rows[r] == one || (isnan(rows[r]) && isnan(one)),
+                  "mxfp4 rows %d: %g vs %g", r, rows[r], one);
+        }
+        if (trial % 4 == 3)
+            continue;
+        /* the exact rewrite into Q8_0: the same products, bit for bit */
+        size_t tiny = 0;
+        CHECK(janas_mxfp4_to_q8_0((const uint8_t *)w, w8, NB * 8, &tiny) == 0 &&
+                  tiny == 0,
+              "mxfp4 to q8_0 (%zu tiny)", tiny);
+        float q8 = janas_dot(JANAS_Q8_0, w8, x, NB);
+        CHECK(q8 == fast, "mxfp4 %g vs its q8_0 rewrite %g", fast, q8);
+    }
+    free(w);
+    free(w8);
+    free(x);
+    free(xf);
+    free(wf);
+}
+
 static void test_dot_q4_0_q5_1(void)
 {
     enum { NB = 8, N = NB * JANAS_QK, NV = 17 };
@@ -764,9 +850,9 @@ static void test_dot_q4_0_q5_1(void)
 static void test_dequantize(void)
 {
     enum { NB = 8, N = NB * JANAS_QK };
-    static const int types[] = {JANAS_Q4_K, JANAS_Q5_K,   JANAS_Q6_K,
-                                JANAS_Q8_0, JANAS_IQ4_NL, JANAS_IQ4_XS,
-                                JANAS_Q4_0, JANAS_Q5_1,   JANAS_Q4_1};
+    static const int types[] = {
+        JANAS_Q4_K,   JANAS_Q5_K, JANAS_Q6_K, JANAS_Q8_0, JANAS_IQ4_NL,
+        JANAS_IQ4_XS, JANAS_Q4_0, JANAS_Q5_1, JANAS_Q4_1, JANAS_MXFP4};
     float *a = malloc(N * sizeof(float)), *b = malloc(N * sizeof(float));
     for (unsigned k = 0; k < sizeof(types) / sizeof(*types); k++) {
         int type = types[k];
@@ -805,6 +891,13 @@ static void test_dequantize(void)
             case JANAS_IQ4_XS: {
                 struct janas_block_iq4xs *q = (struct janas_block_iq4xs *)w + i;
                 q->d = janas_fp32_to_fp16(rndf(0.0001f, 0.01f));
+                break;
+            }
+            case JANAS_MXFP4: { /* eight blocks cover one super-block */
+                struct janas_block_mxfp4 *q =
+                    (struct janas_block_mxfp4 *)w + i * 8;
+                for (int j = 0; j < 8; j++)
+                    q[j].e = (uint8_t)(118 + rnd() % 14);
                 break;
             }
             case JANAS_Q4_0: {
@@ -854,6 +947,9 @@ static void test_dequantize(void)
             break;
         case JANAS_IQ4_XS:
             janas_iq4xs_dequantize((const void *)w, a, N);
+            break;
+        case JANAS_MXFP4:
+            janas_mxfp4_dequantize((const void *)w, a, N);
             break;
         case JANAS_Q4_0:
             janas_q4_0_dequantize((const void *)w, a, N);
@@ -1100,6 +1196,7 @@ int main(void)
     test_det();
     test_dot_q5k_q8_0();
     test_dot_iq4();
+    test_dot_mxfp4();
     test_dot_q4_0_q5_1();
     test_dot_q3k();
     test_dot_iq3s();

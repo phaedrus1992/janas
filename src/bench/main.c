@@ -448,8 +448,12 @@ int main(int argc, char **argv)
     if (cpu_rows && janas_llm_model_gpu_prompts(m))
         out("note:    in every row the GPU reads a prompt's blocks of %d "
             "tokens or more (the fast prompt); \"+ GPU\" also gives it a "
-            "part in the shorter passes\n",
-            JANAS_GPU_FAST_N);
+            "part in the shorter passes%s\n",
+            JANAS_GPU_FAST_N,
+            gpu && janas_gpu_min_n(gpu) > 1
+                ? ", from 2 tokens on: a reply's single tokens are the "
+                  "CPU's in every row"
+                : "");
     janas_llm_model_force(m, -1);
     char tune[512];
     int32_t tn;

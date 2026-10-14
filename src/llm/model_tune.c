@@ -116,8 +116,14 @@ void janas_m_init_tuner(struct janas_llm_model *m)
     janas_tuner_load(&m->tuner, m->tune_key);
 }
 
-/* Threads and GPU of a candidate, for the passes that follow. */
-void janas_m_apply_candidate(struct janas_llm_model *m, int cand)
+/* Threads and GPU of a candidate, for the passes that follow, of nv
+   vectors. The GPU is kept awake only where it takes such a pass: on an
+   integrated GPU a single token's products stay on the CPU
+   (janas_gpu_min_n 2) unless the whole token is asked of it
+   (JANAS_GPU_TOKEN=1), and keeping it awake there only took the power the
+   cores need - a Radeon 780M wrote at 10.5 tokens/s in janas-bench's
+   "+ GPU" rows against 17.3 on the CPU alone (issue #16). */
+void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv)
 {
     /* a borrowed pool belongs to the model that made it: a drafting model
        setting its own thread count would set the target's too */
@@ -125,7 +131,9 @@ void janas_m_apply_candidate(struct janas_llm_model *m, int cand)
         janas_pool_set_active(m->compute, m->tuner.cand[cand].threads);
     m->gpu_use = m->tuner.cand[cand].gpu;
     if (m->gpu) {
-        janas_gpu_keep_awake(m->gpu, m->gpu_use);
+        janas_gpu_keep_awake(m->gpu,
+                             m->gpu_use && (nv >= janas_gpu_min_n(m->gpu) ||
+                                            janas_m_gpu_token_asked()));
         janas_gpu_set_only_fast(m->gpu, !m->gpu_use);
     }
 }
