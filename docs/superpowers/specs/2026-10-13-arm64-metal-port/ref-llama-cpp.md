@@ -2,7 +2,8 @@
 
 Ref: `b11588` (`7f51953d7d2f`), from `ggml-org/llama.cpp`.
 Paths are relative to the repository root.
-Licence: MIT. Ported code must be declared in the upstream PR.
+Licence: MIT.
+Reference for understanding only: no code is taken from this project (upstream #20).
 
 Caution: this tree contains features that may not be in mainline (a Hadamard path, Q1_0 and Q2_0 types).
 Check a citation against current upstream before you quote it as mainline behavior.

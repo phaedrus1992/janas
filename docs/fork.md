@@ -7,7 +7,7 @@ The fork keeps all upstream features for x86-64 CPUs and Vulkan GPUs.
 It adds:
 
 - NEON CPU kernels for macOS on Apple Silicon and for Linux arm64 servers.
-- A Metal GPU backend for macOS, in pure C11, loaded at run time.
+- The Vulkan GPU backend on macOS through MoltenVK. Native Metal only if the vkcheck numbers cannot hold it.
 - macOS support for the I/O and memory paths, including models larger than memory.
 
 ## Status
@@ -15,8 +15,17 @@ It adds:
 E0, the fork workflow, is built: `clean` mirrors `upstream/main`, the daily
 sync merges upstream into `main` through a pull request, and a pre-push hook
 keeps fork tooling off `port/*` branches. The hook tests are in
-`.fork/tests/`; run both by hand. Each clone installs the hook once with
-`./.fork/install-hooks.sh`.
+`.fork/tests/`; run both by hand, or let `fork-tests.yml` run them in CI on
+every pull request that touches `.fork/` or the workflows. Each clone
+installs the hook once with `./.fork/install-hooks.sh`.
+
+The maintainer answered the upstream issue (#20) on 2026-10-13: original
+code only; Metal not yet — the Vulkan backend goes through MoltenVK first,
+gated by `tools/vkcheck.c`; arm64 CI agreed; no NEON bit-exact rule change.
+The vkcheck gate ran on the M1 Max on 2026-10-14: MoltenVK imports host
+memory in place, but the subgroup size is not selectable, so the engine
+would not take the GPU. Native Metal is the maintainer's call on those
+numbers. The full record is `vkcheck-m1-max.md`.
 
 No port code exists yet.
 Each epic gets its own design session before work starts.
@@ -47,7 +56,8 @@ The spec and its reference material are in [`docs/superpowers/specs/2026-10-13-a
 | [`ref-mlx.md`](superpowers/specs/2026-10-13-arm64-metal-port/ref-mlx.md) | MLX, and why it is reference only |
 | [`ref-mtplx.md`](superpowers/specs/2026-10-13-arm64-metal-port/ref-mtplx.md) | mtplx: drafts, Gated DeltaNet rollback, tuning |
 | [`ref-omlx.md`](superpowers/specs/2026-10-13-arm64-metal-port/ref-omlx.md) | omlx: prompt cache, expert offload, memory guard |
-| [`techniques.md`](superpowers/specs/2026-10-13-arm64-metal-port/techniques.md) | Each borrowed technique and the epic that uses it |
+| [`techniques.md`](superpowers/specs/2026-10-13-arm64-metal-port/techniques.md) | Each technique studied from a reference project and the epic that uses it. Understanding only |
+| [`vkcheck-m1-max.md`](superpowers/specs/2026-10-13-arm64-metal-port/vkcheck-m1-max.md) | The vkcheck gate run on the M1 Max: MoltenVK numbers and the verdict |
 
 ## Epics
 
@@ -58,8 +68,8 @@ Each epic is a milestone on this fork.
 | E0 | Fork workflow and upstream agreement |
 | E1 | Portability layer: builds and runs on macOS arm64 and Linux arm64 |
 | E2 | NEON CPU kernels |
-| E3 | Metal row-split matvec |
-| E4 | Metal whole token |
+| E3 | GPU on macOS through MoltenVK |
+| E4 | Whole token on the macOS GPU path |
 | E5 | macOS I/O and memory |
 | E6 | Draft and Gated DeltaNet speedups |
 | Future | Ideas outside the port |

@@ -24,7 +24,8 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    # GitHub moves the ubuntu-latest label to Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check the App secrets
         env:

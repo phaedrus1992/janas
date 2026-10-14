@@ -1,6 +1,9 @@
 # Techniques to borrow
 
-Each row is a technique from a reference project, with the epic that uses it.
+Each row is a technique studied from a reference project, with the epic that uses it.
+The maintainer requires original code (upstream #20): the rows are understanding only, and no code is taken.
+E3 is MoltenVK-first.
+The Metal rows in E3 apply only if the maintainer weighs native Metal in.
 Status values: `planned` (in an epic), `future` (in the `Future` milestone), `check` (verify against Janas before you use it).
 
 | Technique | Source | Epic | Status |
@@ -33,4 +36,4 @@ Status values: `planned` (in an epic), `future` (in the `Future` milestone), `ch
 | Absolute-path sysctl calls | omlx `omlx/utils/hardware.py:28-41` | E1 | planned |
 | Hash-chained prompt cache with an SSD tier | omlx `omlx/cache/paged_cache.py:84-125`, `omlx/cache/paged_ssd_cache.py` | Future | future |
 | SME kernels | llama.cpp `ggml/src/ggml-cpu/kleidiai/kleidiai.cpp` | Future | future |
-| Vulkan on MoltenVK | llama.cpp `ggml/src/ggml-vulkan/ggml-vulkan.cpp:4170-4174` | Future | future (blocked on host import) |
+| Vulkan on MoltenVK | llama.cpp `ggml/src/ggml-vulkan/ggml-vulkan.cpp:4170-4174` | E3 | planned (gated by `tools/vkcheck.c` on the M1 Max) |

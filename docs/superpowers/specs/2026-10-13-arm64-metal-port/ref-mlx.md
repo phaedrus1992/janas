@@ -5,7 +5,7 @@ Paths are relative to the repository root.
 Licence: MIT.
 
 Conclusion: MLX is reference material only.
-Janas gets a native Metal backend.
+No code is taken from this project (upstream #20).
 The reasons are in §7.
 
 ## 1. Quant formats

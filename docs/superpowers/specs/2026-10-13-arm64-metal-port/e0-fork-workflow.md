@@ -10,7 +10,8 @@ The implementation plan is a separate step, written later.
 Goal: the branch model in `design.md` §5 exists and works, and an upstream issue that the maintainer answers.
 
 Exit test: `clean`, `main`, the sync workflow and the guard work.
-The maintainer answers the three questions in `design.md` §5.
+The maintainer answered the three questions on 2026-10-13.
+The answer is in §6.
 
 ## 2. Decisions
 
@@ -186,6 +187,23 @@ Body:
 > 3. Bit-exactness on NEON: float reductions in a different vector width can land on different bits. The NEON epic starts with research on how the AVX2 path meets the bit-exact rule today, and whether NEON can meet it the same way. If it can't, I'll propose a rule change before any kernel work.
 >
 > I test on an M1 Max (macOS) and Docker arm64. I have no real x86-64 machine, so the "no x86-64 speed regression" check needs your Core Ultra machine. All commits carry DCO sign-off, and any code borrowed from elsewhere (llama.cpp, mlx, both MIT) is declared in the PRs.
+
+The maintainer answered on 2026-10-13 (`camauri`, upstream issue #20):
+
+> Thank you, phaedrus1992, for asking first, and for a plan this clear. Arm64 and Apple Silicon are welcome. The answers, and one condition that frames them:
+>
+> **Original code only.** Janas-LLM's arithmetic is its own: a reply's tokens come out identical to the bit on every path (AVX2, AVX-VNNI, the GPU), and every kernel follows the same order of operations to get there. Kernels from llama.cpp or mlx follow theirs, so they would have to be rewritten anyway: please write the NEON and GPU code for Janas from the start, with no code taken from other projects.
+>
+> 1. **Metal: not yet.** Before a second GPU backend, the one Janas has should be tried through MoltenVK: if it passes, the Vulkan shaders serve Apple Silicon as they are, and every shader keeps a single implementation. `tools/vkcheck.c`, in Release 2026-10-13 (4), tells: it builds alone (`cc -O2 -I/opt/homebrew/include tools/vkcheck.c -o vkcheck`), lists what the backend needs (Vulkan 1.3, buffer addresses, the integer dot product, the subgroup operations, host memory imported in place - Apple's pages are 16 KB, so the alignment it reports matters) and runs three tests: zero-copy, the dot product (exact, and a rough rate, to see whether it is emulated) and the float semantics (fma, `precise`, order) that keep the GPU's results the CPU's to the bit. Its output from your M1 Max would say what is missing; a native Metal backend would be weighed on those numbers, if MoltenVK cannot do it.
+> 2. **CI on macOS arm64 and Linux arm64: yes**, once the portability work lands.
+> 3. **Bit-exactness on NEON: no rule change should be needed.** Integer sums are exact, so `sdot` and `i8mm` give the integers AVX-VNNI gives; the float part (block scales, sums across blocks) has to follow the same operations in the same order as the scalar reference and the AVX2 path (`src/llm/quant_dotn.h` describes it). On NEON's 128-bit registers that means keeping the AVX2 code's 8-lane order, two registers for one. The GPU shaders meet the rule the same way.
+>
+> **How it would go.** Small pull requests, one change each, with the x86-64 paths untouched and the tests passing. I review and test each one here on x86-64 (the regression check you mention), and import it into the development branch as your commit, with your sign-off; it goes out in the next release, since the public history has one commit per release, and the pull request is closed with a note saying which. The order: the portability layer, the NEON kernels, the GPU through MoltenVK, then the expert streaming on macOS. Speed is measured against llama.cpp on the same Mac: that is the bar Janas holds itself to.
+>
+> Maurizio "camauri" Cammalleri
+
+Term 1 supersedes the draft's closing line about declaring borrowed code.
+No code is taken from any other project.
 
 ## 7. Testing
 
