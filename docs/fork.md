@@ -27,6 +27,9 @@ memory in place, but the subgroup size is not selectable, so the engine
 would not take the GPU. Native Metal is the maintainer's call on those
 numbers. The full record is `vkcheck-m1-max.md`.
 
+E1, the portability layer, is designed: [`e1-portability.md`](superpowers/specs/2026-10-13-arm64-metal-port/e1-portability.md) records what stops the build on macOS arm64 and cuts the work into six `port/*` branches (#420 to #426).
+The count is a measurement, not an estimate: 170 of the 409 files `build.sh` compiles fail on macOS arm64, and 143 of those fail from one line in `src/llm/json.h`.
+On Linux arm64 four files fail, and all four are the same defect — names a `#if defined(__x86_64__)` guard hides.
 No port code exists yet.
 Each epic gets its own design session before work starts.
 
