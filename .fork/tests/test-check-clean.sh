@@ -4,6 +4,16 @@
 # branch is built with git plumbing on top of clean, and the trap removes them.
 set -euo pipefail
 
+# A fixed identity and no signing: the fixtures must not need a key.
+export GIT_CONFIG_COUNT=3
+export GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=user.name GIT_CONFIG_VALUE_1=fixture
+export GIT_CONFIG_KEY_2=user.email GIT_CONFIG_VALUE_2=fixture@example.invalid
+# A hermetic fixture: the operator's git config must not leak in. A CI runner
+# has no identity, and git cannot auto-detect one there.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 root="$(git rev-parse --show-toplevel)"
 guard="$root/.fork/check-clean.sh"
 hook="$root/.fork/hooks/pre-push.sh"
