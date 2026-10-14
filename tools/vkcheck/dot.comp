@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// vkcheck's integer dot product test: per invocation, reps rounds of four
+// products of four signed bytes into four sums, the shared operand moved by
+// an addition each round; the CPU computes the same sums. Correctness, and
+// with many invocations a rough rate of the instruction Janas-LLM's
+// quantized products are made of (a driver that emulates it is slower by
+// several times).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U { uint v[]; };
+layout(push_constant) uniform P { uvec2 a, y; uint n, reps; } p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n)
+        return;
+    U A = U(p.a);
+    uint x = A.v[i], w0 = A.v[(i * 7u + 3u) % p.n];
+    uint w1 = w0 ^ 0x5A5A5A5Au, w2 = w0 + 0x01020304u, w3 = ~w0;
+    int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint r = 0u; r < p.reps; r++) {
+        a0 += dotPacked4x8EXT(int(x), int(w0));
+        a1 += dotPacked4x8EXT(int(x), int(w1));
+        a2 += dotPacked4x8EXT(int(x), int(w2));
+        a3 += dotPacked4x8EXT(int(x), int(w3));
+        x += 0x9E3779B9u;
+    }
+    U(p.y).v[i] = uint(a0 + a1 + a2 + a3);
+}

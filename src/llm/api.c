@@ -510,9 +510,14 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     uint64_t d0, d1;
     janas_llm_model_head_requant(llm->m, &d0, &d1);
     if (d0 && w >= 0 && (size_t)w < sizeof(bits))
+        w += snprintf(bits + w, sizeof(bits) - (size_t)w,
+                      ", output head at 4 bits (%.0f -> %.0f MB)", d0 / 1e6,
+                      d1 / 1e6);
+    int h16 = janas_llm_model_head16(llm->m, &d0, &d1);
+    if (h16 && w >= 0 && (size_t)w < sizeof(bits))
         snprintf(bits + w, sizeof(bits) - (size_t)w,
-                 ", output head at 4 bits (%.0f -> %.0f MB)", d0 / 1e6,
-                 d1 / 1e6);
+                 ", output head %s read as Q8_0 (%.0f -> %.0f MB)",
+                 h16 == 30 ? "BF16" : "F16", d0 / 1e6, d1 / 1e6);
     llm->cache_bytes = cache;
     llm->reserve_bytes = reserve;
     llm->kv_token = kv_token;

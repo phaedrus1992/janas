@@ -82,7 +82,12 @@ struct janas_llm_chat {
     int chan_label; /* Gemma: the channel's name ("thought\n") to skip */
     uint32_t reply_tokens;
     uint32_t answer_tokens; /* of them, outside the reasoning */
-    char pend[1024];        /* reply bytes not yet returned */
+    /* the closing of a reasoning cut at max_reasoning: already in the
+       session, taken one a call as if the model wrote them, so that each
+       piece of text comes out as reasoning or answer (close_reasoning) */
+    int32_t forced[80];
+    uint32_t n_forced, i_forced;
+    char pend[1024]; /* reply bytes not yet returned */
     size_t npend;
     /* where each turn starts in the sequence, so that sliding the context
        forgets whole exchanges, and how long the system message is */

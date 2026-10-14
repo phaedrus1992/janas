@@ -36,9 +36,11 @@ struct srv_config {
     size_t max_body;      /* bytes of a request body at most */
     int max_connections;
     int verbose;
-    int test;     /* serve the test chat page at /test */
-    int thinking; /* reasoning when a request does not say: 1, 0, or -1
-                     for the model's own default */
+    int test;             /* serve the test chat page at /test */
+    int thinking;         /* reasoning when a request does not say: 1, 0, or -1
+                             for the model's own default */
+    int reasoning_budget; /* the longest reasoning when a request does not
+                             say, in tokens: -1 no limit (default), 0 none */
     const char *embed_path; /* the embedding model, or NULL */
     const char *embed_id;   /* its name for clients */
     const char *store_dir;  /* where stored documents outlive the server;
@@ -67,6 +69,11 @@ struct srv_engine;
 
 /* JOB_COUNT: only how many tokens the messages are (j->prompt_tokens) */
 enum job_kind { JOB_CHAT, JOB_TEXT, JOB_COUNT, JOB_EMBED };
+
+/* The server's reasoning for a request that does not say (--think,
+   --reasoning-budget), into p. */
+void srv_reasoning_default(const struct srv_config *cfg,
+                           struct janas_llm_chat_params *p);
 
 /* A message of a chat request, with the tool calls of an assistant's. */
 struct srv_msg {

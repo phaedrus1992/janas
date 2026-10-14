@@ -299,6 +299,13 @@ struct janas_llm_chat_params {
        JANAS_LLM_FINISH_LENGTH there, like at max_reply, which counts the
        reasoning too and still applies. 0: no limit (default) */
     int32_t max_answer;
+    /* the longest reasoning, in tokens, for the models that reason: one
+       still reasoning there has it closed - the engine writes a sentence
+       ("I have thought enough; now I give the answer.") and the closing
+       mark as if the model had - and goes on with its answer, which
+       max_answer and max_reply still limit; the sentence is reasoning, a
+       dozen tokens past the limit. 0: no limit (default) */
+    int32_t max_reasoning;
 };
 
 JANAS_LLM_API void
@@ -668,6 +675,10 @@ struct janas_llm_chat_stats {
        the estimate follows that cost as it grows with the position rather
        than the latest speed, which would promise too little */
     double input_eta_seconds;
+    /* of output_tokens, those of the reasoning; and 1 when max_reasoning
+       closed it rather than the model */
+    uint32_t reasoning_tokens;
+    int32_t reasoning_cut;
 };
 
 /* janas_llm_chat_stats.stage */

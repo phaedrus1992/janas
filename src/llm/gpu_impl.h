@@ -16,7 +16,9 @@
 /* The push constants a shader may take: every Vulkan device gives 128. */
 #define JANAS_G_PUSH_BYTES 128
 /* the kinds of product shader (gpu.c's prod_index) */
-#define N_PROD 12
+#define N_PROD 13
+/* the kinds of b32_matvec.comp (gpu.c's b32_kind) */
+#define N_B32 5
 
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
@@ -145,26 +147,31 @@ struct janas_gpu {
     VkPhysicalDevice pd;
     VkDevice dev;
     VkQueue queue;
-    VkShaderModule sm, sm6, sm6p, sm5, sm80, sm32[4], smx4, sm3, smi3, sma;
+    VkShaderModule sm, sm6, sm6p, sm5, sm80, sm32[N_B32], smx4, sm3, smi3, sma,
+        sma32;
     VkPipelineLayout pl;
     VkPipeline pipe, pipe6, pipe6p, pipe5, pipe80, pipea; /* Q4_K, Q6_K,
                                                              Q6_K_P, Q5_K,
                                                              Q8_0, experts'
                                                              activation */
-    /* blocks of 32: Q4_0, IQ4_NL, Q4_1, Q5_1 (b32_matvec's KIND) */
-    VkPipeline pipe32[4];
+    /* the experts' activation in blocks of 32 (expert_act.comp's KIND 1),
+       for a down matrix in blocks of 32 (MXFP4) */
+    VkPipeline pipea32;
+    /* blocks of 32: Q4_0, IQ4_NL, Q4_1, Q5_1, MXFP4 (b32_matvec's KIND) */
+    VkPipeline pipe32[N_B32];
     VkPipeline pipex4, pipe3, pipei3; /* IQ4_XS, Q3_K, IQ3_S */
     /* Q4_K on many vectors in tiles (q4k_mm.comp), MM_ROWS x MM_VECS */
     VkShaderModule sm_mm, sm_mm6, sm_mm6s, sm_mm80, sm_mm5, sm_mm3, sm_mmx4,
-        sm_mmi3, sm_mmn4,
-        sm_dm[2]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL */
+        sm_mmi3, sm_mmn4, sm_mmmx,
+        sm_dm[2]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL, mmmx MXFP4 */
     VkPipeline pipe_mm, pipe_mm6, pipe_mm6s, pipe_mm80, pipe_mm5, pipe_mm3,
-        pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_dm[2];
+        pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_mmmx, pipe_dm[2];
     int only_fast; /* janas_gpu_set_only_fast */
     uint32_t nvg;  /* vectors a product's workgroup takes (NV_PER_GROUP) */
-    /* a mixture's experts in one dispatch (experts_id): Q4_K, Q6_K_P */
-    VkShaderModule sm_id4, sm_id6, sm_id6s;
-    VkPipeline pipe_id4, pipe_id6, pipe_id6s;
+    /* a mixture's experts in one dispatch (experts_id): Q4_K, Q6_K_P,
+       Q6_K, MXFP4 */
+    VkShaderModule sm_id4, sm_id6, sm_id6s, sm_idmx;
+    VkPipeline pipe_id4, pipe_id6, pipe_id6s, pipe_idmx;
     struct stage ts; /* their table, 3 uvec4 an expert */
     /* the product shaders made for a single vector (prod_index) */
     VkShaderModule pm1[N_PROD];

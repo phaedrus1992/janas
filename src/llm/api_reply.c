@@ -4,6 +4,7 @@
  * api_reply.c - the public API: the reply, piece by piece, and its counters
  * (see include/janas/llm.h).
  */
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
@@ -251,12 +252,57 @@ static void take(janas_llm_chat *c, int32_t t)
         janas_api_record(c, t, JANAS_LLM_PART_CALL, tmp, n);
         return;
     }
+    if (c->in_think)
+        c->stats.reasoning_tokens++; /* what max_reasoning counts */
     janas_api_record(
         c, t, c->in_think ? JANAS_LLM_PART_REASONING : JANAS_LLM_PART_ANSWER,
         tmp, n);
     if (!c->in_think)
         janas_api_rtext_add(c, tmp, n); /* the answer, for memo_store */
     give(c, tmp, n);
+}
+
+/*
+ * The reasoning at max_reasoning tokens, closed for the model: a sentence of
+ * ours, the format's closing mark (</think>, Gemma's <channel|>) and, after
+ * </think>, the blank line the model itself writes there; the answer follows
+ * (the drafts beyond are dropped). The sentence is what makes a small model
+ * answer: cut at 32 tokens with janas-chat's system message, Qwen3.5-0.8B and
+ * 2B given the mark alone went on reasoning in their answer and mostly looped
+ * to the end of the reply (20 of 36 replies ended by the model, the three
+ * models with Qwen3-4B), given the sentence first answered (35 of 36, the
+ * replies a third as long: 96 tokens on average against 265); Qwen3-4B answered
+ * either way (13 Oct 2026). The sentence is reasoning, shown as such and
+ * counted: the reasoning ends that many tokens past the ceiling. Without a
+ * ceiling a model whose reasoning never closes - issue #21's, its arithmetic
+ * broken - writes on to the end of the context, a chat's max_tokens counting
+ * the answer alone.
+ */
+static void close_reasoning(janas_llm_chat *c)
+{
+    const janas_llm *llm = c->llm;
+    if (llm->think_close < 0)
+        return; /* no mark: the context ends the reply */
+    static const char say[] =
+        "\n\nI have thought enough; now I give the answer.\n";
+    int32_t ids[80];
+    long n = janas_tokenizer_encode(llm->tok, say, sizeof(say) - 1, 0, ids, 64);
+    if (n < 0 || n > 64)
+        n = 0;
+    ids[n++] = llm->think_close;
+    if (llm->format != FORMAT_GEMMA) {
+        long m = janas_tokenizer_encode(llm->tok, "\n\n", 2, 0, ids + n, 8);
+        if (m > 0 && m <= 8)
+            n += m;
+    }
+    if (janas_llm_session_append(c->s, ids, (uint32_t)n) != 0)
+        return; /* no room for it: the context ends the reply */
+    c->stats.reasoning_cut = 1;
+    /* taken one a call (janas_llm_chat_next): the reasoning's last piece
+       is returned as reasoning before the answer begins */
+    memcpy(c->forced, ids, (size_t)n * sizeof(*ids));
+    c->n_forced = (uint32_t)n;
+    c->i_forced = 0;
 }
 
 int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
@@ -297,6 +343,9 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
              c->answer_tokens >= (uint32_t)c->p.max_answer)) {
             c->ended = 1;
             c->stats.finish = JANAS_LLM_FINISH_LENGTH;
+        } else if (c->i_forced < c->n_forced) {
+            t = c->forced[c->i_forced++]; /* in the session already */
+            got = 1;
         } else {
             r = janas_llm_session_next(c->s, &t);
             got = r == 0;
@@ -319,6 +368,10 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
         } else if (got) {
             c->reply_tokens++;
             take(c, t);
+            if (c->in_think && c->p.max_reasoning > 0 &&
+                c->stats.reasoning_tokens >= (uint32_t)c->p.max_reasoning &&
+                c->i_forced >= c->n_forced)
+                close_reasoning(c);
         }
         janas_api_update_stats(c);
         if (r != 0) {

@@ -3,7 +3,7 @@
 /*
  * gpu_check.c - products split between the GPU and the CPU must equal the
  * CPU's bit for bit: random Q4_K, Q5_K, Q6_K, Q6_K_P (bit planes, at its
- * three levels), Q8_0 and the blocks of 32 (Q4_0, IQ4_NL, Q4_1, Q5_1)
+ * three levels), Q8_0 and the blocks of 32 (Q4_0, IQ4_NL, Q4_1, Q5_1, MXFP4)
  * matrices in shared memory, and the GPU's aligned copy of Q6_K (on the GPU
  * alone, against the CPU's Q6_K), several shapes, vector
  * counts and strides. Skips (exit 0) when no GPU is usable.
@@ -115,10 +115,12 @@ int main(void)
     for (size_t b = 0; b < w8bytes / 34; b++)
         w8b[b].d = janas_fp32_to_fp16(0.0001f + (rnd() % 1000) * 1e-6f);
     /* blocks of 32 with four or five bits: Q4_0 and IQ4_NL (18 bytes: d,
-       16 of nibbles), Q4_1 (20: d, m, ...), Q5_1 (24: d, m, qh, ...);
-       random bytes with d (and m) set to small scales */
-    static const int t32[4] = {JANAS_Q4_0, JANAS_IQ4_NL, JANAS_Q4_1,
-                               JANAS_Q5_1};
+       16 of nibbles), Q4_1 (20: d, m, ...), Q5_1 (24: d, m, qh, ...), MXFP4
+       (17: the E8M0 byte, 16 of nibbles); random bytes with d (and m) set
+       to small scales, MXFP4's byte to powers of two from 2^-10 to 2^-3 (a
+       subnormal one, under 2^-125, a GPU may flush) */
+    static const int t32[5] = {JANAS_Q4_0, JANAS_IQ4_NL, JANAS_Q4_1, JANAS_Q5_1,
+                               JANAS_MXFP4};
     /* Q3_K (d at byte 108) and IQ3_S (d at 0): 110-byte blocks */
     uint8_t *w3[2];
     size_t w3bytes = (size_t)MAXR * (MAXC / JANAS_QK) * 110 + 4096;
@@ -142,16 +144,20 @@ int main(void)
         uint16_t d = janas_fp32_to_fp16(0.00005f + (rnd() % 1000) * 1e-7f);
         memcpy(wx + b, &d, 2);
     }
-    static const size_t s32[4] = {18, 18, 20, 24};
-    uint8_t *w32[4];
-    size_t w32bytes[4];
-    for (int k = 0; k < 4; k++) {
+    static const size_t s32[5] = {18, 18, 20, 24, 17};
+    uint8_t *w32[5];
+    size_t w32bytes[5];
+    for (int k = 0; k < 5; k++) {
         w32bytes[k] = (size_t)MAXR * (MAXC / JANAS_QK) * 8 * s32[k];
         w32bytes[k] = (w32bytes[k] + 4095) / 4096 * 4096;
         w32[k] = aligned_alloc(4096, w32bytes[k]);
         for (size_t i = 0; i < w32bytes[k]; i++)
             w32[k][i] = (uint8_t)rnd();
         for (size_t b = 0; b + s32[k] <= w32bytes[k]; b += s32[k]) {
+            if (t32[k] == JANAS_MXFP4) {
+                w32[k][b] = (uint8_t)(118 + rnd() % 8);
+                continue;
+            }
             uint16_t d = janas_fp32_to_fp16(0.0005f + (rnd() % 1000) * 1e-6f);
             memcpy(w32[k] + b, &d, 2);
             if (s32[k] > 18) {
@@ -171,6 +177,7 @@ int main(void)
         janas_gpu_import(g, w32[1], w32bytes[1]) != 0 ||
         janas_gpu_import(g, w32[2], w32bytes[2]) != 0 ||
         janas_gpu_import(g, w32[3], w32bytes[3]) != 0 ||
+        janas_gpu_import(g, w32[4], w32bytes[4]) != 0 ||
         janas_gpu_import(g, wx, wxbytes) != 0 ||
         janas_gpu_import(g, w3[0], w3bytes) != 0 ||
         janas_gpu_import(g, w3[1], w3bytes) != 0) {
@@ -202,12 +209,12 @@ int main(void)
     int bad = 0, runs = 0;
     /* 0 Q4_K, 1 Q6_K, 2-4 Q6_K_P with three, two and one planes, 5 Q5_K,
        6 Q8_0, 7-10 Q4_0, IQ4_NL, Q4_1, Q5_1, 11 IQ4_XS,
-       12 Q3_K, 13 IQ3_S, 14 the aligned Q6_K */
+       12 Q3_K, 13 IQ3_S, 14 the aligned Q6_K, 15 MXFP4 */
     static const char *names[] = {"Q4_K",     "Q6_K",  "Q6_K_P/3", "Q6_K_P/2",
                                   "Q6_K_P/1", "Q5_K",  "Q8_0",     "Q4_0",
                                   "IQ4_NL",   "Q4_1",  "Q5_1",     "IQ4_XS",
-                                  "Q3_K",     "IQ3_S", "Q6_K_A"};
-    for (int q6 = 0; q6 < 15; q6++)
+                                  "Q3_K",     "IQ3_S", "Q6_K_A",   "MXFP4"};
+    for (int q6 = 0; q6 < 16; q6++)
         for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++)
             for (size_t k = 0; k < sizeof(nvs) / sizeof(nvs[0]); k++)
                 for (int strided = 0; strided < 2; strided++) {
@@ -216,7 +223,8 @@ int main(void)
                     size_t skip = s % 2; /* a row further in, every other
                                             shape */
                     struct janas_matvec_task t = {
-                        .type = q6 == 14   ? JANAS_Q6_K
+                        .type = q6 == 15   ? JANAS_MXFP4
+                                : q6 == 14 ? JANAS_Q6_K
                                 : q6 == 13 ? JANAS_IQ3_S
                                 : q6 == 12 ? JANAS_Q3_K
                                 : q6 == 11 ? JANAS_IQ4_XS
@@ -226,7 +234,8 @@ int main(void)
                                 : q6 >= 2  ? JANAS_Q6_K_P
                                 : q6 == 1  ? JANAS_Q6_K
                                            : JANAS_Q4_K,
-                        .w = q6 == 14   ? w6 + skip * 210 * nb
+                        .w = q6 == 15   ? w32[4] + skip * 8 * s32[4] * nb
+                             : q6 == 14 ? w6 + skip * 210 * nb
                              : q6 >= 12 ? w3[q6 - 12] + skip * 110 * nb
                              : q6 == 11 ? wx + skip * 136 * nb
                              : q6 >= 7
@@ -321,7 +330,7 @@ int main(void)
     free(wp);
     free(w5);
     free(w8);
-    for (int k = 0; k < 4; k++)
+    for (int k = 0; k < 5; k++)
         free(w32[k]);
     free(wx);
     free(w3[0]);

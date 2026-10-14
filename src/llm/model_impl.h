@@ -279,6 +279,10 @@ struct janas_llm_model {
     int warm_use;        /* preload the most used experts, and count them */
     uint32_t *use_count; /* experts used this session, n_layer * n_expert */
     uint64_t head_before, head_after; /* output head requantized (head_bits) */
+    /* the head's type in the file (BF16 30, F16 1) when rewritten as Q8_0 at
+       load (head16_to_q8_0), else 0; and the bytes before and after */
+    int head16;
+    uint64_t head16_before, head16_after;
     /* the caller's CPUs before the load pinned it (a cpu_set_t), given
        back when the model is freed */
     unsigned char caller_cpus[128];
@@ -385,6 +389,15 @@ void janas_m_init_tuner(struct janas_llm_model *m);
 /* Memory the GPU will import collapsed into 2 MB pages (Linux; see
    model_load.c), before the import pins it. */
 void janas_m_huge_pages(void *p, uint64_t bytes);
+/* The longest region of memory the GPU imports (gpu.c janas_gpu_import). */
+#define JANAS_M_REGION_MAX ((uint64_t)4 << 30)
+/* The next region the GPU imports of bytes, from at: its first byte into
+   *from (at, or the 2 MB boundary before it where huge: memory allocated on
+   one), and its end, returned: bytes, or past at a multiple of unit (unit
+   0: the farthest it may reach, for the caller to cut), never more than
+   JANAS_M_REGION_MAX from *from. */
+uint64_t janas_m_import_next(uint64_t at, uint64_t bytes, uint64_t unit,
+                             int huge, uint64_t *from);
 int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
                        uint64_t bytes, uint64_t unit);
 void janas_m_arena_to_gpu(struct janas_llm_model *m);
@@ -392,7 +405,9 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m);
    the GPU failed after replaying on the base in place, the state lost. */
 int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits);
-void janas_m_apply_candidate(struct janas_llm_model *m, int cand);
+void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv);
+/* Whether the whole token is asked of the GPU (JANAS_GPU_TOKEN=1). */
+int janas_m_gpu_token_asked(void);
 uint32_t *janas_m_profile_read(const struct janas_llm_model *m, size_t *used);
 void janas_m_profile_write(const struct janas_llm_model *m);
 void janas_m_norm_quant(struct janas_llm_model *m, const float *w,

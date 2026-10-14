@@ -87,6 +87,10 @@ int janas_llm_model_expert_bits_auto(const struct janas_llm_model *m);
    and after; 0 and 0 if it was not. */
 void janas_llm_model_head_requant(const struct janas_llm_model *m,
                                   uint64_t *before, uint64_t *after);
+/* The output head's type in the file (BF16 30, F16 1) when it was rewritten
+   as Q8_0 at load, else 0; and its bytes before and after. */
+int janas_llm_model_head16(const struct janas_llm_model *m, uint64_t *before,
+                           uint64_t *after);
 /* How the attention scores are computed (janas_attn_scores), and whether the
    engine chose it. */
 int janas_llm_model_attn_scores(const struct janas_llm_model *m);

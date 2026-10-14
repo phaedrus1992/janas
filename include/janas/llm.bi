@@ -85,6 +85,9 @@ type janas_llm_chat_params
                              '' JANAS_LLM_ELIMIT, never a cut (0: none)
     max_answer   as long     '' the longest answer, reasoning not counted
                              '' (0: none); max_reply counts it too
+    max_reasoning as long    '' the longest reasoning, closed for the model
+                             '' there with a sentence and the mark, the
+                             '' answer following (0: none)
 end type
 
 type janas_llm_chat_stats
@@ -129,6 +132,9 @@ type janas_llm_chat_stats
     '' seconds left to read the prompt (stage INPUT), an estimate; -1:
     '' not yet known
     input_eta_seconds as double
+    '' of output_tokens, the reasoning's; 1 when max_reasoning closed it
+    reasoning_tokens as ulong
+    reasoning_cut    as long
 end type
 
 const JANAS_LLM_STAGE_IDLE = 0
