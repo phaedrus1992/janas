@@ -39,15 +39,33 @@ jobs:
           fi
           git branch --no-track clean origin/clean
       - name: Run the fixtures from main
-        # Every fixture that main carries runs. A pull request that adds a
-        # fixture cannot run it here until the fixture is on main.
+        # Every .fork/tests/test-*.sh on main runs. A pull request that adds a
+        # fixture cannot run it here until the fixture is on main. All of
+        # them are read from one main commit before any runs, because a
+        # fixture runs pull request code that could move origin/main.
         run: |
+          main="$(git rev-parse --verify 'origin/main^{commit}')"
+          mkdir "$RUNNER_TEMP/fixtures"
+          names=()
+          while IFS= read -r -d '' entry; do
+            path="${entry#*$'\t'}"
+            name="${path##*/}"
+            [[ "${entry%% *}" == 100644 || "${entry%% *}" == 100755 ]] || continue
+            [[ "$name" == test-*.sh ]] || continue
+            git show "$main:$path" > "$RUNNER_TEMP/fixtures/$name"
+            names+=("$name")
+          done < <(git ls-tree -z "$main" -- .fork/tests/)
+          if ((${#names[@]} == 0)); then
+            echo "::error::origin/main ($main) has no .fork/tests/test-*.sh"
+            exit 1
+          fi
           status=0
-          for path in $(git ls-tree --name-only origin/main .fork/tests/); do
-            name="$(basename "$path")"
-            git show "origin/main:$path" > "$RUNNER_TEMP/$name"
+          for name in "${names[@]}"; do
             echo "::group::$name"
-            bash "$RUNNER_TEMP/$name" || status=1
+            if ! bash "$RUNNER_TEMP/fixtures/$name"; then
+              echo "::error::$name failed"
+              status=1
+            fi
             echo "::endgroup::"
           done
           exit "$status"
