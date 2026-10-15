@@ -193,7 +193,7 @@ if git --git-dir="$origin" rev-parse --verify --quiet "refs/heads/$sync_branch" 
 else
   bad "the fresh branch must be on origin"
 fi
-engine="$(git -C "$fork" show "origin/$sync_branch:src/engine.c")"
+engine="$(git -C "$fork" show "origin/$sync_branch:src/engine.c")" || engine=""
 if [[ "$engine" == *two* ]]; then
   ok "upstream's engine change arrived"
 else
