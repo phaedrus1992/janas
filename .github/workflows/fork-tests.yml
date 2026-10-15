@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # The fixture tests for the fork tooling. A pull request that touches .fork/
-# or the workflows runs both fixtures, and the merge push re-runs them as a
+# or the workflows runs every fixture, and the merge push re-runs them as a
 # smoke test. The fixtures come from main, never from the pull request tree,
 # so a changed pull request cannot fake the verdict. test-check-clean.sh
 # needs the clean branch as a local branch; the first step materializes it
@@ -39,8 +39,15 @@ jobs:
           fi
           git branch --no-track clean origin/clean
       - name: Run the fixtures from main
+        # Every fixture that main carries runs. A pull request that adds a
+        # fixture cannot run it here until the fixture is on main.
         run: |
-          git show origin/main:.fork/tests/test-check-clean.sh > "$RUNNER_TEMP/test-check-clean.sh"
-          git show origin/main:.fork/tests/test-sync-upstream.sh > "$RUNNER_TEMP/test-sync-upstream.sh"
-          bash "$RUNNER_TEMP/test-check-clean.sh"
-          bash "$RUNNER_TEMP/test-sync-upstream.sh"
+          status=0
+          for path in $(git ls-tree --name-only origin/main .fork/tests/); do
+            name="$(basename "$path")"
+            git show "origin/main:$path" > "$RUNNER_TEMP/$name"
+            echo "::group::$name"
+            bash "$RUNNER_TEMP/$name" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
