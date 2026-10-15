@@ -237,7 +237,7 @@ if [ "$OS" = windows ] && [ -d /usr/include/vulkan ] &&
         [ -d "/usr/include/$d" ] && ln -sfn "/usr/include/$d" "$OBJ/vkinc/$d"
     done
     VK_INC=(-I"$OBJ/vkinc")
-    CFLAGS+=("${VK_INC[@]}")
+    CFLAGS+=(${VK_INC[@]+"${VK_INC[@]}"})
 fi
 GLSLANG=""
 if command -v glslangValidator >/dev/null 2>&1; then
@@ -255,7 +255,7 @@ if command -v glslangValidator >/dev/null 2>&1; then
 else
     GPU_MISSING="glslangValidator (glslang-tools, glslang), 15.2 or later"
 fi
-echo '#include <vulkan/vulkan.h>' | "$CC" "${VK_INC[@]}" -E -x c - >/dev/null 2>&1 ||
+echo '#include <vulkan/vulkan.h>' | "$CC" ${VK_INC[@]+"${VK_INC[@]}"} -E -x c - >/dev/null 2>&1 ||
     GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }the Vulkan headers (libvulkan-dev, vulkan-headers)"
 if [ -n "$GLSLANG" ]; then
     for comp in src/*/shaders/*.comp; do
@@ -378,18 +378,22 @@ for d in src/third_party/*/; do
     lib=$(basename "$d")
     # shellcheck disable=SC2207
     extra=($(tp_flags "$lib"))
+    # a process substitution would drop a failed listing, and the library
+    # would link short: read the list first, and stop when it fails or is empty
+    srcs=$(tp_sources "$lib") && [ -n "$srcs" ] ||
+        { echo "build.sh: cannot list the sources of $lib: fix tp_sources" >&2; exit 1; }
     while IFS= read -r src; do
         obj=$(objname "$src")
         tp_objs+=("$obj")
-        compile "$src" "$obj" "${TP_CFLAGS[@]}" "${extra[@]}"
-    done < <(tp_sources "$lib")
+        compile "$src" "$obj" ${TP_CFLAGS[@]+"${TP_CFLAGS[@]}"} ${extra[@]+"${extra[@]}"}
+    done <<<"$srcs"
 done
 rm -f "$OBJ/libjanas_third.a"
 # archives made anew: ar only adds and replaces, so the objects of a source
 # since removed or renamed would stay in them and be linked twice
 if [ ${#tp_objs[@]} -gt 0 ]; then
     rm -f "$OBJ/libjanas_third.a"
-    "$AR" rcs "$OBJ/libjanas_third.a" "${tp_objs[@]}"
+    "$AR" rcs "$OBJ/libjanas_third.a" ${tp_objs[@]+"${tp_objs[@]}"}
 fi
 # their public headers, for the programs that use them
 TP_INC=(-Isrc/third_party/libmicrohttpd/src/include -Isrc/third_party/yyjson)
@@ -408,19 +412,19 @@ while IFS= read -r src; do
     extra=()
     # the TLS layer reads Mbed TLS's headers, as the system's: their
     # warnings are not Janas's to fix
-    [ "$src" = src/common/mcp_tls.c ] && extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
-    compile "$src" "$obj" "${CFLAGS[@]}" "${extra[@]}"
+    [ "$src" = src/common/mcp_tls.c ] && extra=(${MBEDTLS_INC[@]+"${MBEDTLS_INC[@]/#-I/-isystem}"})
+    compile "$src" "$obj" "${CFLAGS[@]}" ${extra[@]+"${extra[@]}"}
 done < <(find src -name '*.c' ! -name main.c ! -name win_start.c \
     ! -path 'src/third_party/*' | sort)
 rm -f "$OBJ/libjanas.a"
-"$AR" rcs "$OBJ/libjanas.a" "${objs[@]}"
+"$AR" rcs "$OBJ/libjanas.a" ${objs[@]+"${objs[@]}"}
 if [ "$VARIANT" = release ]; then
     # two shared libraries, each with its own public API: libjanas_mcp is
     # the MCP client (src/common/mcp_*, with the JSON reader it uses),
     # libjanas_llm all the rest; a program may use either without the other
     llm_objs=()
     mcp_objs=()
-    for o in "${objs[@]}"; do
+    for o in ${objs[@]+"${objs[@]}"}; do
         case "$o" in
         */common_mcp_*.o) mcp_objs+=("$o") ;;
         */common_hf_*.o) ;; # for the tools, with libjanas.a only
@@ -437,22 +441,22 @@ if [ "$VARIANT" = release ]; then
     if [ "$OS" = windows ]; then
         # a DLL and its import library (libjanas_llm.dll.a) for MinGW
         for l in llm mcp; do
-            if [ $l = llm ]; then lo=("${llm_objs[@]}"); else
-                lo=("${mcp_objs[@]}" "$OBJ/libjanas_third.a"); fi
+            if [ $l = llm ]; then lo=(${llm_objs[@]+"${llm_objs[@]}"}); else
+                lo=(${mcp_objs[@]+"${mcp_objs[@]}"} "$OBJ/libjanas_third.a"); fi
             echo "LD  $BIN/libjanas_$l.dll"
-            "$CC" -shared -pthread "${LDSTATIC[@]}" "${lo[@]}" "${LDLIBS[@]}" \
-                -Wl,--out-implib,"$BIN/libjanas_$l.dll.a" \
+            "$CC" -shared -pthread ${LDSTATIC[@]+"${LDSTATIC[@]}"} ${lo[@]+"${lo[@]}"} \
+                "${LDLIBS[@]}" -Wl,--out-implib,"$BIN/libjanas_$l.dll.a" \
                 -o "$BIN/libjanas_$l.dll"
         done
     else
         # --no-undefined: a function a library needs and does not have is
         # an error here, not when a program first calls it
         echo "LD  $BIN/libjanas_llm.so"
-        "$CC" -shared -pthread -Wl,--no-undefined "${llm_objs[@]}" \
+        "$CC" -shared -pthread -Wl,--no-undefined ${llm_objs[@]+"${llm_objs[@]}"} \
             "${LDLIBS[@]}" -o "$BIN/libjanas_llm.so"
         echo "LD  $BIN/libjanas_mcp.so"
         # with Mbed TLS from the archive of the libraries of others
-        "$CC" -shared -pthread -Wl,--no-undefined "${mcp_objs[@]}" \
+        "$CC" -shared -pthread -Wl,--no-undefined ${mcp_objs[@]+"${mcp_objs[@]}"} \
             "$OBJ/libjanas_third.a" "${LDLIBS[@]}" -o "$BIN/libjanas_mcp.so"
     fi
 fi
@@ -488,8 +492,9 @@ for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
         done < <(find "$dir" -maxdepth 1 -name '*.c' ! -name main.c | sort)
     fi
     echo "LD  $exe"
-    "$CC" "${CFLAGS[@]}" "${TP_INC[@]}" "$src" "${own[@]}" "${START[@]}" \
-        "$OBJ/libjanas.a" "${THIRD[@]}" "${LDSTATIC[@]}" "${LDLIBS[@]}" -o "$exe"
+    "$CC" "${CFLAGS[@]}" "${TP_INC[@]}" "$src" ${own[@]+"${own[@]}"} \
+        ${START[@]+"${START[@]}"} "$OBJ/libjanas.a" ${THIRD[@]+"${THIRD[@]}"} \
+        ${LDSTATIC[@]+"${LDSTATIC[@]}"} "${LDLIBS[@]}" -o "$exe"
 done
 
 if [ "$ACTION" = test ]; then
