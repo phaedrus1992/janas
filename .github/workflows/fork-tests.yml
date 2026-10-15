@@ -2,7 +2,10 @@
 # The fixture tests for the fork tooling. A pull request that touches .fork/
 # or the workflows runs every fixture, and the merge push re-runs them as a
 # smoke test. The fixtures come from main, never from the pull request tree,
-# so a changed pull request cannot fake the verdict. test-check-clean.sh
+# so a pull request cannot weaken a test to make its own change pass. This
+# does not stop a hostile pull request: the fixtures run its code with the
+# same user. A fixture that a pull request adds or changes runs only after
+# the merge, so run it locally first. test-check-clean.sh
 # needs the clean branch as a local branch; the first step materializes it
 # from origin/clean.
 name: fork-tests
@@ -39,13 +42,13 @@ jobs:
           fi
           git branch --no-track clean origin/clean
       - name: Run the fixtures from main
-        # Every .fork/tests/test-*.sh on main runs. A pull request that adds a
-        # fixture cannot run it here until the fixture is on main. All of
-        # them are read from one main commit before any runs, because a
-        # fixture runs pull request code that could move origin/main.
+        # Every .fork/tests/test-*.sh on main runs. All of them are read from
+        # one main commit before any runs, because a fixture runs pull
+        # request code that could move origin/main.
         run: |
           main="$(git rev-parse --verify 'origin/main^{commit}')"
           mkdir "$RUNNER_TEMP/fixtures"
+          git ls-tree -z "$main" -- .fork/tests/ > "$RUNNER_TEMP/tree"
           names=()
           while IFS= read -r -d '' entry; do
             path="${entry#*$'\t'}"
@@ -54,7 +57,7 @@ jobs:
             [[ "$name" == test-*.sh ]] || continue
             git show "$main:$path" > "$RUNNER_TEMP/fixtures/$name"
             names+=("$name")
-          done < <(git ls-tree -z "$main" -- .fork/tests/)
+          done < "$RUNNER_TEMP/tree"
           if ((${#names[@]} == 0)); then
             echo "::error::origin/main ($main) has no .fork/tests/test-*.sh"
             exit 1
