@@ -18,10 +18,12 @@ bad() {
 }
 
 # The stub records one line for each source: the source, a tab, then all the
-# arguments. It answers the sweep's probe (source "-") without a record.
-#   STUB_EXIT        the status for every source (default 0)
-#   STUB_FAIL_ODD=1  fail only the sources whose path has an odd length
-#   STUB_PROBE=fail  fail the probe
+# arguments, and prints "diag <source>" as its compiler output. It answers the
+# sweep's probe (a file named probe.c) without a record.
+#   STUB_EXIT          the status for every source (default 0)
+#   STUB_FAIL_ODD=1    fail only the sources whose path has an odd length
+#   STUB_DIE_AT=<src>  stop with status 127 at that source
+#   STUB_PROBE=fail    fail the probe
 # A source that is not a file gets status 3, as a real compiler would fail.
 # For src/server/http.c it also records whether the generated header it
 # includes is on the include path.
@@ -29,12 +31,14 @@ stub="$scratch/cc"
 cat >"$stub" <<'EOF'
 #!/usr/bin/env bash
 src="${!#}"
-if [[ "$src" == - ]]; then
+if [[ "$src" == */probe.c ]]; then
   [[ "${STUB_PROBE:-}" != fail ]]
   exit
 fi
 printf '%s\t%s\n' "$src" "$*" >>"$STUB_RECORD"
+echo "diag $src" >&2
 [[ -f "$src" ]] || exit 3
+[[ "$src" != "${STUB_DIE_AT:-}" ]] || exit 127
 if [[ "$src" == src/server/http.c ]]; then
   for arg in "$@"; do
     if [[ "$arg" == -I* && -f "${arg#-I}/server_test_html.h" ]]; then
@@ -82,23 +86,35 @@ total="$(wc -l <"$STUB_RECORD" | tr -d ' ')"
   bad "all pass: expected '0 of $total files fail', got '$summary'"
 [[ -f "$scratch/pass.txt" && ! -s "$scratch/pass.txt" ]] ||
   bad "all pass: the failing list must exist and be empty"
-[[ -f "$scratch/pass.txt.log" ]] || bad "the sweep must write <failing-list>.log"
 cp "$STUB_RECORD" "$scratch/record.pass"
 
-# Each source is compiled once, and no glob reaches the compiler unexpanded.
+# The Janas sources compiled are exactly the .c files outside third_party,
+# except win_start.c, which build.sh compiles for Windows only.
+cut -f1 "$scratch/record.pass" | grep -v '^src/third_party/' | sort >"$scratch/janas.got"
+(cd "$root" && {
+  find src -name '*.c' ! -path 'src/third_party/*' ! -name win_start.c
+  find tests tools -maxdepth 1 -name '*.c'
+} | sort) >"$scratch/janas.expected"
+cmp -s "$scratch/janas.got" "$scratch/janas.expected" ||
+  bad "Janas sources: $(diff "$scratch/janas.expected" "$scratch/janas.got" | head -5)"
 dupes="$(cut -f1 "$scratch/record.pass" | sort | uniq -d)"
 [[ -z "$dupes" ]] || bad "these sources were compiled more than once: $dupes"
-sources="$(cut -f1 "$scratch/record.pass")"
-[[ "$sources" != *'*'* ]] || bad "a glob that matched nothing reached the compiler"
-for group in src/third_party/libmicrohttpd/ src/third_party/mbedtls/library/ \
-  src/third_party/yyjson/ src/llm/ src/server/ src/services/ tests/ tools/; do
-  grep -q "^$group" "$scratch/record.pass" || bad "no source under $group was compiled"
-done
 expected_tp="$(cd "$root" && find src/third_party/libmicrohttpd src/third_party/yyjson \
   -name '*.c' | wc -l | tr -d ' ')"
 got_tp="$(grep -cE '^src/third_party/(libmicrohttpd|yyjson)/' "$scratch/record.pass" || true)"
 [[ $got_tp -eq $expected_tp ]] ||
   bad "libmicrohttpd and yyjson: expected $expected_tp sources, got $got_tp"
+grep -q '^src/third_party/mbedtls/library/' "$scratch/record.pass" ||
+  bad "no mbedtls source was compiled"
+
+# The log has one "=== <file>" line for each file, and each file's compiler
+# output sits under its own line.
+log_errors="$(awk '
+  /^=== / { if (want != "") print "no output under " want; want = substr($0, 5); n++; next }
+  { if ($0 != "diag " want) print "stray line under " want ": " $0; want = "" }
+  END { if (want != "") print "no output under " want; print "headers " n }
+' "$scratch/pass.txt.log")"
+[[ "$log_errors" == "headers $total" ]] || bad "log: ${log_errors:0:300}"
 
 # The flag split, for every record: -w for third-party sources, -Werror for
 # Janas's own.
@@ -124,6 +140,11 @@ listed="$(wc -l <"$scratch/list.txt" | tr -d ' ')"
 run_sweep 0 "$scratch/list.txt" >/dev/null
 [[ ! -s "$scratch/list.txt" ]] || bad "a second run must replace the failing list"
 
+# Status 125 is the highest a compiler gives for a file it rejects.
+summary="$(run_sweep 125 "$scratch/s125.txt")"
+[[ "$summary" == "$total of $total files fail" ]] ||
+  bad "status 125: expected '$total of $total files fail', got '$summary'"
+
 # Some files fail: the summary, the list, and the compiler agree on which.
 : >"$STUB_RECORD"
 summary="$(TMPDIR="$private_tmp" STUB_FAIL_ODD=1 CC="$stub" bash "$sweep" "$scratch/odd.txt")"
@@ -134,58 +155,145 @@ odd="$(wc -l <"$scratch/odd.expected" | tr -d ' ')"
   bad "some fail: expected '$odd of $total files fail', got '$summary'"
 sort "$scratch/odd.txt" | cmp -s - "$scratch/odd.expected" ||
   bad "some fail: the failing list is not the set of files that failed"
-grep -q '^=== src/llm/api.c$' "$scratch/odd.txt.log" ||
-  bad "the log must mark each file with a === line"
 
-# A broken compiler stops the sweep instead of counting every file.
-broken_case() { # what, expected message, then the environment
+# A stopped sweep exits 1, prints no summary, and leaves no list, not even
+# the list of an earlier good run at the same path.
+stopped_case() { # what, expected message, then the environment
   local what="$1" message="$2" rc
   shift 2
   : >"$STUB_RECORD"
+  echo "src/stale.c" >"$scratch/stopped.txt"
   set +e
-  env TMPDIR="$private_tmp" "$@" bash "$sweep" "$scratch/broken.txt" >"$scratch/broken.out" \
-    2>"$scratch/broken.err"
+  env TMPDIR="$private_tmp" "$@" bash "$sweep" "$scratch/stopped.txt" \
+    >"$scratch/stopped.out" 2>"$scratch/stopped.err"
   rc=$?
   set -e
   [[ $rc -eq 1 ]] || bad "$what: expected exit 1, got $rc"
-  grep -q "$message" "$scratch/broken.err" || bad "$what: the error must say '$message'"
-  [[ ! -e "$scratch/broken.txt" ]] || bad "$what: a stopped sweep must leave no failing list"
-  [[ ! -s "$scratch/broken.out" ]] || bad "$what: a stopped sweep must print no summary"
+  grep -q "$message" "$scratch/stopped.err" || bad "$what: the error must say '$message'"
+  [[ ! -e "$scratch/stopped.txt" ]] || bad "$what: a stopped sweep must leave no failing list"
+  [[ ! -e "$scratch/stopped.txt.part" ]] || bad "$what: a stopped sweep must leave no .part"
+  [[ ! -s "$scratch/stopped.out" ]] || bad "$what: a stopped sweep must print no summary"
 }
-broken_case "a missing compiler" "cannot compile an empty file" CC="$scratch/no-such-cc"
-broken_case "a failing probe" "cannot compile an empty file" CC="$stub" STUB_PROBE=fail
-broken_case "a compiler that dies" "stopped with status 127" CC="$stub" STUB_EXIT=127
+stopped_case "a missing compiler" "cannot compile an empty file" CC="$scratch/no-such-cc"
+stopped_case "a failing probe" "cannot compile an empty file" CC="$stub" STUB_PROBE=fail
+stopped_case "status 126" "stopped with status 126" CC="$stub" STUB_EXIT=126
+stopped_case "a compiler that dies" "stopped with status 127" CC="$stub" STUB_EXIT=127
+stopped_case "a compiler that dies late" "stopped with status 127 on src/llm/api.c" \
+  CC="$stub" STUB_FAIL_ODD=1 STUB_DIE_AT=src/llm/api.c
 
-# A tree that is not the one build.sh expects stops the sweep.
-fake="$scratch/fake"
-mkdir -p "$fake/src/third_party/empty" "$fake/src/tool"
-cat >"$fake/build.sh" <<'EOF'
+# A small tree with a known shape. Each case below breaks one part of it.
+fake_tree() { # directory
+  local d="$1" f
+  mkdir -p "$d/src/third_party/lib" "$d/src/core" "$d/src/tool" "$d/tests" "$d/tools"
+  cat >"$d/build.sh" <<'EOF'
+tp_flags()
+{
+    echo "-DLIB"
+}
+tp_sources()
+{
+    find "src/third_party/$1" -name '*.c' | sort
+}
+EOF
+  for f in src/third_party/lib/a.c src/core/b.c src/tool/main.c src/tool/part.c \
+    tests/t.c tools/x.c; do
+    echo "int x;" >"$d/$f"
+  done
+}
+fake_run() { # directory; sets rc, and writes fake.out and fake.err
+  set +e
+  (cd "$1" && TMPDIR="$private_tmp" CC="$stub" bash "$sweep" "$scratch/fake.txt" \
+    >"$scratch/fake.out" 2>"$scratch/fake.err")
+  rc=$?
+  set -e
+}
+fake_case() { # what, expected message, then a command that breaks the tree
+  local what="$1" message="$2" d
+  shift 2
+  d="$(mktemp -d "$scratch/fake.XXXXXX")"
+  fake_tree "$d"
+  (cd "$d" && "$@")
+  echo "src/stale.c" >"$scratch/fake.txt"
+  fake_run "$d"
+  [[ $rc -eq 1 ]] || bad "$what: expected exit 1, got $rc"
+  grep -qF "$message" "$scratch/fake.err" || bad "$what: the error must say '$message'"
+  [[ ! -e "$scratch/fake.txt" ]] || bad "$what: a stopped sweep must leave no failing list"
+}
+set_build() { cat >build.sh; }
+
+d="$scratch/fake-good"
+fake_tree "$d"
+: >"$STUB_RECORD"
+fake_run "$d"
+[[ $rc -eq 0 && "$(cat "$scratch/fake.out")" == "0 of 6 files fail" ]] ||
+  bad "the small tree: expected '0 of 6 files fail', got rc $rc '$(cat "$scratch/fake.out")'"
+[[ ! -s "$scratch/fake.err" ]] ||
+  bad "outside any git repository the sweep must say nothing on stderr: $(cat "$scratch/fake.err")"
+
+fake_case "a library with no sources" "no sources for src/third_party/lib" \
+  rm src/third_party/lib/a.c
+fake_case "a tp_sources that fails" "build.sh's tp_sources lib failed" \
+  set_build <<'EOF'
+tp_flags()
+{
+    echo "-DLIB"
+}
+tp_sources()
+{
+    ls "src/third_party/$1/missing.c" 2>/dev/null | sort
+}
+EOF
+fake_case "a tp_flags that fails" "build.sh's tp_flags lib failed" \
+  set_build <<'EOF'
+tp_flags()
+{
+    false
+}
+tp_sources()
+{
+    find "src/third_party/$1" -name '*.c' | sort
+}
+EOF
+fake_case "a build.sh with no tp_flags" "build.sh has no function tp_flags" \
+  set_build <<'EOF'
+tp_sources()
+{
+    :
+}
+EOF
+fake_case "two tp_sources" "build.sh defines tp_sources 2 times" \
+  set_build <<'EOF'
 tp_flags()
 {
     :
 }
 tp_sources()
 {
-    find "src/third_party/$1" -name '*.c'
+    :
+}
+tp_sources()
+{
+    :
 }
 EOF
-set +e
-(cd "$fake" && TMPDIR="$private_tmp" CC="$stub" bash "$sweep" "$scratch/fake.txt" \
-  >/dev/null 2>"$scratch/fake.err")
-rc=$?
-set -e
-[[ $rc -eq 1 ]] || bad "a library with no sources: expected exit 1, got $rc"
-grep -q 'no sources for src/third_party/empty' "$scratch/fake.err" ||
-  bad "a library with no sources: the error must name it"
-printf '#!/bin/sh\n' >"$fake/build.sh"
-set +e
-(cd "$fake" && TMPDIR="$private_tmp" CC="$stub" bash "$sweep" "$scratch/fake.txt" \
-  >/dev/null 2>"$scratch/fake.err")
-rc=$?
-set -e
-[[ $rc -eq 1 ]] || bad "a build.sh with no tp_flags: expected exit 1, got $rc"
-grep -q 'build.sh has no function tp_flags' "$scratch/fake.err" ||
-  bad "a build.sh with no tp_flags: the error must say so"
+fake_case "a tp_flags cut short" "cannot load tp_flags from build.sh" \
+  set_build <<'EOF'
+tp_flags()
+{
+    cat <<END
+}
+END
+}
+tp_sources()
+{
+    :
+}
+EOF
+fake_case "no main.c" "no src/*/main.c" rm src/tool/main.c
+fake_case "no library sources" "no sources for the library under src/" \
+  rm src/core/b.c src/tool/part.c
+fake_case "no tests" "no sources for tests/*.c" rm tests/t.c
+fake_case "no tools" "no sources for tools/*.c" rm tools/x.c
 
 # Outside a clone the sweep has no tree to sweep.
 mkdir "$scratch/outside"
@@ -195,6 +303,7 @@ rc=$?
 set -e
 [[ $rc -eq 2 ]] || bad "outside a clone the sweep must exit 2, got $rc"
 grep -q 'is not a Janas clone' "$scratch/err" || bad "outside a clone the error must say so"
+! grep -q 'cannot read' "$scratch/err" || bad "outside a repository git is not refusing a clone"
 
 # Without git, as in a build container, the current directory is the clone.
 nogit="$scratch/nogit"
