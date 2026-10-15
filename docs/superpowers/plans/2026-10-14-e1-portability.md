@@ -488,10 +488,11 @@ Then each declaration becomes `JANAS_PRINTF_LIKE(a, b);` with its own argument n
 - [ ] **Step 4: Verify the count drops**
 
 ```bash
+git show main:.fork/sweep-syntax.sh > .tmp/sweep-syntax.sh
 bash .tmp/sweep-syntax.sh .tmp/sweep-after-json.txt
 ```
 
-The sweep compiles every source `build.sh` compiles, with `build.sh`'s flags, applying `-w` to third-party and `-Wall -Wextra -Werror` to everything else. Recreate it if it is gone: it is the measurement tool behind the spec's §2, and its flag split is the part that is easy to get wrong.
+The sweep is `.fork/sweep-syntax.sh` on `main`. A port branch carries no `.fork/`, so copy it from `main` first. It compiles every source `build.sh` compiles, with `build.sh`'s flags, applying `-w` to third-party and `-Wall -Wextra -Werror` to everything else. It writes stub headers for the generated web pages, so a missing or stale `lib/` does not change the count. The baselines on `clean` are 169 of 375 on macOS arm64 and 4 of 375 on Linux arm64.
 
 Expected: 143 `json.h` files leave the list. A smaller drop means the macro did not reach every use of the attribute; `git grep 'format(gnu_printf'` must print `src/common/printf_like.h` only.
 
