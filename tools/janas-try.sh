@@ -545,8 +545,10 @@ cleanup()
     [ "$KEEP" = 1 ] && return 0
     local f size=0 files=() listed
     # a process substitution would hide a failed sort: the models would be kept with no message
-    listed=$(sort -u "$WORK/created") ||
-        { fail "cannot list $WORK/created: the models are kept"; return 1; }
+    if ! listed=$(sort -u "$WORK/created"); then
+        fail "cannot list $WORK/created: the models are kept"
+        return 1
+    fi
     while read -r f; do
         [ -f "$f" ] || continue
         files+=("$f")

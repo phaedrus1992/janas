@@ -353,7 +353,10 @@ tp_flags()
             "-I$v/pqcp/mldsa-native/mldsa" ;;
     yyjson) ;;
     # an unknown library would compile with no flags and no message
-    *) echo "build.sh: no compile flags for $1: add a case to tp_flags" >&2; return 1 ;;
+    *)
+        echo "build.sh: no compile flags for $1: add a case to tp_flags" >&2
+        return 1
+        ;;
     esac
 }
 # The sources of a library of others: all its .c files, or for Mbed TLS the
@@ -383,10 +386,14 @@ for d in src/third_party/*/; do
     extra=($(tp_flags "$lib"))
     # a process substitution would drop a failed listing, and the library
     # would link short. pipefail (set at the top) makes a failed ls fail the listing
-    srcs=$(tp_sources "$lib") ||
-        { echo "build.sh: cannot list the sources of $lib (see the error above)" >&2; exit 1; }
-    [ -n "$srcs" ] ||
-        { echo "build.sh: no .c files for $lib: check src/third_party/$lib" >&2; exit 1; }
+    if ! srcs=$(tp_sources "$lib"); then
+        echo "build.sh: cannot list the sources of $lib (see the error above)" >&2
+        exit 1
+    fi
+    if [ -z "$srcs" ]; then
+        echo "build.sh: no .c files for $lib: check src/third_party/$lib" >&2
+        exit 1
+    fi
     while IFS= read -r src; do
         obj=$(objname "$src")
         tp_objs+=("$obj")
@@ -411,9 +418,11 @@ MBEDTLS_INC=($(tp_flags mbedtls))
 tool_dirs=$(for m in src/*/main.c src/services/*/main.c; do dirname "$m"; done)
 objs=()
 # a process substitution would drop a failed find, and the library would link short
-lib_srcs=$(find src -name '*.c' ! -name main.c ! -name win_start.c \
-    ! -path 'src/third_party/*' | sort) ||
-    { echo "build.sh: cannot list the library sources under src/" >&2; exit 1; }
+if ! lib_srcs=$(find src -name '*.c' ! -name main.c ! -name win_start.c \
+    ! -path 'src/third_party/*' | sort); then
+    echo "build.sh: cannot list the library sources under src/" >&2
+    exit 1
+fi
 while IFS= read -r src; do
     [ -n "$src" ] || continue
     grep -qx "$(dirname "$src")" <<<"$tool_dirs" && continue
@@ -495,8 +504,10 @@ for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
         dir=$(dirname "$src")
         exe="$BIN/janas-$(basename "$dir")$SUFFIX$EXE"
         # a process substitution would drop a failed find, and the program would link short
-        dir_srcs=$(find "$dir" -maxdepth 1 -name '*.c' ! -name main.c | sort) ||
-            { echo "build.sh: cannot list the sources of $dir" >&2; exit 1; }
+        if ! dir_srcs=$(find "$dir" -maxdepth 1 -name '*.c' ! -name main.c | sort); then
+            echo "build.sh: cannot list the sources of $dir" >&2
+            exit 1
+        fi
         while IFS= read -r c; do
             [ -n "$c" ] || continue
             obj=$(objname "$c")
@@ -525,5 +536,5 @@ if [ "$ACTION" = test ]; then
         echo "RUN $t"
         "${RUN[@]}" "$t" || status=1
     done
-    exit $status
+    exit "$status"
 fi
