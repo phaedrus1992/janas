@@ -232,7 +232,7 @@ For the later implementation plan, not now:
 
 1. `port/21-arch-guard-leaks`, because it is the only slice with a defect in shipped code and the only one any arm64 machine can verify.
 2. `port/20-build-portability`, because `port/23` needs a build that gets far enough to report its own errors.
-3. `port/23-clang-dialect`, which takes the failure count from 170 to 27.
+3. `port/23-clang-dialect`, which with `port/20` applied takes the failure count from 169 to 15 (measured over the 375 files `build.sh` compiles, 2026-10-14).
 4. `port/22-os-call-sites`.
 5. `port/24-sysinfo-macos`.
 6. `port/25-ci-arm64`, last, with #13.

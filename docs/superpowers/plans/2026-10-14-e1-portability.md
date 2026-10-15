@@ -291,17 +291,26 @@ Expected: FAIL at `src/third_party/libmicrohttpd/src/microhttpd/mhd_sockets.h:11
 headers_newest=$(find src include "$SPV" "$GEN" -name '*.h' -printf '%T@\n' | sort -n | tail -1)
 ```
 
-BSD `find` has no `-printf`. `date -r` is not portable either: `-r` takes seconds since the epoch on GNU and a file on BSD. Let `find` produce the names and `ls -t` do the sorting:
+BSD `find` has no `-printf`. `date -r` is not portable either: `-r` takes seconds since the epoch on GNU and a file on BSD. Let `find` produce the names and a shell loop keep the newest:
 
 ```bash
+newest_h=
+while IFS= read -r -d '' h; do
+    if [ -z "$newest_h" ] || [ "$h" -nt "$newest_h" ]; then
+        newest_h=$h
+    fi
+done < <(find src include "$SPV" "$GEN" -name '*.h' -print0)
 headers_newest=0
-newest_h=$(find src include "$SPV" "$GEN" -name '*.h' -print0 |
-    xargs -0 ls -t 2>/dev/null | head -1)
-[ -n "$newest_h" ] &&
-    headers_newest=$(stat -f %m "$newest_h" 2>/dev/null || stat -c %Y "$newest_h")
+if [ -n "$newest_h" ]; then
+    headers_newest=$(stat -c %Y "$newest_h" 2>/dev/null || stat -f %m "$newest_h")
+fi
 ```
 
-`stat -f %m` is BSD and `stat -c %Y` is GNU, so the first one to succeed gives seconds. An empty tree leaves `newest_h` empty, the `stat` never runs, and `headers_newest` stays 0 — which is the existing behaviour for a tree with no objects yet.
+Do not use a pipeline that ends in `head -1`. `head` exits early, the writer dies of SIGPIPE, and under `set -o pipefail` the build stops right after the GPU note with no message.
+
+`stat -c %Y` is GNU and `stat -f %m` is BSD. The GNU spelling goes first. A failing BSD `stat` prints nothing, but a failing GNU `stat -f` prints the file system block to stdout, and the command substitution captures it. GNU `stat` is also what a Mac with Homebrew coreutils or uutils on `PATH` runs.
+
+An empty tree leaves `newest_h` empty, the `stat` never runs, and `headers_newest` stays 0 — which is the existing behaviour for a tree with no objects yet.
 
 - [ ] **Step 4: Replace the GNU `stat -c`**
 
@@ -314,7 +323,7 @@ newest_h=$(find src include "$SPV" "$GEN" -name '*.h' -print0 |
 Change it to the same two-spelling form:
 
 ```bash
-[ "$(stat -f %m "$obj" 2>/dev/null || stat -c %Y "$obj")" -lt "$headers_newest" ]; then
+[ "$(stat -c %Y "$obj" 2>/dev/null || stat -f %m "$obj")" -lt "$headers_newest" ]; then
 ```
 
 `headers_newest` is now plain seconds, so drop the `${headers_newest%.*}` suffix strip.
@@ -425,10 +434,11 @@ Then open the pull request as in Task 1 Step 13, with `--base main --head phaedr
 
 Closes #424. Spec §4 (`port/23`), §9 step 3.
 
-This is the branch that takes the macOS failure count from 170 to about 27.
+This is the branch that takes the macOS failure count from 169 to 15, with Task 2 applied. On `clean` alone it removes 146 failing files; the other 8 are Task 2's libmicrohttpd files.
 
 **Files:**
-- Modify: `src/llm/json.h:68`
+- Create: `src/common/printf_like.h`
+- Modify: the 14 `format(gnu_printf` sites in 13 files: `src/llm/json.h`, `src/llm/chat.h`, `src/llm/metrics.c`, `src/chat/term.h`, `src/common/mcp_client.h`, `src/server/server.h`, `src/server/request.h`, `src/services/git/git.h`, `src/services/prices/prices.h`, `src/services/quakes/tools.c`, `src/services/system/tools.c`, `src/bench/main.c`, and `src/chat/main.c`
 - Modify: `src/chat/main.c:17`
 - Modify: `src/chat/tune.c:32`
 - Modify: `tests/bench_kernels.c:123`
@@ -461,7 +471,7 @@ Expected: FAIL in an engine source with `error: 'format' attribute argument not 
     __attribute__((format(gnu_printf, 2, 3)));
 ```
 
-Apple clang does not accept the `gnu_printf` argument and reports `-Wignored-attributes`, which `-Werror` makes fatal. Add a macro above the declaration and use it:
+Apple clang does not accept the `gnu_printf` argument and reports `-Wignored-attributes`, which `-Werror` makes fatal. `json.h` is not the only site: `git grep 'format(gnu_printf'` finds 14 sites in 13 files. Put the macro in a header of its own, `src/common/printf_like.h`, and include it in each of the 13 files directly, not through another header:
 
 ```c
 /* gnu_printf checks the GNU extensions in a format string; Apple clang
@@ -473,7 +483,7 @@ Apple clang does not accept the `gnu_printf` argument and reports `-Wignored-att
 #endif
 ```
 
-Then the declaration becomes `JANAS_PRINTF_LIKE(2, 3);`. Guard only on `__APPLE__` and leave `gnu_printf` everywhere else: changing it globally would alter `-Wformat` on the x86-64 path, which must not move.
+Then each declaration becomes `JANAS_PRINTF_LIKE(a, b);` with its own argument numbers. Guard only on `__APPLE__` and leave `gnu_printf` everywhere else: changing it globally would alter `-Wformat` on the x86-64 path, which must not move.
 
 - [ ] **Step 4: Verify the count drops**
 
@@ -483,7 +493,7 @@ bash .tmp/sweep-syntax.sh .tmp/sweep-after-json.txt
 
 The sweep compiles every source `build.sh` compiles, with `build.sh`'s flags, applying `-w` to third-party and `-Wall -Wextra -Werror` to everything else. Recreate it if it is gone: it is the measurement tool behind the spec's §2, and its flag split is the part that is easy to get wrong.
 
-Expected: about 27 files fail, down from 170. A much smaller drop means the macro did not reach every use of the attribute; grep for other `format(gnu_printf` occurrences.
+Expected: 143 `json.h` files leave the list. A smaller drop means the macro did not reach every use of the attribute; `git grep 'format(gnu_printf'` must print `src/common/printf_like.h` only.
 
 - [ ] **Step 5: Fix `chat/main.c`**
 
@@ -532,7 +542,7 @@ The value is unchanged: the implicit conversion already did exactly this. State 
 bash .tmp/sweep-syntax.sh .tmp/sweep-final.txt
 ```
 
-Expected: `tests/bench_kernels.c` and `src/chat/tune.c` are gone from the list. `src/llm/json.h`'s 143 files are gone.
+Expected: `tests/bench_kernels.c` and `src/chat/tune.c` are gone from the list. `src/llm/json.h`'s 143 files are gone. With Task 2 applied, 15 files fail, and all of them belong to Tasks 1, 4 and 5.
 
 - [ ] **Step 10: Verify Linux arm64**
 
@@ -563,7 +573,7 @@ Expected: the same list as before this branch, minus nothing. A new entry means 
 
 ```bash
 ./.fork/check-clean.sh
-git add src/llm/json.h src/chat/main.c src/chat/tune.c tests/bench_kernels.c
+git add src/common/printf_like.h $(git diff --name-only)
 git commit -s -m "build: the four constructs Apple clang refuses"
 git push -u origin port/23-clang-dialect
 ```
