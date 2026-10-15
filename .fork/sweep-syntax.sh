@@ -18,8 +18,12 @@ Prints "<failing> of <total> files fail" on stdout.
 The sweep measures the build without GPU support: it does not define
 JANAS_GPU_SPV, so the Vulkan bodies of src/llm/gpu*.c are not compiled.
 
+The sweep runs the tp_flags and tp_sources functions of the swept build.sh.
+Sweep only a tree that you would build.
+
 Exit 0 when the sweep ran, whatever the count; 1 when the compiler or the
-tree is broken, so that no count would be true; 2 for a usage error.
+tree is broken, so that no count would be true; 2 for a usage error. A sweep
+that stops leaves no <failing-list>, so an old list cannot read as its result.
 
 CC selects the compiler (default cc). A port/* branch carries no .fork/, so
 copy the script from main first:
@@ -53,12 +57,16 @@ if [[ ! -d "$out_dir" ]]; then
 fi
 out="$(cd "$out_dir" && pwd)/$(basename "$1")"
 log="$out.log"
+rm -f "$out" "$out.part"
+: >"$log"
 
 if ! command -v git >/dev/null; then
   top="$PWD"
-elif ! top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+elif ! top="$(git rev-parse --show-toplevel 2>&1)"; then
   # Git refuses a clone that another user owns, as in a container mount.
-  echo "sweep-syntax: git cannot read a clone here; sweeping $PWD." >&2
+  if [[ "$top" != *"not a git repository"* ]]; then
+    echo "sweep-syntax: git cannot read the clone here (${top%%$'\n'*}); sweeping $PWD." >&2
+  fi
   top="$PWD"
 fi
 if [[ ! -f "$top/build.sh" ]]; then
@@ -74,15 +82,24 @@ VERSION="$(git describe --always --dirty 2>/dev/null || echo unknown)"
 
 # The third-party flags and source lists come from this clone's build.sh, so
 # that each branch is swept with the build it carries.
+# build.sh writes each one as "name()" on a line of its own, then "{", and
+# ends it with "}" in column 0. Bash keeps the last of two definitions, so
+# there must be exactly one.
 for fn in tp_flags tp_sources; do
+  count="$(awk -v fn="$fn" '$0 == fn "()" { n++ } END { print n + 0 }' build.sh)"
+  [[ $count -ne 0 ]] || die "build.sh has no function $fn; update the sweep to match build.sh."
+  [[ $count -eq 1 ]] || die "build.sh defines $fn $count times; the sweep cannot tell which one runs."
   body="$(awk -v fn="$fn" '$0 == fn "()" { on = 1 } on { print } on && $0 == "}" { exit }' build.sh)"
-  [[ -n "$body" ]] || die "build.sh has no function $fn; update the sweep to match build.sh."
+  bash -n <<<"$body" 2>/dev/null ||
+    die "cannot load $fn from build.sh: it does not end at the first '}' in column 0."
   eval "$body"
 done
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/janas-sweep.XXXXXX")"
 trap 'rm -rf "$scratch"; rm -f "$out.part"' EXIT
-trap 'exit 130' INT TERM HUP
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # build.sh writes each src/<tool>/<name>.html as a C array in a generated
 # header. A syntax check needs only the declaration, so the sweep writes
@@ -110,8 +127,8 @@ TP=("${BASE[@]}" -w)
 
 # A compiler that cannot compile an empty file would count every file as a
 # portability failure.
-if ! printf 'int janas_sweep_probe;\n' | "$CC" -fsyntax-only "${BASE[@]}" -x c - \
-  >"$scratch/probe.log" 2>&1; then
+printf 'int janas_sweep_probe;\n' >"$scratch/probe.c"
+if ! "$CC" -fsyntax-only "${BASE[@]}" "$scratch/probe.c" >"$scratch/probe.log" 2>&1; then
   cat "$scratch/probe.log" >&2
   die "the compiler '$CC' cannot compile an empty file with build.sh's flags; fix CC."
 fi
@@ -125,7 +142,6 @@ need() { # what, list
 total=0
 fail=0
 : >"$out.part"
-: >"$log"
 sweep_one() { # flags... source
   local src="${!#}" rc=0
   total=$((total + 1))
@@ -143,7 +159,9 @@ sweep_one() { # flags... source
 for dir in src/third_party/*/; do
   lib="$(basename "$dir")"
   # shellcheck disable=SC2207 # build.sh splits tp_flags the same way
-  flags=($(tp_flags "$lib"))
+  flags_text="$(tp_flags "$lib")" || die "build.sh's tp_flags $lib failed."
+  # shellcheck disable=SC2206 # build.sh splits tp_flags the same way
+  flags=($flags_text)
   sources="$(tp_sources "$lib")" ||
     die "build.sh's tp_sources $lib failed: a file in its list or a tool it runs is missing."
   need "src/third_party/$lib" "$sources"
@@ -151,8 +169,9 @@ for dir in src/third_party/*/; do
     sweep_one "${TP[@]}" ${flags[@]+"${flags[@]}"} "$src"
   done <<<"$sources"
 done
-# shellcheck disable=SC2207 # build.sh splits tp_flags the same way
-MBEDTLS_INC=($(tp_flags mbedtls))
+mbedtls_text="$(tp_flags mbedtls)" || die "build.sh's tp_flags mbedtls failed."
+# shellcheck disable=SC2206 # build.sh splits tp_flags the same way
+MBEDTLS_INC=($mbedtls_text)
 
 # A directory with a main.c is a program. Its other files go to the program
 # pass below, as build.sh splits them.
@@ -168,19 +187,25 @@ sources="$(find src -name '*.c' ! -name main.c ! -name win_start.c \
   ! -path 'src/third_party/*' | sort)" || die "cannot list the sources under src/."
 need "the library under src/" "$sources"
 while IFS= read -r src; do
-  if grep -qxF "$(dirname "$src")" <<<"$tool_dirs"; then
+  if [[ $'\n'"$tool_dirs"$'\n' == *$'\n'"$(dirname "$src")"$'\n'* ]]; then
     continue
   fi
   extra=()
   if [[ "$src" == src/common/mcp_tls.c ]]; then
-    extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
+    extra=(${MBEDTLS_INC[@]+"${MBEDTLS_INC[@]/#-I/-isystem}"})
   fi
   sweep_one "${JANAS[@]}" ${extra[@]+"${extra[@]}"} "$src"
 done <<<"$sources"
+for group in tests tools; do
+  found=
+  for src in "$group"/*.c; do
+    if [[ -f "$src" ]]; then
+      found=yes
+    fi
+  done
+  need "$group/*.c" "$found"
+done
 for src in tests/*.c tools/*.c "${mains[@]}"; do
-  if [[ ! -f "$src" ]]; then
-    continue
-  fi
   sweep_one "${JANAS[@]}" "$src"
   if [[ "$(basename "$src")" == main.c ]]; then
     parts="$(find "$(dirname "$src")" -maxdepth 1 -name '*.c' ! -name main.c | sort)" ||
