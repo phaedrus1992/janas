@@ -33,6 +33,10 @@ On Linux arm64 four files fail, and all four are the same defect — names a `#i
 No port code exists yet.
 Each epic gets its own design session before work starts.
 
+Rendeverance has NEON kernels and Windows on ARM64 in upstream pull requests #31 to #34.
+This fork now helps that work instead of a separate NEON track.
+[`ref-rendeverance.md`](superpowers/specs/2026-10-13-arm64-metal-port/ref-rendeverance.md) compares the two and lists the macOS work that stays here.
+
 The daily sync runs on a GitHub App installation token, minted per run by
 `actions/create-github-app-token` from the `SYNC_APP_ID` and
 `SYNC_APP_PRIVATE_KEY` secrets (#410).
