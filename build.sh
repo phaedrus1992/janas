@@ -125,7 +125,13 @@ SUFFIX=""
 # _GNU_SOURCE for every file, empty as the files that define it write it:
 # the C library of Ubuntu 22.04 (the binary package's) declares memmem,
 # strcasestr and the like only with it, where a newer one does by default
-CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread -Isrc -Iinclude)
+# -ffp-contract=off: no multiply and add fused by the compiler on its own -
+# gcc fuses them where FMA is enabled (the kernels' functions), clang within
+# an expression, each version where it sees fit - so that one source gives
+# the same bits with every compiler (issue #38); the FMAs the kernels write
+# with intrinsics stay
+CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread
+    -ffp-contract=off -Isrc -Iinclude)
 if [ "$OS" = windows ]; then
     # Windows 10 and later; printf with the C99 formats (%zu, %lld); what
     # MinGW's C library lacks, in one header every file starts with

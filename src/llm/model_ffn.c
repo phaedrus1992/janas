@@ -368,7 +368,7 @@ static void route_tok(struct janas_llm_model *m, uint32_t j)
         if (r[e] > mx)
             mx = r[e];
     for (uint32_t e = 0; e < ne; e++) {
-        r[e] = expf(r[e] - mx);
+        r[e] = janas_expf(r[e] - mx);
         sum += r[e];
     }
     float wsum = 0.0f;

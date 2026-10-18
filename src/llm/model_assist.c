@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "jmath.h"
 #include "matvec.h"
 #include "vmath.h"
 
@@ -360,11 +361,11 @@ static void rope_at(float *cs, float *sn, uint32_t pos, uint32_t n_rot,
                     float base, const float *ff)
 {
     for (uint32_t i = 0; i < n_rot / 2; i++) {
-        float theta = (float)pos * powf(base, -2.0f * (float)i / (float)n_rot);
+        float theta =
+            (float)pos * janas_powf(base, -2.0f * (float)i / (float)n_rot);
         if (ff)
             theta /= ff[i];
-        cs[i] = cosf(theta);
-        sn[i] = sinf(theta);
+        janas_sincosf(theta, &sn[i], &cs[i]);
     }
 }
 

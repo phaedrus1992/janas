@@ -46,6 +46,7 @@
 #include "deltanet.h"
 #include "tuner.h"
 #include "gpu.h"
+#include "jmath.h"
 #include "matvec.h"
 #include "quant.h"
 #include "vmath.h"
@@ -96,12 +97,12 @@ static void rope_table(float *cs, float *sn, uint32_t n, uint32_t pos0,
     uint32_t half = n_rot / 2;
     for (uint32_t j = 0; j < n; j++)
         for (uint32_t i = 0; i < half; i++) {
-            float theta =
-                (float)(pos0 + j) * powf(base, -2.0f * (float)i / (float)n_rot);
+            float theta = (float)(pos0 + j) *
+                          janas_powf(base, -2.0f * (float)i / (float)n_rot);
             if (ff)
                 theta /= ff[i];
-            cs[(size_t)j * half + i] = cosf(theta);
-            sn[(size_t)j * half + i] = sinf(theta);
+            janas_sincosf(theta, &sn[(size_t)j * half + i],
+                          &cs[(size_t)j * half + i]);
         }
 }
 
@@ -202,7 +203,7 @@ static void softcap_worker(void *arg, int tid, int n_threads)
     size_t per = (len + (size_t)n_threads - 1) / (size_t)n_threads;
     size_t a = (size_t)tid * per, b = a + per < len ? a + per : len;
     for (size_t i = a; i < b; i++)
-        l[i] = c * tanhf(l[i] / c);
+        l[i] = c * janas_tanhf(l[i] / c);
 }
 
 /* A key row turned back by the angles in cs, sn (half pairs, NeoX) and put
@@ -263,11 +264,10 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
         const float *ff = swa ? NULL : m->rope_freqs;
         for (uint32_t i = 0; i < half; i++) {
             float theta =
-                (float)drop * powf(base, -2.0f * (float)i / (float)n_rot);
+                (float)drop * janas_powf(base, -2.0f * (float)i / (float)n_rot);
             if (ff)
                 theta /= ff[i];
-            cs[i] = cosf(theta);
-            sn[i] = sinf(theta);
+            janas_sincosf(theta, &sn[i], &cs[i]);
         }
         size_t row = hd * elt;
         for (uint32_t h = 0; h < m->kv_heads[sl]; h++) {
@@ -642,7 +642,7 @@ double janas_m_exp_sum(const float *l, uint32_t n, float mx)
         sum = exp_sum_avx2(l, n, mx, &i);
 #endif
     for (; i < n; i++)
-        sum += expf(l[i] - mx);
+        sum += janas_exp_det(l[i] - mx);
     return sum;
 }
 
@@ -703,7 +703,7 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
         sum = exp_sum_avx2(l, m->dh_n, mx, &i);
 #endif
     for (; i < m->dh_n; i++)
-        sum += expf(l[i] - mx);
+        sum += janas_exp_det(l[i] - mx);
     *token = m->dh_ids[best];
     *conf = (float)(1.0 / sum);
     m->phase[JANAS_PH_OUTPUT] += now() - td;

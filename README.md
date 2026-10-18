@@ -140,6 +140,7 @@ On Qwen3-Next-80B-A3B, whose file is larger than this laptop's 30 GB, llama.cpp 
 - [docs/code-completion.md](docs/code-completion.md) — code completion in VSCodium and VS Code, through `janas-server`
 - [docs/tools.md](docs/tools.md) — the converters, checkers and benchmarks
 - [docs/hardware.md](docs/hardware.md) — measuring your machine, and helping it run on more hardware
+- [docs/reports.md](docs/reports.md) — what testers measured on their own machines
 - [AUTHORS](AUTHORS) — who wrote it, and what it owes to others
 - [LICENSE](LICENSE) — GNU GPL, version 3 or later
 
@@ -197,6 +198,8 @@ The converters, checkers and benchmarks built beside the programs: [docs/tools.m
 ## Helping it run on more hardware
 
 Which machines are wanted most, the one command that tries Janas and writes a report, and what to send: [docs/hardware.md](docs/hardware.md#helping-it-run-on-more-hardware).
+
+What testers measured on their own machines so far: [docs/reports.md](docs/reports.md).
 
 ## Credits
 

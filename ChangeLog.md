@@ -2,6 +2,14 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-17] - The same answer whatever the C library and the compiler
+
+- **The engine computes exp, log, pow, sin, cos and tanh itself** (`src/llm/jmath.c`), in double with plain IEEE-754 operations, where it called the C library's: the rotary angles, the softmax of the experts' router and of the attention's pieces, the DeltaNet's softplus, decay and gates, the soft cap of the logits, the sampler. The C library's functions differ between versions and systems - glibc 2.41 rounds several of them correctly where 2.39 did not - and one unit in the last place was enough to turn a near tie between two tokens the other way: Qwen3.6-35B-A3B's answer at temperature 0 was another text on Ubuntu 24.04 (issue #38, reported by martinambrus). The float results are the double ones rounded once; `tests/test_jmath` checks them against the C library in double over the ranges the engine uses them on (exp within 0 units in the last place, the others within one).
+- **No compiler fuses a multiply and an add on its own** (`-ffp-contract=off`): gcc did in the kernels' functions compiled for FMA, each version where it saw fit - eight places, all in the scalar ends of vector loops; the fused operations the kernels write themselves stay.
+- **janas-try's answer fingerprints**: medium's is `13e2f198c270b826` and gemma's `bf1626afffa7eeab` now, quick's and full's unchanged, each the same with the GPU, without it and with the AVX2 kernels forced. Against llama.cpp, on eleven texts of six models (Qwen3-0.6B, Qwen3.5-0.8B, 2B and 9B, Qwen3-4B against its own file and against the Q8_0's), the most likely token agrees at 4,111 of 4,400 positions, 4,108 before.
+- **test_quant says whether it compared the scalar SiLU with the AVX2 one**: on a CPU without AVX2 and FMA it passed as if a million values had agreed, comparing none (issue #26, reported by phaedrus1992); it prints how many it compared, or that there was nothing to compare with.
+
+
 ## [2026-10-14] - MXFP4 on the GPU, and the experts of a large cache back on it
 
 - **A mixture's experts reach the GPU again when the expert cache holds more than 4 GiB of them.** Since the release of 13 October the memory the GPU reads is given to it in regions that start on 2 MB boundaries, each overlapping the one before, and the overlap was not counted in the 4 GiB a region may take: past the first, a region could come to a little more, which the GPU refused, and the expert cache was then not given to it at all. On an integrated GPU a mixture's experts stayed on the CPU, in the fast prompt and in the block read whole on the GPU, whenever the cache held more than about 4 GiB of experts, depending on the size of an expert: Qwen3.6-35B-A3B's MXFP4_MOE file beyond 4 GiB, its Q4_K_M at six bits beyond 8 GiB. Each region counts its overlap now, and `tests/test_import_regions` checks them.
