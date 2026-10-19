@@ -130,7 +130,7 @@ On Qwen3-Next-80B-A3B, whose file is larger than this laptop's 30 GB, llama.cpp 
 - [INSTALL.md](INSTALL.md) — what the build needs, how to prepare a model, and the first run
 - [ChangeLog.md](ChangeLog.md) — what changed, newest first
 - [MODELS.md](MODELS.md) — what a converted model's licence is, and what may be redistributed
-- [CONTRIBUTING.md](CONTRIBUTING.md) — how to help, and the sign-off
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to help, and why code from contributors waits for now
 - [src/services](src/services/README.md) — Janas's services, each with its page, in `janas-chat` and in other MCP clients
 - [docs/features.md](docs/features.md) — what Janas-LLM runs today, model by model and feature by feature
 - [docs/models.md](docs/models.md) — getting a model: `janas-get`, or a GGUF file converted
@@ -140,6 +140,7 @@ On Qwen3-Next-80B-A3B, whose file is larger than this laptop's 30 GB, llama.cpp 
 - [docs/code-completion.md](docs/code-completion.md) — code completion in VSCodium and VS Code, through `janas-server`
 - [docs/tools.md](docs/tools.md) — the converters, checkers and benchmarks
 - [docs/hardware.md](docs/hardware.md) — measuring your machine, and helping it run on more hardware
+- [docs/reports.md](docs/reports.md) — what testers measured on their own machines
 - [AUTHORS](AUTHORS) — who wrote it, and what it owes to others
 - [LICENSE](LICENSE) — GNU GPL, version 3 or later
 
@@ -198,6 +199,8 @@ The converters, checkers and benchmarks built beside the programs: [docs/tools.m
 
 Which machines are wanted most, the one command that tries Janas and writes a report, and what to send: [docs/hardware.md](docs/hardware.md#helping-it-run-on-more-hardware).
 
+What testers measured on their own machines so far: [docs/reports.md](docs/reports.md).
+
 ## Credits
 
 Janas is designed and written by **Maurizio "camauri" Cammalleri** ([LinkedIn](https://www.linkedin.com/in/maurizio-cammalleri-80a89a11/), [Substack](https://cammalleri.substack.com/)).
@@ -229,4 +232,4 @@ Janas is free software under the **GNU General Public License, version 3 or late
 
 ## Contributing
 
-[CONTRIBUTING.md](CONTRIBUTING.md). The short version: a measurement from a machine nobody here owns is worth more than most patches, and every commit needs a `Signed-off-by` line (`git commit -s`).
+[CONTRIBUTING.md](CONTRIBUTING.md). The short version: a measurement from a machine nobody here owns is worth more than most patches, and code from contributors cannot be merged until the non-profit foundation that will hold Janas's copyright is set up.

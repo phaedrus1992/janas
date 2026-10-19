@@ -125,7 +125,13 @@ SUFFIX=""
 # _GNU_SOURCE for every file, empty as the files that define it write it:
 # the C library of Ubuntu 22.04 (the binary package's) declares memmem,
 # strcasestr and the like only with it, where a newer one does by default
-CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread -Isrc -Iinclude)
+# -ffp-contract=off: no multiply and add fused by the compiler on its own -
+# gcc fuses them where FMA is enabled (the kernels' functions), clang within
+# an expression, each version where it sees fit - so that one source gives
+# the same bits with every compiler (issue #38); the FMAs the kernels write
+# with intrinsics stay
+CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread
+    -ffp-contract=off -Isrc -Iinclude)
 if [ "$OS" = windows ]; then
     # Windows 10 and later; printf with the C99 formats (%zu, %lld); what
     # MinGW's C library lacks, in one header every file starts with
@@ -140,7 +146,10 @@ fi
 case "$VARIANT" in
 release) CFLAGS+=(-O2 -DNDEBUG) ;;
 debug) CFLAGS+=(-O0 -g) ;;
-asan) CFLAGS+=(-O1 -g -fsanitize=address -fno-omit-frame-pointer) ;;
+# asan: aligned blocks with a tag before them, as on Windows, so that one
+# given to the wrong release stops the program (src/common/aligned.h)
+asan) CFLAGS+=(-O1 -g -fsanitize=address -fno-omit-frame-pointer
+    -DJANAS_ALIGNED_CHECK) ;;
 ubsan) CFLAGS+=(-O1 -g -fsanitize=undefined -fno-sanitize-recover=all) ;;
 tsan) CFLAGS+=(-O1 -g -fsanitize=thread) ;;
 *)
@@ -303,7 +312,11 @@ done
 CFLAGS+=(-I"$GEN")
 
 # one object, rebuilt when its source or any header is newer
-headers_newest=$(find src include "$SPV" "$GEN" -name '*.h' -printf '%T@\n' | sort -n | tail -1)
+if ! headers_newest=$(find src include "$SPV" "$GEN" -name '*.h' -printf '%T@\n' |
+    sort -n | tail -1) || [ -z "$headers_newest" ]; then
+    echo "build.sh: cannot list the headers under src/ and include/" >&2
+    exit 2
+fi
 compile()
 { # source, object, then the flags
     local src="$1" obj="$2"
@@ -315,6 +328,26 @@ compile()
     fi
 }
 objname() { echo "$OBJ/$(echo "${1#src/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
+# The output of a listing of sources, or a stop that names what was listed:
+# read through a pipe or a process substitution its failure would be lost,
+# and a program linked with fewer objects than it needs. An empty listing
+# stops too, unless "may-be-empty" comes first.
+sources()
+{ # [may-be-empty] what was listed, then the command
+    local empty="" what out
+    [ "$1" = may-be-empty ] && empty=yes && shift
+    what="$1"
+    shift
+    if ! out=$("$@"); then
+        echo "build.sh: cannot list the sources of $what" >&2
+        exit 2
+    fi
+    if [ -z "$out" ] && [ -z "$empty" ]; then
+        echo "build.sh: no sources in $what" >&2
+        exit 2
+    fi
+    [ -z "$out" ] || printf '%s\n' "$out"
+}
 
 # Libraries of others (src/third_party/<lib>/, see its origin.md), each with
 # the flags it needs and without Janas's warnings, in an archive of their
@@ -351,6 +384,13 @@ tp_flags()
             "-I$c/core -I$v/builtin/src -I$c/dispatch -I$c/extras" \
             "-I$c/platform -I$c/utilities -I$v/pqcp/src" \
             "-I$v/pqcp/mldsa-native/mldsa" ;;
+    yyjson) ;;
+    *)
+        # without its flags it would be compiled wrong, or not at all
+        echo "build.sh: no flags for the library of others $1" \
+            "(src/third_party/$1): add it to tp_flags" >&2
+        return 1
+        ;;
     esac
 }
 # The sources of a library of others: all its .c files, or for Mbed TLS the
@@ -362,28 +402,45 @@ tp_sources()
     case "$1" in
     mbedtls)
         local c="$d/tf-psa-crypto" v="$d/tf-psa-crypto/drivers"
-        ls "$d"/library/*.c "$c"/core/*.c "$c"/extras/*.c "$c"/platform/*.c \
-            "$c"/utilities/*.c "$v"/builtin/src/*.c "$v"/pqcp/src/*.c \
-            "$v"/everest/library/x25519.c \
+        local s
+        # a directory with no .c left is its pattern unexpanded, which is
+        # no file either: both missing, both named
+        for s in "$d"/library/*.c "$c"/core/*.c "$c"/extras/*.c \
+            "$c"/platform/*.c "$c"/utilities/*.c "$v"/builtin/src/*.c \
+            "$v"/pqcp/src/*.c "$v"/everest/library/x25519.c \
             "$v"/everest/library/Hacl_Curve25519_joined.c \
             "$v"/p256-m/p256-m_driver_entrypoints.c \
-            "$v"/p256-m/p256-m/p256-m.c 2>/dev/null | sort
+            "$v"/p256-m/p256-m/p256-m.c; do
+            if [ ! -f "$s" ]; then
+                echo "build.sh: $1: missing $s" >&2
+                return 1
+            fi
+            echo "$s"
+        done | sort
         ;;
     *) find "$d" -name '*.c' | sort ;;
     esac
 }
 tp_objs=()
+tp_libs=0
 for d in src/third_party/*/; do
     [ -d "$d" ] || continue
+    tp_libs=$((tp_libs + 1))
     lib=$(basename "$d")
-    # shellcheck disable=SC2207
-    extra=($(tp_flags "$lib"))
+    flags=$(tp_flags "$lib") || exit 2
+    # shellcheck disable=SC2206
+    extra=($flags)
+    tp_list=$(sources "$d" tp_sources "$lib") || exit 2
     while IFS= read -r src; do
         obj=$(objname "$src")
         tp_objs+=("$obj")
         compile "$src" "$obj" "${TP_CFLAGS[@]}" "${extra[@]}"
-    done < <(tp_sources "$lib")
+    done <<<"$tp_list"
 done
+if [ $tp_libs = 0 ]; then
+    echo "build.sh: no libraries of others in src/third_party/" >&2
+    exit 2
+fi
 rm -f "$OBJ/libjanas_third.a"
 # archives made anew: ar only adds and replaces, so the objects of a source
 # since removed or renamed would stay in them and be linked twice
@@ -394,12 +451,15 @@ fi
 # their public headers, for the programs that use them
 TP_INC=(-Isrc/third_party/libmicrohttpd/src/include -Isrc/third_party/yyjson)
 # Mbed TLS's, for the TLS layer of the MCP client (src/common/mcp_tls.c)
-# shellcheck disable=SC2207
-MBEDTLS_INC=($(tp_flags mbedtls))
+flags=$(tp_flags mbedtls) || exit 2
+# shellcheck disable=SC2206
+MBEDTLS_INC=($flags)
 
 # A directory with a main.c is a program: its other .c files are its own.
 # Every other .c under src/ goes into the library.
 tool_dirs=$(for m in src/*/main.c src/services/*/main.c; do dirname "$m"; done)
+lib_list=$(sources src/ find src -name '*.c' ! -name main.c ! -name win_start.c \
+    ! -path 'src/third_party/*') || exit 2
 objs=()
 while IFS= read -r src; do
     grep -qx "$(dirname "$src")" <<<"$tool_dirs" && continue
@@ -410,8 +470,7 @@ while IFS= read -r src; do
     # warnings are not Janas's to fix
     [ "$src" = src/common/mcp_tls.c ] && extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
     compile "$src" "$obj" "${CFLAGS[@]}" "${extra[@]}"
-done < <(find src -name '*.c' ! -name main.c ! -name win_start.c \
-    ! -path 'src/third_party/*' | sort)
+done < <(sort <<<"$lib_list")
 rm -f "$OBJ/libjanas.a"
 "$AR" rcs "$OBJ/libjanas.a" "${objs[@]}"
 if [ "$VARIANT" = release ]; then
@@ -476,16 +535,24 @@ fi
 
 # test and benchmark programs, and the C tools
 for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
+    # a pattern that matched nothing comes here as it is
+    if [ ! -f "$src" ]; then
+        echo "build.sh: no sources match $src" >&2
+        exit 2
+    fi
     exe="$BIN/$(basename "${src%.c}")$SUFFIX$EXE"
     own=()
     if [ "$(basename "$src")" = main.c ]; then
         dir=$(dirname "$src")
         exe="$BIN/janas-$(basename "$dir")$SUFFIX$EXE"
+        own_list=$(sources may-be-empty "$dir" \
+            find "$dir" -maxdepth 1 -name '*.c' ! -name main.c) || exit 2
         while IFS= read -r c; do
+            [ -n "$c" ] || continue
             obj=$(objname "$c")
             own+=("$obj")
             compile "$c" "$obj" "${CFLAGS[@]}" "${TP_INC[@]}"
-        done < <(find "$dir" -maxdepth 1 -name '*.c' ! -name main.c | sort)
+        done < <(sort <<<"$own_list")
     fi
     echo "LD  $exe"
     "$CC" "${CFLAGS[@]}" "${TP_INC[@]}" "$src" "${own[@]}" "${START[@]}" \

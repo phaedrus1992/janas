@@ -479,7 +479,7 @@ det8(const float *g, const float *u, float *h, int n)
 static void test_det(void)
 {
     float g[1024], u[1024], a[1024], b[1024];
-    int bad = 0;
+    int bad = 0, compared = 0;
     for (int round = 0; round < 1000; round++) {
         for (int i = 0; i < 1024; i++) {
             /* wide range, and the clamp edges */
@@ -495,10 +495,18 @@ static void test_det(void)
             det8(g, u, b, 1024);
             for (int i = 0; i < 1024; i++)
                 bad += memcmp(&a[i], &b[i], 4) != 0;
+            compared += 1024;
         }
 #endif
     }
-    CHECK(bad == 0, "silu_mul_det: %d scalar/AVX2 differences", bad);
+    /* without AVX2 and FMA there is nothing to compare it with: say so,
+       rather than pass as if 1000 rounds had agreed (issue #26) */
+    if (compared)
+        printf("silu_mul_det: scalar against AVX2 on %d values\n", compared);
+    else
+        printf("silu_mul_det: no AVX2 with FMA here, scalar not compared\n");
+    CHECK(bad == 0, "silu_mul_det: %d scalar/AVX2 differences of %d", bad,
+          compared);
     double worst = 0;
     for (int i = 0; i < 100000; i++) {
         float d = ldexpf(rndf(1.0f, 2.0f), (int)(rnd() % 200) - 100);

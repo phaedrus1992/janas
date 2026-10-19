@@ -28,6 +28,7 @@
 #endif
 #include <time.h>
 
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "llm/matvec.h"
 #include "llm/gpu.h"
@@ -54,7 +55,7 @@ static unsigned char *weights(size_t bytes)
         return janas_gpu_alloc(gpu, bytes);
     if (mem_kind == 2) {
         size_t al = (size_t)2 << 20;
-        return aligned_alloc(al, (bytes + al - 1) / al * al);
+        return janas_aligned_alloc(al, (bytes + al - 1) / al * al);
     }
     return malloc(bytes);
 }
@@ -169,8 +170,10 @@ int main(int argc, char **argv)
             printf(p ? "\n" : " |");
         }
         fflush(stdout);
-        if (mem_kind != 1)
-            free(w); /* the driver's goes with the GPU */
+        if (mem_kind == 2) /* the driver's goes with the GPU */
+            janas_aligned_free(w);
+        else if (mem_kind == 0)
+            free(w);
         free(y);
     }
     free(x);

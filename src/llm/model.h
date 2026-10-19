@@ -130,6 +130,10 @@ int janas_llm_model_settling(const struct janas_llm_model *m);
  */
 uint32_t janas_llm_prefill_block(const struct janas_jns *j);
 
+/* The model's own layers in j: all of them less an MTP block in the file
+   (qwen35moe: nextn_predict_layers, the last ones). */
+uint32_t janas_llm_main_layers(const struct janas_jns *j);
+
 /*
  * Largest block of tokens one forward call accepts: larger than
  * JANAS_LLM_MAX_BLOCK, so that a prefill reads each expert once for many

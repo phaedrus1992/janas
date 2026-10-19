@@ -22,11 +22,20 @@
 
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
+
+/* the spin-wait hint while a submission runs, as pool.c's */
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define gpu_relax() _mm_pause()
+#elif defined(__aarch64__)
+#define gpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define gpu_relax() ((void)0)
+#endif
 
 #define MAX_REGIONS 48
 #define MAX_PENDING 64

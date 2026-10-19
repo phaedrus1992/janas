@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "expert_cache.h"
 
+#include "common/aligned.h"
 #include "common/reopen.h"
 #include "common/uring.h"
 
@@ -49,6 +50,11 @@ struct janas_expert_cache {
     uint64_t slot_bytes;
     size_t n_slots;
     uint8_t *arena;
+    /* the layers it serves: keys of layers below n_layer, experts of those
+       from first on (an MTP block's slots apart: the block's first layer) */
+    uint32_t first, n_layer;
+    struct janas_expert_cache *wide; /* the MTP block's slots, or NULL */
+    int asked_wide; /* the outstanding request is the block's (caller only) */
 
     int32_t *where; /* (layer, expert) -> slot, n_layer * n_expert */
     int64_t *key;   /* slot -> (layer, expert) or NONE */
@@ -232,7 +238,7 @@ static void touch(struct janas_expert_cache *c, int32_t s)
 static int32_t victim(struct janas_expert_cache *c)
 {
     if (c->filled == c->n_slots && c->last_pass_asked > c->n_slots) {
-        uint32_t nl = c->j->h.n_layer;
+        uint32_t nl = c->n_layer;
         for (uint32_t d = 0; d < nl; d++) {
             uint32_t l = (c->cur_layer + nl - d) % nl;
             for (int32_t s = c->ltail[l]; s != NONE; s = c->lprev[s])
@@ -443,34 +449,96 @@ static int32_t load(struct janas_expert_cache *c, uint32_t layer, uint32_t e)
     return s;
 }
 
-struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
-                                                     uint64_t budget_bytes,
-                                                     int level,
-                                                     struct janas_pool *io,
-                                                     char *err, size_t err_len)
-{
-    if (level < 1 || level > 3) {
-        snprintf(err, err_len, "expert level %d out of range", level);
-        return NULL;
-    }
-    uint64_t slot_bytes = 0;
-    for (uint32_t l = 0; l < j->h.n_layer; l++)
-        if (j->layers[l].level_bytes[level - 1] > slot_bytes)
-            slot_bytes = j->layers[l].level_bytes[level - 1];
-    size_t n_slots = (size_t)(budget_bytes / slot_bytes);
-    size_t n_keys = (size_t)j->h.n_layer * j->h.n_expert;
-    if (n_slots > n_keys)
-        n_slots = n_keys;
-    if (n_slots < j->h.n_expert_used) {
-        snprintf(err, err_len, "budget below one layer of experts");
-        return NULL;
-    }
+/* How a budget is cut in slots: n_slots of slot bytes, and n_wide of
+   wide_slot for an MTP block whose experts are larger (0: none apart). */
+struct layout {
+    uint64_t slot, wide_slot;
+    size_t n_slots, n_wide;
+};
 
+static void clamp_layers(const struct janas_jns *j, uint32_t *n_layer,
+                         uint32_t *n_main)
+{
+    if (*n_layer == 0 || *n_layer > j->h.n_layer)
+        *n_layer = j->h.n_layer;
+    if (*n_main == 0 || *n_main > *n_layer)
+        *n_main = *n_layer;
+}
+
+static void layout(const struct janas_jns *j, uint32_t n_layer, uint32_t n_main,
+                   int level, uint64_t budget, struct layout *o)
+{
+    size_t ne = j->h.n_expert, keys = (size_t)n_layer * ne,
+           mkeys = (size_t)n_main * ne, wkeys = keys - mkeys;
+    uint64_t main = 0, wide = 0;
+    for (uint32_t l = 0; l < n_layer; l++) {
+        uint64_t b = j->layers[l].level_bytes[level - 1], *m = &main;
+        if (l >= n_main)
+            m = &wide;
+        if (b > *m)
+            *m = b;
+    }
+    /* one size for all, the largest */
+    uint64_t one = main > wide ? main : wide;
+    size_t n = (size_t)(budget / one);
+    *o = (struct layout){.slot = one, .n_slots = n < keys ? n : keys};
+    if (wide <= main || main == 0)
+        return;
+    /* or the block apart: room for one request, or for all its experts
+       where the budget holds every expert of both */
+    uint64_t ws = (wide + main - 1) / main * main;
+    size_t wn = wkeys < JANAS_EXPERT_CHUNK ? wkeys : JANAS_EXPERT_CHUNK;
+    if (budget >= (uint64_t)mkeys * main + (uint64_t)wkeys * ws)
+        wn = wkeys;
+    if (budget < (uint64_t)wn * ws)
+        return;
+    size_t mn = (size_t)((budget - (uint64_t)wn * ws) / main);
+    if (mn > mkeys)
+        mn = mkeys;
+    /* only where it holds more experts (all of them: in less memory) */
+    if (mn < j->h.n_expert_used || mn + wn < o->n_slots)
+        return;
+    *o = (struct layout){
+        .slot = main, .wide_slot = ws, .n_slots = mn, .n_wide = wn};
+}
+
+uint64_t janas_expert_cache_room(const struct janas_jns *j, uint32_t n_layer,
+                                 uint32_t n_main, int level)
+{
+    struct layout o;
+    clamp_layers(j, &n_layer, &n_main);
+    layout(j, n_layer, n_main, level, UINT64_MAX, &o);
+    return (uint64_t)o.n_slots * o.slot + (uint64_t)o.n_wide * o.wide_slot;
+}
+
+/* The bytes of every slot, the MTP block's after the model's. */
+static uint64_t arena_used(const struct janas_expert_cache *c)
+{
+    uint64_t b = (uint64_t)c->n_slots * c->slot_bytes;
+    if (c->wide)
+        b += (uint64_t)c->wide->n_slots * c->wide->slot_bytes;
+    return b;
+}
+
+/*
+ * A cache of n_slots slots for the experts of layers first to n_layer - 1,
+ * in arena (someone else's, not freed here), or in an arena of its own of
+ * used bytes and the guard.
+ */
+static struct janas_expert_cache *
+part_create(const struct janas_jns *j, uint32_t first, uint32_t n_layer,
+            uint64_t slot_bytes, size_t n_slots, int level,
+            struct janas_pool *io, uint8_t *arena, uint64_t used, char *err,
+            size_t err_len)
+{
+    size_t n_keys = (size_t)n_layer * j->h.n_expert;
     struct janas_expert_cache *c = calloc(1, sizeof(*c));
     if (!c)
         return NULL;
     c->j = j;
     c->level = level;
+    c->first = first;
+    c->n_layer = n_layer;
     c->io = io;
     c->slot_bytes = slot_bytes;
     c->n_slots = n_slots;
@@ -479,10 +547,11 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
     c->fd = janas_reopen_read(j->fd, 1);
     /* on 2 MB boundaries, for a GPU that imports it (model_load.c
        janas_m_huge_pages) */
-    size_t arena_bytes =
-        (n_slots * slot_bytes + JANAS_ARENA_GUARD + JANAS_HUGE_PAGE - 1) /
-        JANAS_HUGE_PAGE * JANAS_HUGE_PAGE;
-    c->arena = aligned_alloc(JANAS_HUGE_PAGE, arena_bytes);
+    size_t arena_bytes = (used + JANAS_ARENA_GUARD + JANAS_HUGE_PAGE - 1) /
+                         JANAS_HUGE_PAGE * JANAS_HUGE_PAGE;
+    c->arena_foreign = arena != NULL;
+    c->arena =
+        arena ? arena : janas_aligned_alloc(JANAS_HUGE_PAGE, arena_bytes);
     c->where = malloc(n_keys * sizeof(int32_t));
     c->key = malloc(n_slots * sizeof(int64_t));
     c->prev = malloc(n_slots * sizeof(int32_t));
@@ -493,8 +562,8 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
        more than there are layers costs nothing */
     c->lprev = malloc(n_slots * sizeof(int32_t));
     c->lnext = malloc(n_slots * sizeof(int32_t));
-    c->lhead = malloc(((size_t)j->h.n_layer + 1) * sizeof(int32_t));
-    c->ltail = malloc(((size_t)j->h.n_layer + 1) * sizeof(int32_t));
+    c->lhead = malloc(((size_t)n_layer + 1) * sizeof(int32_t));
+    c->ltail = malloc(((size_t)n_layer + 1) * sizeof(int32_t));
     c->pf_flag = calloc(n_slots, 1);
     if (c->fd < 0 || !c->arena || !c->where || !c->key || !c->prev ||
         !c->next || !c->stamp || !c->jobs || !c->lprev || !c->lnext ||
@@ -516,7 +585,8 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
      * gives huge pages where they are free. JANAS_ARENA_HUGE=1 asks for
      * them again.
      */
-    if (getenv("JANAS_ARENA_HUGE") && atoi(getenv("JANAS_ARENA_HUGE")) > 0)
+    if (!arena && getenv("JANAS_ARENA_HUGE") &&
+        atoi(getenv("JANAS_ARENA_HUGE")) > 0)
         madvise(c->arena, arena_bytes, MADV_HUGEPAGE);
     pthread_mutex_init(&c->api_lock, NULL);
     pthread_mutex_init(&c->lock, NULL);
@@ -560,7 +630,7 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
     c->has_coordinator = 1;
     for (size_t k = 0; k < n_keys; k++)
         c->where[k] = NONE;
-    for (uint32_t l = 0; l <= j->h.n_layer; l++)
+    for (uint32_t l = 0; l <= n_layer; l++)
         c->lhead[l] = c->ltail[l] = NONE;
     for (size_t s = 0; s < n_slots; s++) {
         c->key[s] = NONE;
@@ -570,10 +640,58 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
     return c;
 }
 
+struct janas_expert_cache *
+janas_expert_cache_create_split(const struct janas_jns *j, uint32_t n_layer,
+                                uint32_t n_main, uint64_t budget_bytes,
+                                int level, struct janas_pool *io, char *err,
+                                size_t err_len)
+{
+    if (level < 1 || level > 3) {
+        snprintf(err, err_len, "expert level %d out of range", level);
+        return NULL;
+    }
+    struct layout o;
+    clamp_layers(j, &n_layer, &n_main);
+    layout(j, n_layer, n_main, level, budget_bytes, &o);
+    if (o.n_slots < j->h.n_expert_used) {
+        snprintf(err, err_len, "budget below one layer of experts");
+        return NULL;
+    }
+    uint64_t at = (uint64_t)o.n_slots * o.slot;
+    if (!o.n_wide)
+        return part_create(j, 0, n_layer, o.slot, o.n_slots, level, io, NULL,
+                           at, err, err_len);
+    /* the block's slots right after the model's, in the same arena: each a
+       whole number of the model's, they start where one of those would */
+    struct janas_expert_cache *c =
+        part_create(j, 0, n_main, o.slot, o.n_slots, level, io, NULL,
+                    at + (uint64_t)o.n_wide * o.wide_slot, err, err_len);
+    if (!c)
+        return NULL;
+    c->wide = part_create(j, n_main, n_layer, o.wide_slot, o.n_wide, level, io,
+                          c->arena + at, 0, err, err_len);
+    if (!c->wide) {
+        janas_expert_cache_destroy(c);
+        return NULL;
+    }
+    return c;
+}
+
+struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
+                                                     uint64_t budget_bytes,
+                                                     int level,
+                                                     struct janas_pool *io,
+                                                     char *err, size_t err_len)
+{
+    return janas_expert_cache_create_split(j, 0, 0, budget_bytes, level, io,
+                                           err, err_len);
+}
+
 void janas_expert_cache_destroy(struct janas_expert_cache *c)
 {
     if (!c)
         return;
+    janas_expert_cache_destroy(c->wide); /* in this arena: before it goes */
     if (c->has_warmer) { /* it holds the lock only for one batch */
         pthread_mutex_lock(&c->api_lock);
         c->warm_stop = 1;
@@ -605,7 +723,7 @@ void janas_expert_cache_destroy(struct janas_expert_cache *c)
     if (c->fd >= 0)
         close(c->fd);
     if (!c->arena_foreign)
-        free(c->arena);
+        janas_aligned_free(c->arena);
     free(c->where);
     free(c->key);
     free(c->prev);
@@ -704,7 +822,7 @@ static void *warmer_main(void *arg)
 int janas_expert_cache_warm_background(struct janas_expert_cache *c,
                                        const uint32_t *counts)
 {
-    size_t n_keys = (size_t)c->j->h.n_layer * c->j->h.n_expert;
+    size_t n_keys = (size_t)c->n_layer * c->j->h.n_expert;
     if (c->has_warmer)
         return -1;
     c->warm_counts = malloc(n_keys * sizeof(uint32_t));
@@ -741,66 +859,95 @@ int janas_expert_cache_warm_background(struct janas_expert_cache *c,
     return 0;
 }
 
-const uint8_t *janas_expert_cache_resident(struct janas_expert_cache *c,
-                                           uint64_t *bytes, uint64_t *loads)
+/* Something is being read into the part, or about to be (under
+   api_lock). */
+static int part_busy(struct janas_expert_cache *c)
 {
-    size_t total = (size_t)c->j->h.n_layer * c->j->h.n_expert;
+    int busy = c->outstanding || c->pf_n[0] || c->pf_n[1] ||
+               (c->has_warmer && !atomic_load(&c->warm_over));
+    pthread_mutex_lock(&c->lock);
+    busy |= c->pending;
+    pthread_mutex_unlock(&c->lock);
+    return busy;
+}
+
+/* The part holds every expert of its layers, and nothing is being read. */
+static int part_complete(struct janas_expert_cache *c, uint64_t *loads)
+{
+    size_t total = (size_t)(c->n_layer - c->first) * c->j->h.n_expert;
     /* between begin and finish the caller holds api_lock: asked there, the
        answer is no rather than waiting on itself (outstanding is the
        caller's own) */
     if (c->n_slots < total || c->outstanding)
-        return NULL;
+        return 0;
     pthread_mutex_lock(&c->api_lock);
-    int busy = (c->has_warmer && !atomic_load(&c->warm_over)) || c->pf_n[0] ||
-               c->pf_n[1];
-    pthread_mutex_lock(&c->lock);
-    busy |= c->pending;
-    pthread_mutex_unlock(&c->lock);
+    int busy = part_busy(c);
     int full = c->filled >= total;
     *loads = atomic_load(&c->loads);
     pthread_mutex_unlock(&c->api_lock);
-    if (busy || !full)
+    return !busy && full;
+}
+
+const uint8_t *janas_expert_cache_resident(struct janas_expert_cache *c,
+                                           uint64_t *bytes, uint64_t *loads)
+{
+    uint64_t wide_loads = 0;
+    if (c->asked_wide || !part_complete(c, loads) ||
+        (c->wide && !part_complete(c->wide, &wide_loads)))
         return NULL;
-    *bytes = (uint64_t)c->n_slots * c->slot_bytes + JANAS_ARENA_GUARD;
+    *loads += wide_loads;
+    *bytes = arena_used(c) + JANAS_ARENA_GUARD;
     return c->arena;
 }
 
 const uint8_t *janas_expert_cache_arena(const struct janas_expert_cache *c,
                                         uint64_t *bytes)
 {
-    *bytes = (uint64_t)c->n_slots * c->slot_bytes + JANAS_ARENA_GUARD;
+    *bytes = arena_used(c) + JANAS_ARENA_GUARD;
     return c->arena;
 }
 
 int janas_expert_cache_rebase(struct janas_expert_cache *c, uint8_t *arena)
 {
+    struct janas_expert_cache *w = c->wide;
     pthread_mutex_lock(&c->api_lock);
-    int busy = c->outstanding || c->pf_n[0] || c->pf_n[1] ||
-               (c->has_warmer && !atomic_load(&c->warm_over));
-    pthread_mutex_lock(&c->lock);
-    busy |= c->pending;
-    pthread_mutex_unlock(&c->lock);
+    if (w)
+        pthread_mutex_lock(&w->api_lock);
+    int busy = c->asked_wide || part_busy(c) || (w && part_busy(w));
     /* the new memory takes no O_DIRECT reads (a GPU driver's mapping):
-       the file opened again without it, for the loads that may still come */
+       the file opened again without it, for the loads that may still come
+       (the MTP block's slots read through a descriptor of their own) */
     int fd = busy ? -1 : janas_reopen_read(c->j->fd, 0);
-    if (fd < 0) {
+    int wfd = fd >= 0 && w ? janas_reopen_read(c->j->fd, 0) : -1;
+    if (fd < 0 || (w && wfd < 0)) {
+        if (fd >= 0)
+            close(fd);
+        if (w)
+            pthread_mutex_unlock(&w->api_lock);
         pthread_mutex_unlock(&c->api_lock);
         return -1;
     }
-    memcpy(arena, c->arena, c->n_slots * c->slot_bytes);
+    memcpy(arena, c->arena, arena_used(c));
     close(c->fd);
     c->fd = fd;
     if (!c->arena_foreign)
-        free(c->arena);
+        janas_aligned_free(c->arena);
     c->arena = arena;
     c->arena_foreign = 1;
+    if (w) {
+        close(w->fd);
+        w->fd = wfd;
+        w->arena = arena + (size_t)c->n_slots * c->slot_bytes;
+        pthread_mutex_unlock(&w->api_lock);
+    }
     pthread_mutex_unlock(&c->api_lock);
     return 0;
 }
 
 uint64_t janas_expert_cache_loads(const struct janas_expert_cache *c)
 {
-    return atomic_load(&((struct janas_expert_cache *)c)->loads);
+    uint64_t n = atomic_load(&((struct janas_expert_cache *)c)->loads);
+    return c->wide ? n + janas_expert_cache_loads(c->wide) : n;
 }
 
 int janas_expert_cache_warming(const struct janas_expert_cache *c)
@@ -828,7 +975,7 @@ void janas_expert_cache_warm_progress(const struct janas_expert_cache *c,
 int janas_expert_cache_warm(struct janas_expert_cache *c,
                             const uint32_t *counts)
 {
-    size_t n_keys = (size_t)c->j->h.n_layer * c->j->h.n_expert;
+    size_t n_keys = (size_t)c->n_layer * c->j->h.n_expert;
     uint32_t *order = malloc(n_keys * sizeof(uint32_t));
     if (!order)
         return -1;
@@ -890,8 +1037,11 @@ static void pf_settle(struct janas_expert_cache *c, int p)
 int janas_expert_cache_prefetch(struct janas_expert_cache *c, uint32_t layer,
                                 const uint32_t *ids, size_t n, size_t max)
 {
+    if (c->wide && layer >= c->n_layer)
+        return janas_expert_cache_prefetch(c->wide, layer, ids, n, max);
     int p = (int)(layer & 1);
-    if (!c->pf_ring[p] || layer >= c->j->h.n_layer || c->outstanding)
+    if (!c->pf_ring[p] || layer >= c->n_layer || c->outstanding ||
+        c->asked_wide)
         return 0;
     pthread_mutex_lock(&c->api_lock);
     pf_settle(c, p); /* a set left over (its layer never asked) */
@@ -953,7 +1103,15 @@ int janas_expert_cache_begin(struct janas_expert_cache *c, uint32_t layer,
                              const uint32_t *ids, size_t n,
                              const uint8_t **slots, uint8_t *ready)
 {
-    if (layer >= c->j->h.n_layer || n > c->n_slots || n > 256 || c->outstanding)
+    if (c->wide && layer >= c->n_layer) {
+        if (c->outstanding || c->asked_wide)
+            return -1;
+        int rc = janas_expert_cache_begin(c->wide, layer, ids, n, slots, ready);
+        c->asked_wide = rc >= 0;
+        return rc;
+    }
+    if (layer >= c->n_layer || n > c->n_slots || n > 256 || c->outstanding ||
+        c->asked_wide)
         return -1;
     /* held until finish: the background filling waits for its turn */
     pthread_mutex_lock(&c->api_lock);
@@ -1030,18 +1188,26 @@ int janas_expert_cache_begin(struct janas_expert_cache *c, uint32_t layer,
 void janas_expert_cache_present(struct janas_expert_cache *c, uint32_t layer,
                                 const uint32_t *ids, size_t n, uint8_t *in)
 {
+    if (c->wide && layer >= c->n_layer) {
+        janas_expert_cache_present(c->wide, layer, ids, n, in);
+        return;
+    }
     uint32_t ne = c->j->h.n_expert;
     size_t base = (size_t)layer * ne;
     /* the background filling changes the map under this lock */
     pthread_mutex_lock(&c->api_lock);
     for (size_t i = 0; i < n; i++)
-        in[i] = layer < c->j->h.n_layer && ids[i] < ne &&
+        in[i] = layer < c->n_layer && ids[i] < ne &&
                 c->where[base + ids[i]] != NONE;
     pthread_mutex_unlock(&c->api_lock);
 }
 
 int janas_expert_cache_finish(struct janas_expert_cache *c)
 {
+    if (c->asked_wide) {
+        c->asked_wide = 0;
+        return janas_expert_cache_finish(c->wide);
+    }
     double t0 = now();
     int rc = wait_jobs(c);
     if (c->via_ring && c->batch_rc) /* the submission itself failed */
@@ -1070,9 +1236,27 @@ void janas_expert_cache_stats(const struct janas_expert_cache *c,
     pthread_mutex_lock(&m->api_lock);
     *s = c->st;
     pthread_mutex_unlock(&m->api_lock);
+    if (!c->wide)
+        return;
+    /* the MTP block's lookups with the model's, as when they shared the
+       slots: the hit rate stays the one of every request */
+    struct janas_expert_cache_stats w;
+    janas_expert_cache_stats(c->wide, &w);
+    s->requests += w.requests;
+    s->hits += w.hits;
+    s->misses += w.misses;
+    s->bytes_read += w.bytes_read;
+    s->warm_bytes += w.warm_bytes;
+    s->io_seconds += w.io_seconds;
+    s->wait_seconds += w.wait_seconds;
+    s->prefetch_reads += w.prefetch_reads;
+    s->prefetch_used += w.prefetch_used;
+    s->prefetch_bytes += w.prefetch_bytes;
 }
 
 void janas_expert_cache_reset_stats(struct janas_expert_cache *c)
 {
     memset(&c->st, 0, sizeof(c->st));
+    if (c->wide)
+        janas_expert_cache_reset_stats(c->wide);
 }
