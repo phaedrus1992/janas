@@ -4,11 +4,12 @@
  * expert_cache.h - a RAM cache of routed experts over a JNS file.
  *
  * A fixed number of slots, each large enough for the largest expert of the
- * model, lives in one 4 KiB-aligned arena. Replacement is LRU; the cache can
- * be warmed with the experts most used by a prompt (the prefill predicts the
- * decode working set: bozza Fase 0). The misses of a request are read in
- * parallel with O_DIRECT by a pool of I/O threads, and the experts of the
- * request itself are never evicted to make room for each other.
+ * model, lives in one 4 KiB-aligned arena (an MTP block whose experts are
+ * larger than the model's has slots of its own: see create_split). Replacement
+ * is LRU; the cache can be warmed with the experts most used by a prompt (the
+ * prefill predicts the decode working set: bozza Fase 0). The misses of a
+ * request are read in parallel with O_DIRECT by a pool of I/O threads, and the
+ * experts of the request itself are never evicted to make room for each other.
  */
 #ifndef JANAS_LLM_EXPERT_CACHE_H
 #define JANAS_LLM_EXPERT_CACHE_H
@@ -51,10 +52,45 @@ struct janas_expert_cache *janas_expert_cache_create(const struct janas_jns *j,
                                                      struct janas_pool *io,
                                                      char *err, size_t err_len);
 
-/* The bytes of an expert slot this cache holds, at the level it was made. */
+/* The most experts of one layer the engine asks for in one request
+   (model_ffn.c): the fewest slots a part of the cache may have. */
+#define JANAS_EXPERT_CHUNK 128
+
+/*
+ * The same over the file's first n_layer layers (0: all), of which the
+ * first n_main are the model's own and the others an MTP block in the same
+ * file (0: all the model's). Where the block's experts are larger than the
+ * model's - Qwen3.6-35B-A3B's in Q8_0, 3,342,336 bytes against 1,835,008 -
+ * slots all as large as theirs would hold half the experts the budget can
+ * (issue #34), so the block gets slots of its own, in the same arena and
+ * out of the same budget: as many as one request asks for, or all of its
+ * experts when the budget holds every expert of both. Its slots are whole
+ * multiples of the model's, so the arena is still cut in slots of the
+ * model's size wherever a GPU imports it. Only where that holds more
+ * experts than one size for all; otherwise, and where the block's experts
+ * are no larger, the cache is the one of janas_expert_cache_create.
+ * Requests, reads ahead and questions for the block's layers go to its
+ * slots; the counts of janas_expert_cache_stats and _loads are of both,
+ * _slots and _slot_bytes the model's, and the filling (warm) is of the
+ * model's layers alone - the block's few slots fill as it asks.
+ */
+struct janas_expert_cache *
+janas_expert_cache_create_split(const struct janas_jns *j, uint32_t n_layer,
+                                uint32_t n_main, uint64_t budget_bytes,
+                                int level, struct janas_pool *io, char *err,
+                                size_t err_len);
+
+/* The bytes of slots create_split takes to hold every expert of those
+   layers at that level: the most a budget for them is worth. */
+uint64_t janas_expert_cache_room(const struct janas_jns *j, uint32_t n_layer,
+                                 uint32_t n_main, int level);
+
+/* The bytes of an expert slot this cache holds, at the level it was made
+   (of the model's layers, with an MTP block apart). */
 uint64_t janas_expert_cache_slot_bytes(const struct janas_expert_cache *c);
 void janas_expert_cache_destroy(struct janas_expert_cache *c);
 
+/* Its slots (for the model's layers, with an MTP block apart). */
 size_t janas_expert_cache_slots(const struct janas_expert_cache *c);
 
 /*
@@ -78,17 +114,18 @@ const uint8_t *janas_expert_cache_arena(const struct janas_expert_cache *c,
                                         uint64_t *bytes);
 uint64_t janas_expert_cache_loads(const struct janas_expert_cache *c);
 /*
- * The arena moved to arena (n_slots x slot bytes and the guard, owned by the
- * caller, not freed here), its contents copied, the file read without O_DIRECT
- * from then on: for memory a GPU's driver allocated, which it reads faster than
- * imported pages. Only when nothing is being read (as _resident); 0, or -1 with
- * nothing changed.
+ * The arena moved to arena (the bytes _arena gives, guard included, owned by
+ * the caller, not freed here), its contents copied, the file read without
+ * O_DIRECT from then on: for memory a GPU's driver allocated, which it reads
+ * faster than imported pages. Only when nothing is being read (as _resident);
+ * 0, or -1 with nothing changed.
  */
 int janas_expert_cache_rebase(struct janas_expert_cache *c, uint8_t *arena);
 
 /*
  * Loads up to the cache capacity the experts with the highest counts
- * (counts has n_layer * n_expert entries, layer-major; zero means never).
+ * (counts has n_layer * n_expert entries, layer-major; zero means never;
+ * those of an MTP block with slots apart are not read).
  * The most frequent end up most recently used. Returns 0 or -1 on I/O error.
  */
 int janas_expert_cache_warm(struct janas_expert_cache *c,

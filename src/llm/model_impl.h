@@ -20,6 +20,7 @@
 #include "gpu.h"
 #include "gpu_token.h"
 #include "jns.h"
+#include "jmath.h"
 #include "quant.h"
 #include "tuner.h"
 
@@ -365,7 +366,7 @@ static inline void rms_norm(float *out, const float *x, const float *w,
 
 static inline float sigmoid(float x)
 {
-    return 1.0f / (1.0f + expf(-x));
+    return 1.0f / (1.0f + janas_expf(-x));
 }
 
 /*

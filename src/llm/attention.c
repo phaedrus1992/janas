@@ -15,6 +15,7 @@
 #include <immintrin.h>
 #endif
 
+#include "jmath.h"
 #include "quant.h"
 #include "vmath.h"
 
@@ -550,7 +551,7 @@ static float att_weights_ref(float *row, uint32_t nt, uint32_t vis, float *mx)
             m = row[t];
     for (uint32_t t = 0; t < nt; t++) {
         float d = row[t] - m;
-        row[t] = t >= vis || d < -80.0f ? 0.0f : expf(d);
+        row[t] = t >= vis || d < -80.0f ? 0.0f : janas_exp_det(d);
         sum[t % 8] += row[t];
     }
     *mx = m;
@@ -861,7 +862,7 @@ static void merge_one(struct attn_job *a, uint32_t j, uint32_t h)
     memset(out, 0, hd * sizeof(float));
     for (uint32_t c = a->c0; c < nc; c++) {
         const float *pm = att_partial(A, kvh, c, j, g);
-        float w = expf(pm[0] - mx);
+        float w = janas_expf(pm[0] - mx);
         sum += w * pm[1];
         janas_axpy_f32(out, w, pm + 2, hd);
     }

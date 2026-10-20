@@ -198,8 +198,9 @@ struct expert_run {
 /* Experts are asked of the cache and computed a chunk at a time: 128, a
    layer of Qwen3-30B-A3B at once - in chunks of 64 the GPU got half a
    layer's experts per launch, and ran them at 340 GMAC/s instead of 420
-   (9 Oct 2026). */
-#define EXPERT_CHUNK 128
+   (9 Oct 2026). The cache gives an MTP block's slots of their own room for
+   one chunk. */
+#define EXPERT_CHUNK JANAS_EXPERT_CHUNK
 #define MAX_RUNS (EXPERT_CHUNK + 1) /* a chunk and the shared expert */
 
 #define EX_T(v, code)                                                          \
@@ -368,7 +369,7 @@ static void route_tok(struct janas_llm_model *m, uint32_t j)
         if (r[e] > mx)
             mx = r[e];
     for (uint32_t e = 0; e < ne; e++) {
-        r[e] = expf(r[e] - mx);
+        r[e] = janas_expf(r[e] - mx);
         sum += r[e];
     }
     float wsum = 0.0f;

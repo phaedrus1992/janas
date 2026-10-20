@@ -58,7 +58,7 @@ static void conv_head_ref(struct janas_llm_model *m, const float *wt,
             float s = 0.0f;
             for (uint32_t i = 0; i < dc; i++)
                 s += win[i] * wt[(size_t)i * cc + c];
-            m->conv_out[(size_t)t * cc + c] = s / (1.0f + expf(-s));
+            m->conv_out[(size_t)t * cc + c] = s / (1.0f + janas_expf(-s));
             for (uint32_t i = 0; i + 1 < dc; i++)
                 win[i] = win[i + 1];
         }
@@ -239,7 +239,7 @@ static void gate_worker(void *arg, int tid, int n_threads)
 #endif
         rms_norm(o, o, w, ds, m->eps);
         for (uint32_t i = 0; i < ds; i++)
-            o[i] *= z[i] / (1.0f + expf(-z[i]));
+            o[i] *= z[i] / (1.0f + janas_expf(-z[i]));
     }
 }
 
@@ -345,9 +345,9 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
             memcpy(mx, src, (size_t)cc * sizeof(float));
             for (uint32_t h = 0; h < nv; h++) {
                 float al = b[nv + h] + dt[h];
-                float sp = al > 20.0f ? al : log1pf(expf(al));
+                float sp = al > 20.0f ? al : janas_softplusf(al);
                 m->beta[(size_t)(a + j) * nv + h] = sigmoid(b[h]);
-                m->decay[(size_t)(a + j) * nv + h] = expf(sp * A[h]);
+                m->decay[(size_t)(a + j) * nv + h] = janas_expf(sp * A[h]);
             }
             continue;
         }
@@ -364,9 +364,9 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
             for (uint32_t r = 0; r < rf; r++) {
                 uint32_t h = g * rf + r;
                 float al = b[2 * g * rf + rf + r] + dt[h];
-                float sp = al > 20.0f ? al : log1pf(expf(al));
+                float sp = al > 20.0f ? al : janas_softplusf(al);
                 m->beta[(size_t)(a + j) * nv + h] = sigmoid(b[2 * g * rf + r]);
-                m->decay[(size_t)(a + j) * nv + h] = expf(sp * A[h]);
+                m->decay[(size_t)(a + j) * nv + h] = janas_expf(sp * A[h]);
             }
         }
     }
