@@ -62,6 +62,9 @@ Output
   under src/ goes into the library. The release build
   also links libjanas_llm.so and libjanas_mcp.so, which export the public
   APIs of include/janas/llm.h and include/janas/mcp.h and nothing else.
+  On Linux src/node/ becomes janas.node, the module for Node.js, with the
+  library inside (janas-<variant>.node for the other variants), and its
+  TypeScript declarations, janas.d.ts, beside it.
 
 Environment
   CC            the compiler, gcc by default
@@ -201,13 +204,14 @@ clean()
 {
     rm -rf "$OBJ"
     if [ -n "$SUFFIX" ]; then
-        rm -f "$BIN"/*"$SUFFIX"
+        rm -f "$BIN"/*"$SUFFIX" "$BIN"/*"$SUFFIX".node
         return
     fi
     for f in "$BIN"/*; do
         [ -e "$f" ] || continue
         case "$f" in
         *-debug | *-asan | *-ubsan | *-tsan) continue ;;
+        *-debug.node | *-asan.node | *-ubsan.node | *-tsan.node) continue ;;
         esac
         rm -f "$f"
     done
@@ -456,10 +460,11 @@ flags=$(tp_flags mbedtls) || exit 2
 MBEDTLS_INC=($flags)
 
 # A directory with a main.c is a program: its other .c files are its own.
-# Every other .c under src/ goes into the library.
+# Every other .c under src/ goes into the library, but the module for
+# Node.js (src/node/), which is linked on its own below.
 tool_dirs=$(for m in src/*/main.c src/services/*/main.c; do dirname "$m"; done)
 lib_list=$(sources src/ find src -name '*.c' ! -name main.c ! -name win_start.c \
-    ! -path 'src/third_party/*') || exit 2
+    ! -path 'src/third_party/*' ! -path 'src/node/*') || exit 2
 objs=()
 while IFS= read -r src; do
     grep -qx "$(dirname "$src")" <<<"$tool_dirs" && continue
@@ -515,6 +520,38 @@ if [ "$VARIANT" = release ]; then
             "$OBJ/libjanas_third.a" "${LDLIBS[@]}" -o "$BIN/libjanas_mcp.so"
     fi
 fi
+# The module for Node.js: its own files and the library, in one janas.node
+# that Node loads. The functions of Node-API are the node process's, so they
+# stay undefined here - and only they: in release anything else undefined
+# stops the build, as --no-undefined does for the libraries above. Linux
+# only, for now: on Windows they would come from node.exe's import library.
+if [ "$OS" != windows ]; then
+    node_objs=()
+    node_list=$(sources src/node find src/node -maxdepth 1 -name '*.c') || exit 2
+    while IFS= read -r c; do
+        obj=$(objname "$c")
+        node_objs+=("$obj")
+        compile "$c" "$obj" "${CFLAGS[@]}"
+    done < <(sort <<<"$node_list")
+    addon="$BIN/janas$SUFFIX.node"
+    echo "LD  $addon"
+    "$CC" "${CFLAGS[@]}" -shared "${node_objs[@]}" "$OBJ/libjanas.a" \
+        "${LDLIBS[@]}" -o "$addon"
+    if [ "$VARIANT" = release ]; then
+        if ! missing=$(nm -D --undefined-only "$addon" |
+            awk '$1 == "U" && $2 !~ /@/ && $2 !~ /^napi_/ { print $2 }'); then
+            echo "build.sh: cannot list what $addon needs (nm)" >&2
+            exit 2
+        fi
+        if [ -n "$missing" ]; then
+            echo "build.sh: $addon needs what it does not have:" $missing >&2
+            exit 2
+        fi
+    fi
+    [ "$BIN/janas.d.ts" -nt src/node/janas.d.ts ] ||
+        cp src/node/janas.d.ts "$BIN/janas.d.ts"
+fi
+
 THIRD=()
 [ -f "$OBJ/libjanas_third.a" ] && THIRD=("$OBJ/libjanas_third.a")
 # Windows: every program starts with the console made ready for UTF-8 and

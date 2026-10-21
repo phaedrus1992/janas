@@ -1,6 +1,6 @@
 # Using it from a program
 
-The library is shaped for foreign-function interfaces from the start: opaque handles, fixed-width types, nothing passed by value that is not a number, parameter blocks that carry their own size, error codes as `int32`, and reply text returned on request as whole UTF-8 characters. It is declared for **C** and for **FreeBASIC**.
+The library is shaped for foreign-function interfaces from the start: opaque handles, fixed-width types, nothing passed by value that is not a number, parameter blocks that carry their own size, error codes as `int32`, and reply text returned on request as whole UTF-8 characters. It is declared for **C** and for **FreeBASIC**, and it is a module for **Node.js** too, with its types for TypeScript.
 
 ## From C
 
@@ -62,6 +62,28 @@ echo "Hello! Introduce yourself." | LD_LIBRARY_PATH=bin/x86_64-linux ./janas-cha
 ```
 
 Two things to know. FreeBASIC does not tell names apart by their case, so the constant the C header calls `JANAS_LLM_ABI_VERSION` is `JANAS_LLM_ABI` there — it would otherwise collide with the function `janas_llm_abi_version()`. And its `line input` reads the terminal, not the standard input: to work in a pipe too, `chat.bas` asks `isatty` and reads a pipe through the `CONS` device.
+
+## From Node.js
+
+`janas.node` is the library as a module for Node.js, made by `./build.sh` on Linux beside the programs (`bin/x86_64-linux/janas.node`), with its types for TypeScript beside it (`janas.d.ts`). It is written in C against Node-API, version 8, whose functions it declares itself: building it needs nothing of Node's. It was tried with Node 20. Each model runs on a thread of its own, so JavaScript's thread never waits for it, and a reply is read as it is written:
+
+```ts
+import { createRequire } from "node:module";
+import type * as Janas from "./janas.js"; // janas.d.ts
+
+const janas = createRequire(import.meta.url)("./janas.node") as typeof Janas;
+const model = await janas.open("qwen3-next.jns", { context: 8192 });
+const chat = await model.chat({ thinking: false });
+for await (const piece of chat.send("Hello! Introduce yourself."))
+    if (piece.type === "text") process.stdout.write(piece.text);
+await model.close();
+```
+
+A piece is the model's text (`reasoning` says whether it is its reasoning or its answer), or, while a long prompt is read, how much of it is (`type: "progress"`, `read` of `total` tokens). `chat.load(messages)` takes a whole conversation, as a server gets it from its client; what it shares with the conversation already computed is not read again. A reply stops when the loop is left (`break`, `return`, an exception), with `reply.stop()`, or with an `AbortSignal` given as `{ signal }` - the client of a request gone. `reply.text()` gives the whole answer, its reasoning left out, and `reply.stats()` the counters (tokens, seconds, how much of the prompt was already read, why it ended). A model holds one conversation, and one chat: replies asked for while another is written wait for it, in order. `model.status()` says, without waiting for the engine, how the expert cache fills and the NPU is made ready. Wrong arguments throw a `TypeError` that names them; what fails in the engine rejects with an `Error` whose `code` says what (`EOPEN`, `EBUSY`, `EFULL`, ...: the suffixes of the library's `JANAS_LLM_E...`). An idle model does not keep Node running, and a model left open is closed when Node leaves.
+
+What has been run: `tests/test_node`, among the tests `./build.sh test` runs (the module without a model: its classes, its errors, engine threads started and ended), and `tests/node_check` on Qwen3-0.6B: the replies through Node the same text, byte for byte, as the library's own in C, streamed and read whole, after a reset and in a new chat; a reply stopped by leaving the loop, by a signal fired and by one aborted before; two replies asked at once; a prompt of several blocks; reasoning on and off; closing twice; a model left open when Node leaves. Both also under AddressSanitizer and ThreadSanitizer, the sanitizer's runtime preloaded into node. The module is not built for Windows yet.
+
+[`examples/node-chat`](../examples/node-chat/README.md) is a chat in TypeScript on it, server and page: the model inside the server's process, its replies streamed to the browser as they are written, the types of what goes between the two shared by both sides.
 
 ## MCP servers from a program
 

@@ -191,7 +191,8 @@ sudo pacman -S vulkan-headers glslang vulkan-tools           # the same, Arch
 - [docs/features.md](docs/features.md) — what Janas-LLM runs today, model by model and feature by feature
 - [docs/models.md](docs/models.md) — getting a model: `janas-get`, or a GGUF file converted, and which files were checked
 - [docs/chat.md](docs/chat.md) — `janas-chat`: its options and commands, the drafts, Janas's services, tools from MCP servers, a long prompt watched as it is read
-- [docs/library.md](docs/library.md) — using it from a program, in C or in FreeBASIC and BASIC MODERN, and MCP servers from a program
+- [docs/library.md](docs/library.md) — using it from a program, in C, in FreeBASIC and BASIC MODERN, or in Node.js and TypeScript, and MCP servers from a program
+- [examples/node-chat](examples/node-chat/README.md) — a chat in TypeScript on the module for Node.js: the model inside the server's process, its replies streamed to the browser
 - [docs/serving.md](docs/serving.md) — the model as tools for Claude Code, editors and other MCP clients (`janas-mcp`), and over HTTP, an API that follows OpenAI's with a chat page to try it from a browser (`janas-server`)
 - [docs/code-completion.md](docs/code-completion.md) — code filled in at an editor's cursor, in VSCodium and VS Code through `janas-server`: 1.5-2.2 s a proposal on a laptop, where a window slid a line was read again in 17 s
 - [docs/tools.md](docs/tools.md) — the converters, checkers and benchmarks built beside the programs
