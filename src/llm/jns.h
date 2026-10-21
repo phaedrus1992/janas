@@ -30,8 +30,11 @@
  * JANAS_JNS_ALIGN: reading only the first level_bytes[0] of the slot gives
  * two bits per weight of the down matrix, level_bytes[1] four, the whole slot
  * the six of Q6_K, bit for bit. A machine short of memory reads the prefix it
- * can afford, out of the same file. Version 2 files are read as if their
- * three levels were all the whole slot.
+ * can afford, out of the same file. The down matrix by neuron
+ * (JANAS_Q6_K_PN, tools/jns_neurons.c), its rows the neurons, keeps the same
+ * three planes and levels, a float per output channel before its base
+ * plane (counted in its bytes). Version 2 files are read as if their three
+ * levels were all the whole slot.
  *
  * Sizes are stored, never derived from products of fields read from the
  * file; the reader checks every offset and length against the file size with

@@ -394,11 +394,14 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
        it depends on the cache, not on the configuration */
     struct janas_expert_cache_stats c0, c1;
     janas_expert_cache_stats(m->cache, &c0);
-    double t0 = now();
+    double k0 = janas_llm_model_npu_compile_seconds(m), t0 = now();
     int r = forward(m, tokens, n, pos0, logits, all_logits);
     double dt = now() - t0;
+    janas_m_npu_pass_end(m);
     janas_expert_cache_stats(m->cache, &c1);
     dt -= c1.wait_seconds - c0.wait_seconds;
+    /* nor the NPU's first compilation of a matrix: once a session */
+    dt -= janas_llm_model_npu_compile_seconds(m) - k0;
     /* while the cache is still filling in the background, passes are not
        representative: neither the tuner nor the draft planner may learn
        from them, or a slow start decides the whole session */
@@ -459,7 +462,11 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     set_rope(m, n, pos0);
     /* a token (or, with JANAS_GPU_BLOCK=1, a block) on the GPU, whole,
        where it can (model_gpu.c) */
-    int gpu = logits ? janas_m_gpu_token(m, pos0, n, all_logits, logits) : -1;
+    /* not where the NPU takes this pass's products: then the block goes
+       product by product, the NPU's to it, the others as before */
+    int gpu = logits && !janas_m_npu_takes(m, n)
+                  ? janas_m_gpu_token(m, pos0, n, all_logits, logits)
+                  : -1;
     if (gpu == -2)
         return -1; /* the GPU failed after replaying on the base in place:
                       no state to go on from (base_pos stays invalid) */
@@ -477,9 +484,18 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
         }
         return 0;
     }
-    for (uint32_t l = 0; l < m->n_layer; l++) {
+    /* a dense block's first layers on the NPU, graph by graph, as many as
+       it holds (model_npu.c); the others here */
+    int npu_layers = janas_m_npu_layers(m, n, pos0);
+    if (npu_layers == -2)
+        return -1; /* the NPU failed halfway: no state to go on from */
+    for (uint32_t l = npu_layers > 0 ? (uint32_t)npu_layers : 0; l < m->n_layer;
+         l++) {
+        m->ana_layer = l; /* the Ana-Net probe's row */
         const struct layer *ly = &m->layers[l];
         janas_m_norm_quant(m, f32(m, ly->attn_norm), 0, n);
+        if (m->npu) /* the NPU's calibration (JANAS_NPU_A8=1) */
+            janas_m_npu_calib(m, 3, l, m->xn, n, dm, dm);
         trace_row(m, "attn_norm", m->xn + (size_t)(n - 1) * dm, dm);
         if (ly->rec)
             janas_m_rec_layer(m, ly, n);
@@ -496,6 +512,8 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
         else if (m->pfb_on && n >= PFB_MIN_N && l + 1 < m->n_layer)
             janas_m_prefetch_block(m, l, n);
         janas_m_norm_quant(m, f32(m, ly->ffn_norm), 0, n);
+        if (m->npu)
+            janas_m_npu_calib(m, 1, l, m->xn, n, dm, dm);
         trace_row(m, "post_norm", m->xn + (size_t)(n - 1) * dm, dm);
         if (ly->post_ffn) {
             /* the FFN's output normalized before the residual: summed
@@ -503,7 +521,10 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
             memcpy(m->xres, m->x, (size_t)n * dm * sizeof(float));
             memset(m->x, 0, (size_t)n * dm * sizeof(float));
         }
-        if (ly->pre_norm2) {
+        janas_m_janet_rec(m, l, n, 0); /* the Janet probe (model_janet.c) */
+        if (janas_m_janet_ffn(m, l, n)) {
+            /* Janet's detectors in place of the layer's feed-forward */
+        } else if (ly->pre_norm2) {
             /* Gemma 4's mixture: the dense branch on xn / xq as normed
                above, then the experts' branch */
             size_t bytes = (size_t)n * dm * sizeof(float);
@@ -523,6 +544,7 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
                                      MOE_ALL) != 0) {
             return -1;
         }
+        janas_m_janet_rec(m, l, n, 1);
         if (ly->post_ffn) {
             struct tok_job st = {
                 .m = m, .ly = ly, .w = f32(m, ly->post_ffn), .n = n};
@@ -547,7 +569,8 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
                     l, sqrt(nn), v[0], v[1], v[2], v[3]);
         }
     }
-    m->ring_hi = pos0 + n; /* the rings hold up to here */
+    janas_m_ana_frame(m, n); /* the Ana-Net probe's picture */
+    m->ring_hi = pos0 + n;   /* the rings hold up to here */
     double td = now();
     uint32_t first = all_logits ? 0 : n - 1;
     /* with an MTP block, every token's final hidden state is kept for it */
@@ -563,7 +586,7 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
                                    .cols = dm,
                                    .n_vec = n - first};
     if (logits) /* without: the hidden states alone, an embedding */
-        janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &to, 1);
+        janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
     if (logits && m->softcap > 0.0f) {
         struct tok_job sc = {.m = m, .n = n - first, .out = logits};
         janas_pool_run(m->compute, softcap_worker, &sc);
@@ -687,7 +710,7 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
                                   .y = m->dh_logits,
                                   .rows = m->dh_n,
                                   .cols = m->d_model};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &t, 1);
+    janas_m_products(m, janas_m_gpu(m, 0), &t, 1);
     /* the best row and its softmax probability within the head */
     float *l = m->dh_logits, mx = l[0];
     uint32_t best = 0;
@@ -748,7 +771,7 @@ int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
                                    .rows = dm,
                                    .cols = 2 * dm,
                                    .n_vec = n};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &tp, 1);
+    janas_m_products(m, janas_m_gpu(m, 0), &tp, 1);
     m->phase[JANAS_PH_QKV] += now() - ta;
     set_rope(m, n, pos0);
     for (uint32_t j = 0; j < n; j++) {
@@ -784,7 +807,7 @@ int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
                                    .rows = m->n_vocab,
                                    .cols = dm,
                                    .n_vec = n - first};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &to, 1);
+    janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
     m->phase[JANAS_PH_OUTPUT] += now() - td;
     return 0;
 }

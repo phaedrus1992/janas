@@ -739,8 +739,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
        12288): the buffers take the widest */
     for (uint32_t l = 0; l < m->n_layer; l++) {
         uint32_t r = m->j.layers[l].m[JANAS_JNS_GATE].rows;
+        const struct janas_jns_matrix *dn = &m->j.layers[l].m[JANAS_JNS_DOWN];
+        /* by neuron (tools/jns_neurons.c), its rows are the gate's */
+        int by_neuron = dn->type == JANAS_Q6_K_PN;
         if ((r != m->d_ff && m->n_expert > 1) || r % JANAS_QK ||
-            m->j.layers[l].m[JANAS_JNS_DOWN].rows != m->d_model) {
+            (by_neuron ? dn->rows != r || dn->cols != m->d_model
+                       : dn->rows != m->d_model)) {
             snprintf(err, err_len, "layer %u: expert shapes differ", l);
             goto fail;
         }
@@ -1027,6 +1031,18 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     m->gate = out_alloc(m, P * ff * sizeof(float));
     m->up = out_alloc(m, P * ff * sizeof(float));
     m->h = malloc(P * ff * sizeof(float));
+    if (janas_m_ana_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the Ana-Net probe");
+        goto fail;
+    }
+    if (janas_m_janet_init(m) != 0) {
+        snprintf(err, err_len, "the Janet probe could not start");
+        goto fail;
+    }
+    if (janas_m_neurons_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the neurons' levels");
+        goto fail;
+    }
     m->dout = out_alloc(m, P * dm * sizeof(float));
     m->xg = malloc(P * dm / JANAS_QK * sizeof(*m->xg));
     m->hq = malloc(P * ff / JANAS_QK * sizeof(*m->hq));
@@ -1320,6 +1336,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             for (int i = 0; i < m->n_out; i++)
                 janas_gpu_import(m->gpu, m->out[i].p, m->out[i].bytes);
     }
+    if (o->no_npu)
+        snprintf(m->npu_why, sizeof m->npu_why,
+                 "left off: the expert cache needs the memory its copies "
+                 "would take (--prompt-on npu asks for it)");
+    else
+        janas_m_npu_open(m);
     janas_m_init_tuner(m);
     return m;
 
@@ -1352,6 +1374,7 @@ void janas_llm_model_free(struct janas_llm_model *m)
         free(m->use_count);
         m->use_count = NULL;
     }
+    janas_m_npu_close(m);
     janas_gpu_tok_destroy(m->gpu, m->gtok);
     free(m->gtok_layers);
     free(m->gblk_layers);
@@ -1403,6 +1426,9 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->xres);
     free(m->xbr);
     free(m->hlen);
+    janas_m_ana_free(m);
+    janas_m_janet_free(m);
+    janas_m_neurons_free(m);
     free(m->xq);
     free(m->attq);
     free(m->pair_tok);
@@ -1767,6 +1793,11 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
                     in_place ? " (in place)" : "");
     } else {
         m->arena_gpu = -1; /* no room for it: the CPU goes on alone */
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr,
+                    "arena: %.1f GB not imported: the experts stay "
+                    "on the CPU\n",
+                    bytes / 1e9);
     }
 }
 

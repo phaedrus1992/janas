@@ -18,6 +18,8 @@
 
 #include "model_impl.h"
 
+#include "expert_cache.h"
+
 struct janas_llm_state {
     uint32_t n;       /* positions 0 .. n - 1 */
     uint32_t n_slots; /* KV slots (attention layers, the MTP block's) */
@@ -406,4 +408,19 @@ struct janas_llm_state *janas_llm_state_read(const struct janas_llm_model *m,
         return NULL;
     }
     return st;
+}
+
+void janas_llm_model_memory(const struct janas_llm_model *m, uint64_t *resident,
+                            uint64_t *cache, uint64_t *kv)
+{
+    uint64_t r = m->j.h.resident_bytes;
+    if (m->ple_tok && m->ple_tok->offset >= m->j.h.resident_offset &&
+        m->ple_tok->bytes < r)
+        r -= m->ple_tok->bytes;
+    uint64_t c = 0;
+    if (m->cache)
+        janas_expert_cache_arena(m->cache, &c);
+    *resident = r;
+    *cache = c;
+    *kv = 2 * ((uint64_t)m->kv_bytes + m->ks_bytes);
 }

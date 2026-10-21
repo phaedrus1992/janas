@@ -18,6 +18,7 @@
 #include "common/pool.h"
 #include "common/sysinfo.h"
 #include "deltanet.h"
+#include "common/devices.h"
 #include "tuner.h"
 #include "gpu.h"
 #include "matvec.h"
@@ -25,6 +26,78 @@
 #include "vmath.h"
 
 #include "model_impl.h"
+
+/* a mask's combinations without the NPU: what they are in the passes it
+   does not take */
+static int without_npu(int mask)
+{
+    int out = 0;
+    for (int c = 0; c < JANAS_DEV_COMBOS; c++)
+        if (mask >> c & 1)
+            out |= 1 << (c & ~JANAS_DEV_NPU);
+    return out;
+}
+
+/*
+ * The user's devices for each kind of pass (--prompt-on, --drafts-on,
+ * --reply-on; common/devices.h), in on[] in the order of
+ * janas_devices_vars, as far as this machine has them and the pass can use
+ * them. The NPU takes blocks only (JANAS_TUNE_BLOCK tokens and more): for
+ * the other passes a combination with it is the rest of it, said where it
+ * was asked for those passes alone. Prompts kept off the GPU keep its fast
+ * prompt off them too; replies asked of it give it single tokens, which an
+ * integrated one does not take by default. A device that is not here: the
+ * engine chooses, and says why.
+ */
+static void user_devices(struct janas_llm_model *m, int on[])
+{
+    static const char *const what[JANAS_DEVICES_OPTIONS] = {"prompts", "drafts",
+                                                            "replies"};
+    int gpu_here = m->gpu && !m->gpu_off,
+        have = 1 | (gpu_here ? 1 << JANAS_DEV_GPU : 0) |
+               (m->npu ? 1 << JANAS_DEV_NPU : 0) |
+               (gpu_here && m->npu ? 1 << (JANAS_DEV_GPU | JANAS_DEV_NPU) : 0);
+    for (int k = 0; k < JANAS_DEVICES_OPTIONS; k++) {
+        const char *var = janas_devices_vars[k];
+        char why[200], nm[64];
+        int mask = janas_devices_mask(getenv(var), why, sizeof why), asked = 0;
+        if (mask < 0) {
+            fprintf(stderr, "janas: %s: %s; the engine chooses\n", var, why);
+            mask = 0;
+        }
+        for (int c = 0; c < JANAS_DEV_COMBOS; c++)
+            asked |= mask >> c & 1 ? c : 0;
+        janas_devices_name(mask, nm, sizeof nm);
+        if (mask && !(mask & have)) {
+            fprintf(stderr,
+                    "janas: %s=%s: not on this machine; the engine chooses\n",
+                    var, nm);
+            if (asked & JANAS_DEV_GPU && !gpu_here)
+                fprintf(stderr, "janas:   GPU: %s\n",
+                        m->gpu ? "it cannot share the model's memory"
+                               : m->gpu_why);
+            if (asked & JANAS_DEV_NPU && !m->npu)
+                fprintf(stderr, "janas:   NPU: %s\n", m->npu_why);
+            mask = 0;
+        }
+        mask &= mask ? have : 0;
+        if (k > 0 && asked & JANAS_DEV_NPU && mask) {
+            char rest[64];
+            mask = without_npu(mask);
+            janas_devices_name(mask, rest, sizeof rest);
+            fprintf(stderr,
+                    "janas: %s=%s: the NPU takes passes of %d tokens and more "
+                    "only; %s on %s\n",
+                    var, nm, JANAS_TUNE_BLOCK, what[k], rest);
+        }
+        on[k] = mask;
+    }
+    m->prompts_off_gpu =
+        on[0] &&
+        !(on[0] & (1 << JANAS_DEV_GPU | 1 << (JANAS_DEV_GPU | JANAS_DEV_NPU)));
+    if (on[2] >> JANAS_DEV_GPU & 1 && janas_gpu_min_n(m->gpu) > 1)
+        janas_gpu_set_min_n(m->gpu, 1);
+}
 
 /*
  * The tuner's candidates: every usable core - the performance cores with
@@ -55,17 +128,24 @@ void janas_m_init_tuner(struct janas_llm_model *m)
     int block = bt && atoi(bt) > 0 ? atoi(bt) : m->all_threads;
     if (block > m->all_threads)
         block = m->all_threads;
-    for (int gpu = 0; gpu <= (m->gpu && !m->gpu_off ? 1 : 0); gpu++)
-        for (int i = 0; i < n_opts; i++) {
-            int dup = 0;
-            for (int k = 0; k < n; k++)
-                dup |= c[k].threads == opts[i] && c[k].gpu == gpu;
-            if (!dup && n < JANAS_TUNE_MAX_CANDS)
-                c[n++] =
-                    (struct janas_tune_cand){.threads = opts[i], .gpu = gpu};
-        }
+    /* with an NPU every candidate with it too, for blocks only (tuner.c):
+       the defaults stay without, unless the user asks for it */
+    for (int npu = 0; npu <= (m->npu ? 1 : 0); npu++)
+        for (int gpu = 0; gpu <= (m->gpu && !m->gpu_off ? 1 : 0); gpu++)
+            for (int i = 0; i < n_opts; i++) {
+                int dup = 0;
+                for (int k = 0; k < n; k++)
+                    dup |= c[k].threads == opts[i] && c[k].gpu == gpu &&
+                           c[k].npu == npu;
+                if (!dup && n < JANAS_TUNE_MAX_CANDS)
+                    c[n++] = (struct janas_tune_cand){
+                        .threads = opts[i], .gpu = gpu, .npu = npu};
+            }
+    int on[JANAS_DEVICES_OPTIONS];
+    user_devices(m, on);
+    memcpy(m->dev_on, on, sizeof m->dev_on);
     int def[JANAS_TUNE_CLASSES] = {0, 0, 0, 0};
-    for (int k = 0; k < n; k++) {
+    for (int k = 0; k < n && !c[k].npu; k++) {
         if (!c[k].gpu && c[k].threads == m->all_threads)
             def[0] = k;
         if (!c[k].gpu && c[k].threads == block)
@@ -79,26 +159,56 @@ void janas_m_init_tuner(struct janas_llm_model *m)
        of 12 models the fastest blocks were on 6 or 12 threads 11 times,
        Qwen3.5-2B 318 tokens/s on 6 and 309 on 12 against 272 on 20 (10 Oct
        2026) */
-    int fast = m->gpu && !m->gpu_off && janas_gpu_fast_prompt() && !bt;
-    if (fast)
+    /* the same with the NPU asked for blocks: it computes nearly all of
+       one too (Qwen3-4B in whole layers, the threads spinning while they
+       waited: 270.6 tokens/s on 6 threads, 262.0 on 12, 252.1 on 20; once
+       they slept, 325.5 on 6 and 320.4 on 12; 20 Oct 2026) */
+    int fast = m->gpu && !m->gpu_off && janas_gpu_fast_prompt() && !bt &&
+               !m->prompts_off_gpu,
+        npu_asked =
+            on[0] & (1 << JANAS_DEV_NPU | 1 << (JANAS_DEV_GPU | JANAS_DEV_NPU));
+    if (fast || (npu_asked && !bt))
         for (int k = 0; k < n; k++)
-            if (!c[k].gpu && c[k].threads == m->p_threads)
+            if (!c[k].gpu && !c[k].npu && c[k].threads == m->p_threads)
                 def[2] = k;
     const char *ga = getenv("JANAS_GPU_ALWAYS");
     if (ga && atoi(ga) > 0)
         for (int k = 0; k < n; k++)
-            if (c[k].gpu && c[k].threads == block)
+            if (c[k].gpu && !c[k].npu && c[k].threads == block)
                 def[1] = def[2] = def[3] = k;
+    /* JANAS_NPU_ALWAYS=1: the blocks' default with the NPU (tests: with
+       JANAS_TUNE=0 every block then runs with it) */
+    const char *na = getenv("JANAS_NPU_ALWAYS");
+    if (na && atoi(na) > 0 && m->npu)
+        for (int k = 0; k < n; k++)
+            if (c[k].npu && c[k].threads == c[def[2]].threads &&
+                c[k].gpu == c[def[2]].gpu) {
+                def[2] = k;
+                break;
+            }
     if (bt && block != c[def[1]].threads && n < JANAS_TUNE_MAX_CANDS) {
         c[n] = (struct janas_tune_cand){.threads = block, .gpu = 0};
         def[1] = def[2] = def[3] = n++;
     }
     janas_tuner_init(&m->tuner, c, n, def, (tn && atoi(tn) == 0) || bt);
     janas_tuner_allow_gpu(&m->tuner, 1);
-    /* a GPU that takes single tokens (a discrete one) is tried for replies
-       too, and kept only if it measures faster */
+    /* a GPU that takes single tokens (a discrete one, or one the user
+       asked for replies) is tried for replies too, and kept only if it
+       measures faster */
     int one = m->gpu && !m->gpu_off && janas_gpu_min_n(m->gpu) <= 1;
     janas_tuner_allow_gpu_one(&m->tuner, one);
+    /* the user's devices: prompts' blocks and short turns (no NPU there),
+       drafts, replies */
+    /* the NPU for blocks by itself only where its answers measured at par
+       (janas_m_npu_auto); elsewhere when asked */
+    const char *nal = getenv("JANAS_NPU_ALWAYS");
+    int blocks = on[0];
+    if (m->npu && !blocks && !(nal && atoi(nal) > 0) && !janas_m_npu_auto(m))
+        blocks = 1 | (m->gpu && !m->gpu_off ? 1 << JANAS_DEV_GPU : 0);
+    janas_tuner_allow(&m->tuner, 2, blocks);
+    janas_tuner_allow(&m->tuner, 3, without_npu(on[0]));
+    janas_tuner_allow(&m->tuner, 1, on[1]);
+    janas_tuner_allow(&m->tuner, 0, on[2]);
     /* the saved choices of this machine and model; "1g" in the key when
        the GPU may take replies, so that choices saved without it do not
        stand in for the tries */
@@ -110,9 +220,14 @@ void janas_m_init_tuner(struct janas_llm_model *m)
                  cpu, m->p_cores, m->p_threads, m->all_threads,
                  m->gpu && !m->gpu_off ? janas_gpu_name(m->gpu) : "no GPU",
                  one ? " 1g" : "", fast ? " f" : "", name);
+    /* the user's devices, when chosen: their own saved choices */
+    if ((on[0] || on[1] || on[2]) && w > 0 && (size_t)w < sizeof(m->tune_key))
+        w += snprintf(m->tune_key + w, sizeof(m->tune_key) - (size_t)w,
+                      "on %x%x%x|", on[0], on[1], on[2]);
     for (int k = 0; k < n && w > 0 && (size_t)w < sizeof(m->tune_key); k++)
-        w += snprintf(m->tune_key + w, sizeof(m->tune_key) - (size_t)w, "%d%s,",
-                      c[k].threads, c[k].gpu ? "g" : "");
+        w += snprintf(m->tune_key + w, sizeof(m->tune_key) - (size_t)w,
+                      "%d%s%s,", c[k].threads, c[k].gpu ? "g" : "",
+                      c[k].npu ? "n" : "");
     janas_tuner_load(&m->tuner, m->tune_key);
 }
 
@@ -130,6 +245,8 @@ void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv)
     if (m->own_compute)
         janas_pool_set_active(m->compute, m->tuner.cand[cand].threads);
     m->gpu_use = m->tuner.cand[cand].gpu;
+    m->npu_use = m->tuner.cand[cand].npu;
+    janas_m_npu_awake(m, nv);
     if (m->gpu) {
         janas_gpu_keep_awake(m->gpu,
                              m->gpu_use && (nv >= janas_gpu_min_n(m->gpu) ||
@@ -159,7 +276,17 @@ int janas_llm_model_threads(const struct janas_llm_model *m, int cls)
 int janas_llm_model_gpu_prompts(const struct janas_llm_model *m)
 {
     return m->gpu && !m->gpu_off && m->tuner.allow_gpu &&
-           janas_gpu_fast_prompt();
+           janas_gpu_fast_prompt() && !m->prompts_off_gpu;
+}
+
+int janas_llm_model_devices(const struct janas_llm_model *m, int cls)
+{
+    /* the user's: the tuner's own limits (janas_m_npu_auto) apart */
+    return cls == 2   ? m->dev_on[0]
+           : cls == 3 ? without_npu(m->dev_on[0])
+           : cls == 1 ? m->dev_on[1]
+           : cls == 0 ? m->dev_on[2]
+                      : 0;
 }
 
 int janas_llm_model_gpu_used(const struct janas_llm_model *m)
@@ -175,13 +302,24 @@ int janas_llm_model_gpu_used(const struct janas_llm_model *m)
     return used;
 }
 
+int janas_llm_model_npu_used(const struct janas_llm_model *m)
+{
+    int used = 0;
+    for (int k = 0; m->npu && k < JANAS_TUNE_CLASSES; k++)
+        if (m->tuner.cand[janas_tuner_best(&m->tuner, k)].npu)
+            used |= 1 << k;
+    return used;
+}
+
 int janas_llm_model_candidates(const struct janas_llm_model *m, int *threads,
-                               int *gpu, int max)
+                               int *gpu, int *npu, int max)
 {
     int n = m->tuner.n_cand < max ? m->tuner.n_cand : max;
     for (int i = 0; i < n; i++) {
         threads[i] = m->tuner.cand[i].threads;
         gpu[i] = m->tuner.cand[i].gpu;
+        if (npu)
+            npu[i] = m->tuner.cand[i].npu;
     }
     return n;
 }

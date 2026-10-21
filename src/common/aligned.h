@@ -72,8 +72,18 @@ static inline void janas_aligned_free(void *p)
 
 #else
 
+/* aligned_alloc wants a size that is a multiple of align (C11 7.22.3.1):
+   glibc takes any, ThreadSanitizer's interceptor refuses it (test_aligned's
+   1 byte on 8), so the size is rounded up - at most align - 1 bytes more */
 static inline void *janas_aligned_alloc(size_t align, size_t size)
 {
+    if (align && size % align) {
+        if (size > SIZE_MAX - align) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        size += align - size % align;
+    }
     return aligned_alloc(align, size);
 }
 

@@ -280,7 +280,7 @@ static void product(struct janas_llm_model *m, const struct janas_jns_tensor *t,
                                    .rows = rows,
                                    .cols = cols,
                                    .n_vec = n};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &tk, 1);
+    janas_m_products(m, janas_m_gpu(m, 0), &tk, 1);
 }
 
 /*

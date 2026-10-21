@@ -19,7 +19,7 @@ What has been run: a probe script speaking each era to it with Qwen3-0.6B and Qw
 bin/x86_64-linux/janas-server qwen3-next.jns
 ```
 
-`janas-server` puts the model behind an HTTP API that follows [OpenAI's](https://github.com/openai/openai-openapi), on `http://127.0.0.1:8080/v1`, so that a client written for that API can use a model running on this machine. It takes the model options `janas-chat` takes (`--ctx`, `--cache`, `--reserve`, `--mtp`, `--draft`, `--mode`, `--no-gpu`) and these:
+`janas-server` puts the model behind an HTTP API that follows [OpenAI's](https://github.com/openai/openai-openapi), on `http://127.0.0.1:8080/v1`, so that a client written for that API can use a model running on this machine. It takes the model options `janas-chat` takes (`--ctx`, `--cache`, `--reserve`, `--mtp`, `--draft`, `--mode`, `--no-gpu`, `--prompt-on`, `--drafts-on`, `--reply-on`, `--npu-int8`) and these:
 
 | Option | |
 |---|---|
@@ -32,7 +32,7 @@ bin/x86_64-linux/janas-server qwen3-next.jns
 | `--test` | serve a chat page for trying it out, on `/test` (below) |
 | `--max-input N` | the longest input a request may have, in tokens, below the context: a longer one gets a 400 (`input_limit_exceeded`) whose error says `input_tokens`, `max_input_tokens`, `excess_tokens` and the parts, and nothing is ever cut to fit |
 | `--warn-input N` | longer inputs are taken, and said on stderr with their parts |
-| `--fim-prefix N`, `--fim-suffix N`, `--fim-max N` | completions with a `suffix`, an editor filling in code at its cursor: the tokens before the cursor read at most (2048; 0: all) and the lines after it (8; 0: all); `--fim-max N` the tokens written there at most, whatever the request asks (256; 0: as asked), since an editor asks for thousands and the requests of the next keystrokes wait for them. Over the budget the text before the cursor is cut at a line to three quarters of it, and the start of the window is kept across keystrokes, also when the editor slides its window, so that a keystroke reads only what it changed (see [Filling in code](../README.md#filling-in-code)) |
+| `--fim-prefix N`, `--fim-suffix N`, `--fim-max N` | completions with a `suffix`, an editor filling in code at its cursor: the tokens before the cursor read at most (2048; 0: all) and the lines after it (8; 0: all); `--fim-max N` the tokens written there at most, whatever the request asks (256; 0: as asked), since an editor asks for thousands and the requests of the next keystrokes wait for them. Over the budget the text before the cursor is cut at a line to three quarters of it, and the start of the window is kept across keystrokes, also when the editor slides its window, so that a keystroke reads only what it changed (see [code completion](code-completion.md)) |
 | `--metrics FILE`, `--progress S` | JSON lines of what every reply costs, and progress lines while a long prompt is read (see [Watching a long prompt](chat.md#watching-a-long-prompt)); `--verbose` prints progress every 30 s |
 | `--no-mcp` | refuse tools of type `mcp` in `/v1/responses`: no connection leaves the server on a request's word (below) |
 | `--keep N` | conversations kept computed besides the one in use (8; 0: none), so that clients taking turns, or a client's requests on the side for titles and tags, do not have their conversations read again from the start |

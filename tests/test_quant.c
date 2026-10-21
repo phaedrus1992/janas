@@ -252,6 +252,142 @@ static void test_q6k_planes(void)
     free(pf);
 }
 
+/* janas_q6kpn_axpy at every level: with h = 1 on zeros the very floats
+   janas_q6kp_dequantize gives, whatever planes lie below the level; with
+   any h on any y, y plus h times them. */
+static void test_q6kpn_axpy(void)
+{
+    enum { NB = 16, N = NB * JANAS_QK };
+    struct janas_block_q6k *w = malloc(NB * sizeof(*w));
+    struct janas_block_q6kp *base = malloc(NB * sizeof(*base));
+    uint8_t *p1 = malloc(NB * JANAS_Q6KP_PLANE);
+    uint8_t *p0 = malloc(NB * JANAS_Q6KP_PLANE);
+    float *ref = malloc(N * sizeof(float)), *y = malloc(N * sizeof(float));
+    float *y0 = malloc(N * sizeof(float));
+
+    for (int trial = 0; trial < 20; trial++) {
+        unsigned char *p = (unsigned char *)w;
+        for (size_t i = 0; i < NB * sizeof(*w); i++)
+            p[i] = (unsigned char)rnd();
+        for (int b = 0; b < NB; b++)
+            w[b].d = janas_fp32_to_fp16(rndf(0.0001f, 0.01f));
+        janas_q6k_to_planes(w, NB, base, p1, p0);
+        for (int level = 0; level <= 3; level++) {
+            const uint8_t *a1 = level >= 2 ? p1 : NULL;
+            const uint8_t *a0 = level >= 3 ? p0 : NULL;
+            if (level)
+                janas_q6kp_dequantize(base, a1, a0, ref, N);
+            for (int i = 0; i < N; i++) {
+                if (!level)
+                    ref[i] = 0.0f;
+                y[i] = 0.0f;
+            }
+            janas_q6kpn_axpy(base, p1, p0, level, 1.0f, y, N);
+            int bad = 0;
+            for (int i = 0; i < N; i++)
+                bad += y[i] != ref[i];
+            CHECK(!bad, "q6kpn axpy level %d, h = 1: %d of %d floats differ",
+                  level, bad, N);
+            float h = rndf(-2.0f, 2.0f);
+            for (int i = 0; i < N; i++)
+                y0[i] = y[i] = rndf(-1.0f, 1.0f);
+            janas_q6kpn_axpy(base, a1, a0, level, h, y, N);
+            bad = 0;
+            for (int i = 0; i < N; i++) {
+                float want = y0[i] + h * ref[i];
+                bad += fabsf(y[i] - want) > 1e-6f * (1.0f + fabsf(want));
+            }
+            CHECK(!bad, "q6kpn axpy level %d, h = %g: %d of %d floats off",
+                  level, h, bad, N);
+            /* the kernel in use against the reference, bit for bit */
+            float *yr = ref;
+            for (int i = 0; i < N; i++)
+                yr[i] = y0[i] = y[i] = rndf(-1.0f, 1.0f);
+            janas_q6kpn_axpy(base, a1, a0, level, h, y, N);
+            janas_q6kpn_axpy_ref(base, a1, a0, level, h, yr, N);
+            CHECK(!memcmp(y, yr, N * sizeof(float)),
+                  "q6kpn axpy level %d: kernel and reference differ", level);
+        }
+    }
+    free(w);
+    free(base);
+    free(p1);
+    free(p0);
+    free(ref);
+    free(y);
+    free(y0);
+}
+
+/* janas_q6kpn_chunk: the kernel in use against the reference, bit for bit,
+   on chunks of 1 to 128 neurons at random levels (JANAS_KERNELS=avx2 tries
+   the AVX2 one on a machine with AVX-VNNI); and the reference against the
+   float axpy, the same products with factors of eight bits. */
+static void test_q6kpn_chunk(void)
+{
+    enum { NN = 160, NB = 4 };
+    struct janas_block_q6k *w = malloc(NN * NB * sizeof(*w));
+    struct janas_block_q6kp *base = malloc(NN * NB * sizeof(*base));
+    uint8_t *p1 = malloc(NN * NB * JANAS_Q6KP_PLANE);
+    uint8_t *p0 = malloc(NN * NB * JANAS_Q6KP_PLANE);
+    unsigned char *p = (unsigned char *)w;
+    for (size_t i = 0; i < NN * NB * sizeof(*w); i++)
+        p[i] = (unsigned char)rnd();
+    for (int b = 0; b < NN * NB; b++)
+        w[b].d = janas_fp32_to_fp16(rndf(0.0001f, 0.01f));
+    janas_q6k_to_planes(w, NN * NB, base, p1, p0);
+    double worst = 0;
+    for (int trial = 0; trial < 60; trial++) {
+        uint32_t js[JANAS_PN_CHUNK], perm[NN];
+        uint8_t lv[JANAS_PN_CHUNK];
+        float h[JANAS_PN_CHUNK], y0[JANAS_QK], y1[JANAS_QK], y2[JANAS_QK],
+            ya[JANAS_QK];
+        uint32_t n = trial < 3   ? (uint32_t)trial + 1
+                     : trial < 6 ? JANAS_PN_CHUNK - (uint32_t)trial + 3
+                                 : 1 + rnd() % JANAS_PN_CHUNK;
+        for (uint32_t i = 0; i < NN; i++)
+            perm[i] = i;
+        for (uint32_t i = 0; i < n; i++) { /* distinct neurons */
+            uint32_t k = i + rnd() % (NN - i), t = perm[i];
+            perm[i] = perm[k];
+            perm[k] = t;
+            js[i] = perm[i];
+            lv[i] = (uint8_t)(1 + rnd() % 3);
+            float g = rndf(-1, 1);
+            h[i] = trial % 2 ? g * g * g * 4.0f : rndf(-2.0f, 2.0f);
+        }
+        size_t b = rnd() % NB;
+        for (int v = 0; v < JANAS_QK; v++)
+            ya[v] = y0[v] = y1[v] = y2[v] = rndf(-1.0f, 1.0f);
+        janas_q6kpn_chunk(base, p1, p0, NN, js, lv, h, n, b, y1);
+        janas_q6kpn_chunk_ref(base, p1, p0, NN, js, lv, h, n, b, y2);
+        CHECK(!memcmp(y1, y2, sizeof(y1)),
+              "q6kpn chunk of %u: kernel and reference differ", n);
+        for (uint32_t i = 0; i < n; i++) {
+            size_t at = b * NN + js[i]; /* by block of outputs */
+            janas_q6kpn_axpy_ref(base + at, p1 + at * JANAS_Q6KP_PLANE,
+                                 p0 + at * JANAS_Q6KP_PLANE, lv[i], h[i], ya,
+                                 JANAS_QK);
+        }
+        double e = 0, sg = 0;
+        for (int v = 0; v < JANAS_QK; v++) {
+            e += ((double)y2[v] - ya[v]) * (y2[v] - ya[v]);
+            sg += ((double)ya[v] - y0[v]) * (ya[v] - y0[v]);
+        }
+        double rel = sg > 0 ? sqrt(e / sg) : 0;
+        if (rel > worst)
+            worst = rel;
+        CHECK(rel < 0.02, "q6kpn chunk of %u: %.4f off the float products", n,
+              rel);
+    }
+    printf("q6kpn chunk: factors of eight bits, at most %.4f off the float "
+           "products\n",
+           worst);
+    free(w);
+    free(base);
+    free(p1);
+    free(p0);
+}
+
 static void test_matvec(void)
 {
     enum { ROWS = 1000, COLS = 2048, NB = COLS / JANAS_QK };
@@ -416,6 +552,70 @@ static void test_quantize_q4k(void)
         CHECK(rel < (kind ? 0.20 : 0.11) && rel < rel_naive,
               "q4k quantize %d%s: relative error %.4f, naive %.4f", kind,
               fast ? " fast" : "", rel, rel_naive);
+    }
+    free(x);
+    free(y);
+    free(q);
+}
+
+/* janas_q6k_quantize: every weight read back as the integer nearest to it
+   under the scales the block keeps (so its bits sit where Q6_K reads them),
+   and less error than the plain way: each group of 16 at its largest
+   magnitude over 31, those scales then to the block's eight bits. */
+static void test_quantize_q6k(void)
+{
+    enum { N = 256 * 64 };
+    float *x = malloc(N * sizeof(float)), *y = malloc(N * sizeof(float));
+    struct janas_block_q6k *q = malloc(N / JANAS_QK * sizeof(*q));
+    for (int kind = 0; kind < 2; kind++) {
+        double var = 0, err = 0, plain = 0, plain_f = 0;
+        for (int i = 0; i < N; i++) {
+            /* sum of uniforms ~ Gaussian; its cube is heavy-tailed */
+            float g = rndf(-1, 1) + rndf(-1, 1) + rndf(-1, 1) + rndf(-1, 1);
+            x[i] = 0.02f * (kind ? g * g * g : g);
+            var += (double)x[i] * x[i];
+        }
+        janas_q6k_quantize(x, q, N);
+        janas_q6k_dequantize(q, y, N);
+        int far = 0;
+        for (int i = 0; i < N; i++) {
+            const struct janas_block_q6k *b = &q[i / JANAS_QK];
+            float a = janas_fp16_to_fp32(b->d) * b->scales[i % JANAS_QK / 16];
+            int k = a != 0.0f ? (int)lrintf(x[i] / a) : 0;
+            k = k < -32 ? -32 : k > 31 ? 31 : k;
+            far += y[i] != a * k;
+            err += ((double)y[i] - x[i]) * (y[i] - x[i]);
+        }
+        CHECK(!far, "q6k quantize %d: %d weights not the nearest", kind, far);
+        for (int b = 0; b < N / JANAS_QK; b++) {
+            const float *xb = x + b * JANAS_QK;
+            float a[16], amax = 0;
+            for (int s = 0; s < 16; s++) {
+                a[s] = 0;
+                for (int k = 0; k < 16; k++)
+                    a[s] = fmaxf(a[s], fabsf(xb[16 * s + k]) / 31);
+                amax = fmaxf(amax, a[s]);
+            }
+            float d = janas_fp16_to_fp32(janas_fp32_to_fp16(amax / 127));
+            for (int v = 0; v < JANAS_QK; v++) {
+                float af = a[v / 16], a8 = d * lrintf(af / d);
+                int kf = af > 0 ? (int)lrintf(xb[v] / af) : 0;
+                int k8 = a8 > 0 ? (int)lrintf(xb[v] / a8) : 0;
+                kf = kf < -32 ? -32 : kf > 31 ? 31 : kf;
+                k8 = k8 < -32 ? -32 : k8 > 31 ? 31 : k8;
+                plain_f += ((double)af * kf - xb[v]) * (af * kf - xb[v]);
+                plain += ((double)a8 * k8 - xb[v]) * (a8 * k8 - xb[v]);
+            }
+        }
+        double rel = sqrt(err / var), rel_plain = sqrt(plain / var);
+        printf("q6k quantize, %s weights: relative rms error %.5f (plain "
+               "%.5f, with float scales %.5f)\n",
+               kind ? "heavy-tailed" : "Gaussian", rel, rel_plain,
+               sqrt(plain_f / var));
+        CHECK(rel < rel_plain,
+              "q6k quantize %d: relative error %.5f, plain "
+              "%.5f",
+              kind, rel, rel_plain);
     }
     free(x);
     free(y);
@@ -1197,6 +1397,8 @@ int main(void)
     test_dot();
     test_dot_q6k();
     test_q6k_planes();
+    test_q6kpn_axpy();
+    test_q6kpn_chunk();
     test_matvec();
     test_matvec_group();
     test_matvec_multi();
@@ -1209,6 +1411,7 @@ int main(void)
     test_dot_q3k();
     test_dot_iq3s();
     test_quantize_q4k();
+    test_quantize_q6k();
     test_quantize_q8k();
     test_dequantize();
     printf("test_quant: kernel %s, %s\n", janas_q4k_kernel_name(),

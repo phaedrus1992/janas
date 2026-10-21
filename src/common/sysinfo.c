@@ -288,4 +288,16 @@ uint64_t janas_mem_total(void)
     return meminfo("MemTotal");
 }
 
+uint64_t janas_rss_bytes(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    unsigned long long size = 0, resident = 0;
+    int ok = fscanf(f, "%llu %llu", &size, &resident) == 2;
+    fclose(f);
+    long page = sysconf(_SC_PAGESIZE);
+    return ok && page > 0 ? (uint64_t)resident * (uint64_t)page : 0;
+}
+
 #endif /* !_WIN32 */

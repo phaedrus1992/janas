@@ -38,8 +38,15 @@
  * e' il 95% della fase, in prefill il 67%, e la cache passa dal 2,7% al 29,5%.
  *
  * Spenta costa una lettura di variabile per invio: zero misurabile.
+ *
+ * In piu' (21 ott 2026) il tratto fra il router e i primi esperti, dove il
+ * thread principale lavora da solo: scelta degli esperti e ordinamento,
+ * apertura della cache (begin), preparazione, in microsecondi a strato; la
+ * chiusura (finish, con l'attesa del disco) a parte.
  */
-static double ex_setup, ex_t1, ex_act, ex_t2, ex_axpy, ex_cache;
+static double ex_setup, ex_t1, ex_act, ex_t2, ex_axpy, ex_begin, ex_finish,
+    ex_route;
+static unsigned long long ex_layers;
 static int ex_trace = -1;
 
 int janas_m_exp_tracing(void)
@@ -53,7 +60,8 @@ int janas_m_exp_tracing(void)
 
 void janas_m_exp_report(void)
 {
-    double tot = ex_setup + ex_t1 + ex_act + ex_t2 + ex_axpy + ex_cache;
+    double tot =
+        ex_setup + ex_t1 + ex_act + ex_t2 + ex_axpy + ex_begin + ex_finish;
     if (tot <= 0)
         return;
     fprintf(stderr,
@@ -61,9 +69,20 @@ void janas_m_exp_report(void)
             "down %.1f%%  axpy %.1f%%  cache %.1f%%  (%.0f ms, matvec "
             "%.1f%%)\n",
             100 * ex_setup / tot, 100 * ex_t1 / tot, 100 * ex_act / tot,
-            100 * ex_t2 / tot, 100 * ex_axpy / tot, 100 * ex_cache / tot,
-            tot * 1e3, 100 * (ex_t1 + ex_t2) / tot);
-    ex_setup = ex_t1 = ex_act = ex_t2 = ex_axpy = ex_cache = 0;
+            100 * ex_t2 / tot, 100 * ex_axpy / tot,
+            100 * (ex_begin + ex_finish) / tot, tot * 1e3,
+            100 * (ex_t1 + ex_t2) / tot);
+    if (ex_layers)
+        fprintf(stderr,
+                "router to experts, a layer: choice and order %.1f us, cache "
+                "begin %.1f us, setup %.1f us; cache finish %.1f us (%llu "
+                "layers)\n",
+                ex_route / ex_layers * 1e6, ex_begin / ex_layers * 1e6,
+                ex_setup / ex_layers * 1e6, ex_finish / ex_layers * 1e6,
+                ex_layers);
+    ex_setup = ex_t1 = ex_act = ex_t2 = ex_axpy = ex_begin = ex_finish = 0;
+    ex_route = 0;
+    ex_layers = 0;
 }
 
 /* SiLU(gate) * up and its quantization, for the pair rows listed in glist. */
@@ -123,6 +142,12 @@ static void act_worker(void *arg, int tid, int n_threads)
             for (; r < ff; r++)
                 h[r] = janas_silu_mul_det(gt[r], u[r]);
         }
+        if (m->ana_tok) /* the Ana-Net probe: by token, after every pair */
+            continue;
+        if (m->ana_mode || m->ana_frame) /* the Ana-Net probe */
+            janas_m_ana_mask(m, g, h, ff);
+        if (m->nskipq && m->nskipq[g]) /* down by neuron reads h itself */
+            continue;
         janas_q8k_quantize_det(h, m->hq + g * stride / JANAS_QK, ff);
     }
 }
@@ -193,6 +218,8 @@ struct expert_run {
     const uint8_t *plane[2]; /* the other two planes of down, or NULL */
     const struct janas_jns_matrix *mx;
     uint32_t a, b;
+    int expert; /* the routed expert's number, -1 the shared one (the Ana-Net
+                   probe) */
 };
 
 /* Experts are asked of the cache and computed a chunk at a time: 128, a
@@ -221,19 +248,37 @@ static void run_experts(struct janas_llm_model *m,
     uint32_t dm = m->d_model, ff = m->ff_buf;
     size_t nbd = dm / JANAS_QK, nbf = ff / JANAS_QK;
     struct janas_matvec_task t1[2 * MAX_RUNS], t2[MAX_RUNS];
-    uint32_t ng = 0;
+    struct janas_neuron_run nr[MAX_RUNS]; /* down by neuron: no product */
+    uint32_t ng = 0, n1 = 0, n2 = 0, nn = 0;
+    /* one run - a dense model's feed-forward, a shared expert - may go to
+       the NPU whole (model_npu.c), the CPU computing the others meanwhile */
+    struct janas_m_npu_ffn nf = {0};
+    int nf_run = -1;
     for (uint32_t r = 0; r < n_runs; r++) {
         uint32_t a = runs[r].a, cnt = runs[r].b - runs[r].a;
-        for (uint32_t g = a; g < runs[r].b; g++) {
+        for (uint32_t g = a; g < runs[r].b; g++)
             memcpy(m->xg + (size_t)g * nbd,
                    m->xq + (size_t)m->pair_tok[m->order[g]] * nbd,
                    nbd * sizeof(*m->xg));
+        if (nf_run < 0 && m->npu &&
+            janas_m_npu_ffn_begin(m, runs[r].base, runs[r].plane, runs[r].mx,
+                                  m->xg + (size_t)a * nbd, cnt,
+                                  m->dout + (size_t)a * dm, &nf) == 0) {
+            nf_run = (int)r;
+            continue;
+        }
+        for (uint32_t g = a; g < runs[r].b; g++) {
             m->glist[ng++] = g;
             m->hlen[g] = runs[r].mx[0].rows;
+            if (m->nskipq)
+                m->nskipq[g] = runs[r].mx[JANAS_JNS_DOWN].type == JANAS_Q6_K_PN;
+            if (m->ana_exp) /* the Ana-Net probe: the pair's expert */
+                m->ana_exp[g] =
+                    runs[r].expert < 0 ? m->n_expert : (uint32_t)runs[r].expert;
         }
         for (int p = 0; p < 2; p++) {
             const struct janas_jns_matrix *mx = &runs[r].mx[p];
-            t1[2 * r + p] = (struct janas_matvec_task){
+            t1[n1++] = (struct janas_matvec_task){
                 .type = (int)mx->type,
                 .w = runs[r].base[p] + mx->offset,
                 .x = m->xg + (size_t)a * nbd,
@@ -245,7 +290,22 @@ static void run_experts(struct janas_llm_model *m,
                 .y_stride = ff};
         }
         const struct janas_jns_matrix *d = &runs[r].mx[JANAS_JNS_DOWN];
-        t2[r] = (struct janas_matvec_task){
+        if (d->type == JANAS_Q6_K_PN) {
+            const uint8_t *w = runs[r].base[2] + d->offset;
+            nr[nn++] = (struct janas_neuron_run){
+                .scale = (const float *)w,
+                .base =
+                    (const struct janas_block_q6kp *)(w +
+                                                      d->cols * sizeof(float)),
+                .p1 = runs[r].plane[0],
+                .p0 = runs[r].plane[1],
+                .rows = d->rows,
+                .cols = d->cols,
+                .a = a,
+                .b = runs[r].b};
+            continue;
+        }
+        t2[n2++] = (struct janas_matvec_task){
             .type = (int)d->type,
             .w = runs[r].base[JANAS_JNS_DOWN] + d->offset,
             .plane = {runs[r].plane[0], runs[r].plane[1]},
@@ -259,12 +319,46 @@ static void run_experts(struct janas_llm_model *m,
     }
     if (janas_m_exp_tracing())
         ex_setup += now() - t_enter;
-    EX_T(ex_t1, janas_gpu_matvec_group(janas_m_gpu(m, 1), m->compute, t1,
-                                       2 * (size_t)n_runs));
+    EX_T(ex_t1, janas_m_products(m, janas_m_gpu(m, 1), t1, n1));
+    /* the Ana-Net probe: each neuron's agreement, from gate's and up's rows,
+       and the norms of down's columns, once an expert */
+    if (m->ana_low)
+        janas_m_ana_lowmark(m, ng);
+    for (uint32_t r = 0;
+         (m->ana_agree || m->ana_coarse || m->ana_low) && r < n_runs; r++)
+        janas_m_ana_agree(m, runs[r].base[0] + runs[r].mx[0].offset,
+                          runs[r].base[1] + runs[r].mx[1].offset, runs[r].mx,
+                          runs[r].a, runs[r].b);
+    for (uint32_t r = 0; m->ana_coln && r < n_runs; r++)
+        janas_m_ana_coln(
+            m, runs[r].expert < 0 ? m->n_expert : (uint32_t)runs[r].expert,
+            runs[r].base[2] + runs[r].mx[2].offset, runs[r].plane[0],
+            runs[r].plane[1], &runs[r].mx[2]);
     struct act_job aj = {m, ng};
     EX_T(ex_act, janas_pool_run(m->compute, act_worker, &aj));
-    EX_T(ex_t2,
-         janas_gpu_matvec_group(janas_m_gpu(m, 1), m->compute, t2, n_runs));
+    /* the NPU's calibration (JANAS_NPU_A8=1): a dense model's intermediate */
+    for (uint32_t i = 0; m->npu && m->n_expert <= 1 && i < ng; i++)
+        janas_m_npu_calib(m, 2, m->ana_layer, m->h + (size_t)m->glist[i] * ff,
+                          1, m->hlen[m->glist[i]], ff);
+    if (m->ana_tok) /* the Ana-Net probe: a token's neurons ranked together */
+        janas_m_ana_tok(m, ng);
+    if (nn && m->neuron_rank)
+        janas_m_neuron_levels(m, ng);
+    EX_T(ex_t2, janas_m_neuron_down(m, nr, nn));
+    if (n2)
+        EX_T(ex_t2, janas_m_products(m, janas_m_gpu(m, 1), t2, n2));
+    /* the Ana-Net probe: neurons kept at fewer bits, their down corrected */
+    for (uint32_t r = 0; m->ana_level && r < n_runs; r++)
+        janas_m_ana_grade(m, runs[r].base[2] + runs[r].mx[2].offset,
+                          runs[r].plane[0], runs[r].plane[1], &runs[r].mx[2],
+                          runs[r].a, runs[r].b);
+    if (nf_run >= 0 && janas_m_npu_ffn_finish(m, &nf) != 0) {
+        /* the NPU failed: that run on the CPU after all */
+        int use = m->npu_use;
+        m->npu_use = 0;
+        run_experts(m, &runs[nf_run], 1);
+        m->npu_use = use;
+    }
 }
 
 int janas_m_route_rank(struct janas_llm_model *m, uint32_t l, uint32_t n,
@@ -498,9 +592,12 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
     uint32_t dm = m->d_model, ne = m->n_expert;
     uint32_t k = part == MOE_SHARED ? 0 : m->k_use;
     uint32_t np = n * k;
+    double t_route = 0;
     if (k) {
         struct router_job rj = {m, ly->router16, n};
         janas_pool_run(m->compute, router_worker, &rj);
+        if (janas_m_exp_tracing())
+            t_route = now();
 
         /* per token: softmax, top-k, normalized weights */
         struct tok_job tj = {.m = m, .n = n};
@@ -550,6 +647,10 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
     }
     double t1 = now();
     m->phase[JANAS_PH_ROUTER] += t1 - t0;
+    if (t_route > 0) {
+        ex_route += t1 - t_route;
+        ex_layers++;
+    }
 
     /* experts in chunks: compute those in RAM while the others load; the
        shared expert, resident, goes with the first of them */
@@ -559,7 +660,7 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
         uint8_t ready[EXPERT_CHUNK];
         if (cn) {
             int rc_b;
-            EX_T(ex_cache, rc_b = janas_expert_cache_begin(
+            EX_T(ex_begin, rc_b = janas_expert_cache_begin(
                                cache, l, distinct + c0, cn, slots, ready));
             if (rc_b < 0)
                 return -1;
@@ -567,7 +668,7 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
         for (int pass = 0; pass < 2; pass++) {
             if (pass == 1 && cn) {
                 int rc_f;
-                EX_T(ex_cache, rc_f = janas_expert_cache_finish(cache));
+                EX_T(ex_finish, rc_f = janas_expert_cache_finish(cache));
                 if (rc_f != 0)
                     return -1;
             }
@@ -579,7 +680,8 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
                                         {NULL, NULL},
                                         ly->sh_mx,
                                         np,
-                                        nt};
+                                        nt,
+                                        -1};
             for (uint32_t i = 0; i < cn; i++)
                 if ((pass == 0) == (ready[i] != 0)) {
                     uint32_t e = distinct[c0 + i];
@@ -595,7 +697,8 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
                                             {pl[0], pl[1]},
                                             jl->m,
                                             m->count[e],
-                                            m->count[e + 1]};
+                                            m->count[e + 1],
+                                            (int)e};
                 }
             if (nr)
                 run_experts(m, runs, nr);

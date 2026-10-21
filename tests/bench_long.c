@@ -20,7 +20,10 @@
  * JANAS_WARM=1 the machine's profile is preloaded, as janas-chat does; with
  * BENCH_READY=1 as well, the prompt waits until that preload is done.
  * BENCH_SAVE=file writes the prompt and the generated tokens (int32), for
- * tracing the same sequence again. The experts' bits and count in use are
+ * tracing the same sequence again. BENCH_EVERY=n prints the decoding n
+ * tokens at a time as well (speed, experts from RAM, misses and time waited
+ * per token): how the cache holds up as a reply moves away from its
+ * prompt. The experts' bits and count in use are
  * printed: with little memory the engine lowers them itself (a different
  * model); BENCH_EXACT=1 keeps all the bits and the model's own count.
  */
@@ -205,11 +208,34 @@ int main(int argc, char **argv)
     janas_pool_trace_report("prefill", t1 - t0);
     janas_pool_trace_reset();
     janas_expert_cache_reset_stats(c);
+    uint32_t every =
+        getenv("BENCH_EVERY") ? (uint32_t)atoi(getenv("BENCH_EVERY")) : 0;
+    struct janas_expert_cache_stats s0 = {0};
+    double ts = now();
     for (uint32_t i = 0; i < nn; i++) {
         out[i] = argmax(logits, nv);
         if (janas_llm_model_decode(m, out[i], np + i, logits) != 0) {
             fprintf(stderr, "decode failed at %u\n", i);
             return 1;
+        }
+        if (every && ((i + 1) % every == 0 || i + 1 == nn)) {
+            struct janas_expert_cache_stats s1;
+            janas_expert_cache_stats(c, &s1);
+            uint32_t k = (i + 1) % every ? (i + 1) % every : every;
+            double te = now();
+            uint64_t rq = s1.requests - s0.requests;
+            printf("decode tokens %4u-%4u: %.2f token/s, experts %.1f%% from "
+                   "RAM, %.1f misses and %.2f ms waited a token\n",
+                   i + 2 - k, i + 1, k / (te - ts),
+                   rq ? 100.0 *
+                            (double)((s1.hits - s1.prefetch_used) -
+                                     (s0.hits - s0.prefetch_used)) /
+                            (double)rq
+                      : 0,
+                   (double)(s1.misses - s0.misses) / k,
+                   (s1.wait_seconds - s0.wait_seconds) / k * 1e3);
+            s0 = s1;
+            ts = te;
         }
     }
     double t2 = now();

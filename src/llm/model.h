@@ -53,6 +53,8 @@ struct janas_llm_options {
                         (Q6_K), requantized to four (Q4_K) at load - faster, a
                         little less accurate; 0 or 6: as in the file
                         (environment JANAS_HEAD_BITS overrides) */
+    int no_npu;      /* 1: the NPU left off, its copies' memory being the
+                        expert cache's (janas_llm_open) */
 };
 
 struct janas_llm_model;
@@ -69,6 +71,12 @@ uint32_t janas_llm_model_n_ctx(const struct janas_llm_model *m);
    context never goes past it: without a rope scaling the file carries, text
    beyond that length falls apart. */
 uint32_t janas_llm_model_n_ctx_train(const struct janas_llm_model *m);
+/* The memory the model holds: its resident weights as read (a table read
+   from the file a row at a time, Gemma 4's per-layer embeddings, is not
+   held), its expert cache's arena, and its keys and values with their
+   scales. */
+void janas_llm_model_memory(const struct janas_llm_model *m, uint64_t *resident,
+                            uint64_t *cache, uint64_t *kv);
 
 /*
  * A place in ~/.cache/janas for something the engine learns about this
@@ -287,15 +295,45 @@ int janas_llm_model_gpu_used(const struct janas_llm_model *m);
    855 ms against 437 for one of 5 (13 Oct 2026). */
 uint32_t janas_llm_model_pass_cap(const struct janas_llm_model *m);
 /* Whether the GPU reads the prompts' blocks whatever the tuner chooses
-   (the fast prompt, outside eco mode). */
+   (the fast prompt, outside eco mode, unless the user keeps prompts off
+   the GPU). */
 int janas_llm_model_gpu_prompts(const struct janas_llm_model *m);
+/* Whether the engine gives the NPU a prompt's blocks by itself, where it
+   measures faster: on the models whose answers on the NPU measured at par
+   with the CPU's against llama.cpp; on the others only when asked
+   (--prompt-on npu). */
+int janas_llm_model_npu_auto(const struct janas_llm_model *m);
+/* The combinations of devices the user allowed a kind of pass
+   (common/devices.h, janas_tune_class), as this machine has them: 0 any
+   (the engine's own limits, as janas_llm_model_npu_auto, apart). */
+int janas_llm_model_devices(const struct janas_llm_model *m, int cls);
 /* The compute threads of the configuration the tuner holds best for a
    kind of pass (janas_tune_class: 0 one token, 1 a few, 2 a block, 3 a
    short one); 0 unknown. */
 int janas_llm_model_threads(const struct janas_llm_model *m, int cls);
 
+/* The tuner's candidates: threads, GPU and NPU (npu may be NULL). */
 int janas_llm_model_candidates(const struct janas_llm_model *m, int *threads,
-                               int *gpu, int max);
+                               int *gpu, int *npu, int max);
+/* As janas_llm_model_gpu_used, for the NPU (looked for at load unless
+   JANAS_NPU=0). */
+int janas_llm_model_npu_used(const struct janas_llm_model *m);
+/* The NPU's name, or NULL when none is used. */
+const char *janas_llm_model_npu_name(const struct janas_llm_model *m);
+/* Seconds spent making the NPU's graphs so far (a matrix's or a layer's
+   first block: its weights prepared, the graph compiled and run once):
+   kept out of the tuner's costs, as the waits for the disk are, and out of
+   janas-bench's rates. */
+double janas_llm_model_npu_compile_seconds(const struct janas_llm_model *m);
+/* The NPU's preparation, safe from another thread while the engine works
+   (janas_llm_npu_preparing): 1 while it goes on, *done of *total graphs
+   made (*total 0: not known ahead), *seconds since it began; 0 after,
+   *seconds the session's preparations; 0 and zeros without an NPU. */
+int janas_llm_model_npu_preparing(const struct janas_llm_model *m,
+                                  int32_t *done, int32_t *total,
+                                  double *seconds);
+/* Without an NPU: why ("" with one). */
+const char *janas_llm_model_npu_why(const struct janas_llm_model *m);
 void janas_llm_model_force(struct janas_llm_model *m, int cand);
 
 /*

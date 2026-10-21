@@ -93,7 +93,9 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
     struct push_id pi = {.rows = md->eff, .nb = nbd, .tiles = t->tiles1};
     janas_g_push_addr(pi.t, B + t->o_tab1);
     janas_gt_bind(g, bound,
-                  ly->gate.type == JANAS_MXFP4 ? g->pipe_idmx : g->pipe_id4);
+                  ly->gate.type == JANAS_MXFP4  ? g->pipe_idmx
+                  : ly->gate.type == JANAS_Q3_K ? g->pipe_id3
+                                                : g->pipe_id4);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind);
     janas_g_compute_barrier(g);
@@ -111,6 +113,7 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                   dt == JANAS_Q4_K    ? g->pipe_id4
                   : dt == JANAS_Q6_K  ? g->pipe_id6s
                   : dt == JANAS_MXFP4 ? g->pipe_idmx
+                  : dt == JANAS_Q3_K  ? g->pipe_id3
                                       : g->pipe_id6);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind + 16);
