@@ -2,6 +2,10 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-22] - The module for Node.js in the Linux package
+
+- **The Linux package carries `janas.node`** and its types for TypeScript, `janas.d.ts`, in `node/`: a Node.js program opens a model with the package alone, without building Janas. The release workflow checks that the module, as packed, loads, where its runner has Node.js. The Windows package has no module yet.
+
 ## [2026-10-21] - Janas-LLM in Node.js
 
 - **`janas.node`, the library as a module for Node.js** (Linux), made by `./build.sh` beside the programs, with its types for TypeScript (`janas.d.ts`): `open()` a model, `model.chat()`, then `chat.send(text)` or `chat.load(messages)` and the reply read with `for await`, piece by piece (the answer, the reasoning, how much of a long prompt is read), or whole with `reply.text()`, its counters with `reply.stats()`. Leaving the loop, `reply.stop()` or an `AbortSignal` stops it. Each model runs on a thread of its own, so JavaScript's thread never waits for it; a model's replies come one at a time, in the order asked; an idle model does not keep Node running, and one left open is closed when Node leaves. Written in C against Node-API (version 8), whose functions it declares itself: building it needs nothing of Node's (checked against Node's headers where they are installed). Tried with Node 20: `tests/test_node` without a model, in the suite, and `tests/node_check` on Qwen3-0.6B, where the replies through Node are the library's own in C, byte for byte; both also under AddressSanitizer and ThreadSanitizer. `docs/library.md`, "From Node.js".

@@ -65,7 +65,7 @@ Two things to know. FreeBASIC does not tell names apart by their case, so the co
 
 ## From Node.js
 
-`janas.node` is the library as a module for Node.js, made by `./build.sh` on Linux beside the programs (`bin/x86_64-linux/janas.node`), with its types for TypeScript beside it (`janas.d.ts`). It is written in C against Node-API, version 8, whose functions it declares itself: building it needs nothing of Node's. It was tried with Node 20. Each model runs on a thread of its own, so JavaScript's thread never waits for it, and a reply is read as it is written:
+`janas.node` is the library as a module for Node.js, made by `./build.sh` on Linux beside the programs (`bin/x86_64-linux/janas.node`), with its types for TypeScript beside it (`janas.d.ts`); the Linux package carries the two in `node/`. It is written in C against Node-API, version 8, whose functions it declares itself: building it needs nothing of Node's. It was tried with Node 20. Each model runs on a thread of its own, so JavaScript's thread never waits for it, and a reply is read as it is written:
 
 ```ts
 import { createRequire } from "node:module";
