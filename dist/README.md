@@ -1,6 +1,6 @@
 # Janas for Linux x86-64
 
-**Qwen3-Next-80B, a 48 GB model, on a laptop with 32 GB of memory: 26 tok/s writing a reply, where llama.cpp manages 3.0, and 68 tok/s reading a prompt, against 18.** Janas-LLM read and wrote faster than llama.cpp on every model compared on that laptop (Debian 13 Linux with kernel 6.12.111, Intel Core Ultra 9 185H with its integrated Arc GPU, Mesa 26.1.6, and its NPU, 32 GB of DDR5-5600 memory, an NVMe SSD), each at its best, measured on 21 October 2026:
+**Qwen3-Next-80B, a 48 GB model, on a laptop with 32 GB of memory: 26 tok/s writing a reply, where llama.cpp manages 3.0, and 68 tok/s reading a prompt, against 18.** Janas-LLM read and wrote faster than llama.cpp on every model compared on that laptop (Debian 13 Linux with kernel 6.12.111, Intel Core Ultra 9 185H with its integrated Arc GPU, Mesa 26.1.6, and its NPU, 32 GB of DDR5-5600 memory, an NVMe SSD), under the same conditions wherever possible, each in its best configuration, measured on 21 October 2026:
 
 | Model | reading 1,024 tokens: Janas-LLM | llama.cpp | writing: Janas-LLM | llama.cpp |
 |---|---:|---:|---:|---:|
@@ -22,7 +22,7 @@
 | Qwen3.5-0.8B | 1,403 tok/s | 514 tok/s | 110 tok/s | 31.1 tok/s |
 | Qwen3-0.6B | 1,421 tok/s | 710 tok/s | 133 tok/s | 46.0 tok/s |
 
-Janas-LLM's figures are the best of the configurations `janas-bench` measures: the GPU reading a prompt's blocks, or on the smaller dense models (Qwen3-4B and smaller, Gemma-4-E2B and E4B) the NPU; llama.cpp's are its best on that laptop, with its Vulkan backend on the same GPU. † llama.cpp's figures of 11 October. On another machine the figures will be other ones: `janas-bench` measures yours (below). How they were taken, and everything else: <https://github.com/prabanta-dev/janas>.
+Janas-LLM's figures are the best of the configurations `janas-bench` measures: the GPU reading a prompt's blocks, or on the smaller dense models (Qwen3-4B and smaller, Gemma-4-E2B and E4B) the NPU; llama.cpp ran with its Vulkan backend on the same GPU, the API Janas-LLM uses (on the two models larger than the memory it wrote with its CPU backend, faster there); the conditions are the same wherever the two engines allow it, and the main README says where they are not. † llama.cpp's figures of 11 October. On another machine the figures will be other ones: `janas-bench` measures yours (below). How they were taken, and everything else: <https://github.com/prabanta-dev/janas>.
 
 Janas-LLM, the inference engine of Janas, runs large language models on ordinary computers, with or without a GPU, mixtures of experts larger than the memory among them: the weights stay on disk, the experts each token needs are read from the SSD and the ones that keep coming back stay in memory. It is written in C and needs nothing but the system's C library; a GPU is used through its Vulkan driver when there is one.
 
