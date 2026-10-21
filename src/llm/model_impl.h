@@ -81,6 +81,7 @@ struct janas_llm_model {
        (and whether the GPU helps) for each kind of pass */
     int p_cores, p_threads, all_threads;
     struct janas_tuner tuner;
+    double last_pass_s; /* janas_llm_model_pass_seconds */
     char tune_key[768];
     int gpu_use;             /* the current pass may use the GPU */
     struct janas_gpu *gpu;   /* optional, for products over blocks */

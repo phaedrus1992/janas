@@ -402,6 +402,7 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
     dt -= c1.wait_seconds - c0.wait_seconds;
     /* nor the NPU's first compilation of a matrix: once a session */
     dt -= janas_llm_model_npu_compile_seconds(m) - k0;
+    m->last_pass_s = dt > 0 && !m->tuner.trying ? dt : 0;
     /* while the cache is still filling in the background, passes are not
        representative: neither the tuner nor the draft planner may learn
        from them, or a slow start decides the whole session */
@@ -413,6 +414,11 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
         prefetch_block_decide(m, &c0, &c1);
     janas_m_arena_to_gpu(m);
     return r;
+}
+
+double janas_llm_model_pass_seconds(const struct janas_llm_model *m)
+{
+    return m->last_pass_s;
 }
 
 static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,

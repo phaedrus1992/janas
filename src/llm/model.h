@@ -124,6 +124,13 @@ uint64_t janas_llm_model_warm_done(const struct janas_llm_model *m);
    costs then says nothing about the machine, so nothing is learned from it. */
 int janas_llm_model_settling(const struct janas_llm_model *m);
 
+/* The last janas_llm_model_forward's time without what it waited for
+   experts read from the disk, nor the NPU's first compilations: what the
+   pass costs with the experts in memory, as the tuner learns it. 0 when
+   the tuner ran the pass on an alternative it was trying, not on its
+   choice: what that costs says nothing of the passes to come. */
+double janas_llm_model_pass_seconds(const struct janas_llm_model *m);
+
 /* The block attention and the recurrent log work in: a pass that can be
    taken back (a draft) is at most this long. */
 #define JANAS_LLM_MAX_BLOCK 64

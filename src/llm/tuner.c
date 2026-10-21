@@ -182,6 +182,7 @@ int janas_tuner_best(const struct janas_tuner *t, int cls)
 
 int janas_tuner_pick(struct janas_tuner *t, int cls)
 {
+    t->trying = 0;
     if (t->forced >= 0) {
         t->cls[cls].passes++;
         return t->forced;
@@ -198,8 +199,10 @@ int janas_tuner_pick(struct janas_tuner *t, int cls)
         if (usable(t, cls, i) &&
             (least < 0 || t->cls[cls].tried[i] < t->cls[cls].tried[least]))
             least = i;
-    if (least >= 0 && t->cls[cls].tried[least] < TRIES)
+    if (least >= 0 && t->cls[cls].tried[least] < TRIES) {
+        t->trying = 1;
         return least;
+    }
     /*
      * Exploit, trying the longest untried alternative now and then, to
      * follow the machine's state. A try is a pass run slower on purpose, so
@@ -226,6 +229,7 @@ int janas_tuner_pick(struct janas_tuner *t, int cls)
         if (old >= 0) {
             t->cls[cls].retry_best = best;
             t->cls[cls].retry_cand = old;
+            t->trying = 1;
             return old;
         }
     }

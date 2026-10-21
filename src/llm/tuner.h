@@ -47,6 +47,8 @@ struct janas_tuner {
     int allow_gpu; /* candidates with the GPU may be chosen */
     int gpu_one;   /* ... for one token too (the GPU takes single tokens) */
     int forced;    /* >= 0: every pass uses this candidate (and is measured) */
+    int trying;    /* the last pick an alternative tried (exploring, or now
+                      and then), not the class's choice */
     /* the combinations of devices a class may use (common/devices.h: bit
        gpu | npu << 1), the user's choice; 0 any */
     int allowed[JANAS_TUNE_CLASSES];
