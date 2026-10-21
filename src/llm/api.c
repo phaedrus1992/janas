@@ -258,12 +258,13 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
        next) the region is smaller than the room the same slots take in it.
        A dense model is the case that cannot survive the difference - its one
        expert a layer is wanted at every token, in order, so a cache one slot
-       short of the layers is a cache that never hits. */
-    uint64_t slot = 0;
-    for (uint32_t l = 0; l < j.h.n_layer; l++)
-        if (j.layers[l].slot_bytes > slot)
-            slot = j.layers[l].slot_bytes;
-    uint64_t experts = (uint64_t)j.h.n_layer * j.h.n_expert * slot;
+       short of the layers is a cache that never hits. An MTP block in the
+       file with larger experts has slots of its own (expert_cache.h
+       create_split), and none is asked of it when the block comes in a
+       file of its own (model_load.c). */
+    uint32_t n_main = janas_llm_main_layers(&j);
+    uint64_t experts = janas_expert_cache_room(
+        &j, p.mtp_path ? n_main : j.h.n_layer, n_main, 3);
     if (experts < j.h.experts_bytes)
         experts = j.h.experts_bytes;
     /* what a token of context costs: keys and values of the layers that

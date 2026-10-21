@@ -1931,7 +1931,7 @@ int janas_gpu_finish(struct janas_gpu *g, int *waited)
     } else {
         while ((r = g->vkGetFenceStatus(g->dev, g->fence)) == VK_NOT_READY) {
             *waited = 1;
-            _mm_pause();
+            gpu_relax();
         }
     }
     g->t_waited = g->verbose ? now() - t0 : 0;

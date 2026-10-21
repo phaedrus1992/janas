@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include "pool.h"
+#include "aligned.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -185,10 +186,8 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     atomic_init(&p->ticket, 0);
     atomic_init(&p->spin, SPIN_ITERATIONS);
     p->threads = calloc((size_t)n_threads, sizeof(pthread_t));
-    if (posix_memalign((void **)&p->done, LINE,
-                       (size_t)n_threads * sizeof(*p->done)) != 0)
-        p->done = NULL;
-    else
+    p->done = janas_aligned_alloc(LINE, (size_t)n_threads * sizeof(*p->done));
+    if (p->done)
         memset(p->done, 0, (size_t)n_threads * sizeof(*p->done));
     if (cpus) {
         p->cpus = malloc((size_t)n_threads * sizeof(int));
@@ -198,7 +197,7 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     }
     if (!p->threads || !p->done || (cpus && !p->cpus)) {
         free(p->threads);
-        free(p->done);
+        janas_aligned_free(p->done);
         free(p->cpus);
         free(p);
         return NULL;
@@ -370,7 +369,7 @@ void janas_pool_destroy(struct janas_pool *p)
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->wake_idle);
     free(p->threads);
-    free(p->done);
+    janas_aligned_free(p->done);
     free(p->cpus);
     free(p);
 }
