@@ -2,6 +2,12 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-22] - Janas's classes for FreeBASIC
+
+- **`include/janas/janas_oop.bi`: Janas-LLM and Janas-MCP with objects, for FreeBASIC** - `Janas.Model`, `Janas.Chat`, their options, a reply's counters, a conversation kept by the program, a handler that receives a reply as it is written through its overridden methods, and an MCP server's tools; objects that close what they hold at the end of their scope and cannot be copied, a Chat that knows when its Model closed; methods that return False and say why. `include/janas/janas.bi` takes `llm.bi` and `mcp.bi` in one include. `tests/test_fb`, in the suite where FreeBASIC is found, tries every class without a model; `tests/fb_check`, on a model, finds the classes' replies the library's own in C, byte for byte.
+- **The chat in FreeBASIC moved from `tools/` to `examples/fb-chat/`**, beside its version with classes, `chat_oop.bas`; its counters' line no longer overflows past 99.9 tokens a second.
+- `llm.bi`: its last note gives the parameter blocks' sizes as they are, 64, 80 and 192 bytes (it said 56, 72 and 176).
+
 ## [2026-10-22] - The module for Node.js in the Linux package
 
 - **The Linux package carries `janas.node`** and its types for TypeScript, `janas.d.ts`, in `node/`: a Node.js program opens a model with the package alone, without building Janas. The release workflow checks that the module, as packed, loads, where its runner has Node.js. The Windows package has no module yet.

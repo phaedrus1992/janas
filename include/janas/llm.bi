@@ -417,6 +417,7 @@ declare function janas_llm_chat_stats(byval c as const janas_llm_chat ptr, _
 end extern
 
 '' The parameter blocks carry their own size, and every call checks it, so a
-'' header out of step with the library is refused instead of misread. As
-'' built on 25 Sep 2026 the sizes are 56, 72 and 176 bytes; a program can see
-'' for itself with sizeof() and with janas_llm_abi_version().
+'' header out of step with the library is refused instead of misread. On
+'' x86-64 the sizes are 64, 80 and 192 bytes (22 Oct 2026), the C header's
+'' field for field; a program can see for itself with sizeof() and with
+'' janas_llm_abi_version().
