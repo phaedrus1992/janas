@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/devices.h"
 #include "common/env_names.h"
 #include "common/model_pick.h"
 #include "common/sysinfo.h"
@@ -115,6 +116,39 @@ static struct {
     atomic_int busy, stop, done, total;
 } prep;
 
+/*
+ * The NPU made ready in sight. The first blocks the NPU reads in a session
+ * wait while its weights are copied and its graphs compiled - seconds to a
+ * minute, inside janas_llm_chat_next, where the chat draws nothing - so a
+ * watcher draws the footer meanwhile, which says how far it is
+ * (janas_llm_npu_preparing). Only while the chat is in the engine
+ * (in_engine), and under lock, which the chat takes to come out: it never
+ * draws beside the chat's own writing, and the footer asks the engine then
+ * only what may be asked from aside, as while the system message is read
+ * ahead.
+ */
+static struct {
+    pthread_t th;
+    int on; /* started, not joined */
+    pthread_mutex_t lock;
+    atomic_int in_engine, stop;
+    const janas_llm *llm;
+} watch = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+/* the chat goes into the engine for a pass that may make the NPU ready,
+   and comes out of it: the watcher may draw in between */
+static void engine_in(void)
+{
+    atomic_store(&watch.in_engine, 1);
+}
+
+static void engine_out(void)
+{
+    pthread_mutex_lock(&watch.lock);
+    atomic_store(&watch.in_engine, 0);
+    pthread_mutex_unlock(&watch.lock);
+}
+
 static int prep_pct(void)
 {
     int t = atomic_load(&prep.total), d = atomic_load(&prep.done);
@@ -138,7 +172,7 @@ static void footer(const janas_llm *llm, const janas_llm_chat *c,
     /* while the system message is read ahead, the chat and the engine's
        settings are the reading thread's: only the cache's filling, which
        is made to be watched from aside, is asked */
-    int reading = atomic_load(&prep.busy);
+    int reading = atomic_load(&prep.busy) || atomic_load(&watch.in_engine);
     struct janas_llm_chat_stats s = {.size = sizeof(s)};
     int have = c && !reading && janas_llm_chat_stats(c, &s) == JANAS_LLM_OK;
     int32_t used = 0, most = 0;
@@ -156,6 +190,15 @@ static void footer(const janas_llm *llm, const janas_llm_chat *c,
         foot_add(part, &np, 2, "%d/%d experts", used, most);
     } else if (!state) /* kept longest: it is what holds the reply back */
         foot_add(part, &np, 9, "reading the tools ahead %d%%", prep_pct());
+    int32_t nd = 0, nt = 0;
+    double ns = 0;
+    if (janas_llm_npu_preparing(llm, &nd, &nt, &ns) == 1) { /* held back too */
+        if (nt > 0)
+            foot_add(part, &np, 9, "preparing the NPU %d/%d, %.0f s", (int)nd,
+                     (int)nt, ns);
+        else
+            foot_add(part, &np, 9, "preparing the NPU, %.0f s", ns);
+    }
     if (have && s.context_size)
         foot_add(part, &np, 4, "context %u/%u", s.context_used, s.context_size);
     /* only where it is on, and only where it means something: it is the one
@@ -221,15 +264,22 @@ static const janas_llm_chat *idle_chat;
 
 static int footer_idle(void)
 {
-    static int shown = -2;
+    static int shown = -2, shown_npu = -2;
     int64_t done = 0, total = 0;
     janas_llm_preload(idle_llm, &done, &total);
     int pct = total > done ? (int)(100 * done / total) : -1;
     /* and the reading ahead's share, while it goes */
     pct = pct * 1000 + (atomic_load(&prep.busy) ? prep_pct() : 999);
-    if (pct == shown)
+    /* and the NPU's preparation, a second at a time */
+    int32_t nd = 0;
+    double ns = 0;
+    int npu = janas_llm_npu_preparing(idle_llm, &nd, NULL, &ns) == 1
+                  ? (int)nd * 10000 + (int)ns
+                  : -1;
+    if (pct == shown && npu == shown_npu)
         return 0;
     shown = pct;
+    shown_npu = npu;
     footer(idle_llm, idle_chat, NULL);
     return 1;
 }
@@ -308,6 +358,22 @@ static void usage(void)
         "reading them\n"
         "  --no-gpu         never give the GPU work, whatever the mode "
         "says\n"
+        "  --prompt-on <devices>\n"
+        "                   what reads the prompts: auto (default: what\n"
+        "                   measures fastest here), cpu, gpu, npu, npu+gpu\n"
+        "                   (both in each pass), or a list apart by commas\n"
+        "                   for the engine to choose from, such as npu,gpu;\n"
+        "                   the CPU takes part in every pass, the NPU in\n"
+        "                   blocks of 64 tokens and more; a choice wins\n"
+        "                   over the mode\n"
+        "  --drafts-on <devices>\n"
+        "                   the same for the passes that check guessed\n"
+        "                   tokens (2 to 16)\n"
+        "  --reply-on <devices>\n"
+        "                   the same for a reply's tokens, one at a time\n"
+        "  --npu-int8       the NPU reads prompts with eight-bit\n"
+        "                   activations: faster, a little less exact\n"
+        "                   (dense Qwen3 models)\n"
         "  --mcp-config <file>\n"
         "                   the MCP servers whose tools the model may call\n"
         "                   (default ~/.config/janas/mcp.json, in the\n"
@@ -622,7 +688,9 @@ static void prep_start(janas_llm_chat *c)
         return;
     int32_t d = 0, t = 0;
     double t0 = now_ms();
+    engine_in(); /* the first block: the NPU may be made ready in it */
     int r = janas_llm_chat_prepare(c, &d, &t);
+    engine_out();
     if (r < 0) {
         prep_say(T_WARN(&term),
                  "the system message could not be read "
@@ -680,6 +748,49 @@ static void prep_wait(const janas_llm *llm, int stop)
     }
     pthread_join(prep.th, NULL);
     prep.on = 0;
+}
+
+static void *watch_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&watch.stop)) {
+        struct timespec ts = {0, 250 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        if (!atomic_load(&watch.in_engine) ||
+            janas_llm_npu_preparing(watch.llm, NULL, NULL, NULL) != 1)
+            continue;
+        pthread_mutex_lock(&watch.lock);
+        if (atomic_load(&watch.in_engine))
+            footer(watch.llm, NULL, "");
+        pthread_mutex_unlock(&watch.lock);
+    }
+    return NULL;
+}
+
+static void watch_start(const janas_llm *llm)
+{
+    watch.llm = llm;
+    atomic_store(&watch.stop, 0);
+    watch.on = pthread_create(&watch.th, NULL, watch_main, NULL) == 0;
+}
+
+static void watch_stop(void)
+{
+    if (!watch.on)
+        return;
+    atomic_store(&watch.stop, 1);
+    pthread_join(watch.th, NULL);
+    watch.on = 0;
+}
+
+/* janas_llm_chat_next, the watcher free to draw while it runs */
+static int32_t engine_next(janas_llm_chat *c, char *buf, int32_t cap,
+                           int32_t *len)
+{
+    engine_in();
+    int32_t rc = janas_llm_chat_next(c, buf, cap, len);
+    engine_out();
+    return rc;
 }
 
 /*
@@ -834,21 +945,27 @@ struct chat_opts { /* where the words land: main keeps them, this names them */
     int *all_tools;
     int *profile; /* 1: the catalog's fast profile */
     int *tune;    /* 1: measure again (--tune), -1: never (--no-tune) */
+    /* --prompt-on, --drafts-on, --reply-on as masks (common/devices.h; 0:
+       as the engine chooses) and --npu-int8, put in the engine's variables
+       when read, for the next model to open */
+    int *devices;
+    int *npu_int8;
 };
 
 /* every option, for the nearest to one mistyped: the first N_ALONE stand
    alone, the others take a value */
-#define N_ALONE 14
+#define N_ALONE 15
 static const char *const OPTIONS[] = {
-    "--no-spec",     "--stats",     "--no-markdown", "--no-gpu",
-    "--no-preload",  "--no-recap",  "--no-mtp",      "--no-mcp",
-    "--no-services", "--all-tools", "--mcp-auto",    "--mcp-instructions",
-    "--tune",        "--no-tune",   "--mtp",         "--draft",
-    "--think",       "--mode",      "--ctx",         "--cache",
-    "--reserve",     "--bits",      "--attention",   "--system",
-    "--mcp-config",  "--progress",  "--temp",        "--top-k",
-    "--top-p",       "--min-p",     "--seed",        "--max",
-    "--head",        "--profile",   "--models"};
+    "--no-spec",     "--stats",      "--no-markdown", "--no-gpu",
+    "--no-preload",  "--no-recap",   "--no-mtp",      "--no-mcp",
+    "--no-services", "--all-tools",  "--mcp-auto",    "--mcp-instructions",
+    "--tune",        "--no-tune",    "--npu-int8",    "--mtp",
+    "--draft",       "--think",      "--mode",        "--ctx",
+    "--cache",       "--reserve",    "--bits",        "--attention",
+    "--system",      "--mcp-config", "--progress",    "--temp",
+    "--top-k",       "--top-p",      "--min-p",       "--seed",
+    "--max",         "--head",       "--profile",     "--models",
+    "--prompt-on",   "--drafts-on",  "--reply-on"};
 #define N_OPTIONS (sizeof OPTIONS / sizeof *OPTIONS)
 
 /* v of option a as a whole number or a number within limits; on a
@@ -952,6 +1069,11 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             *o->tune = a[2] == 't' ? 1 : -1;
             continue;
         }
+        if (strcmp(a, "--npu-int8") == 0) {
+            *o->npu_int8 = 1;
+            setenv("JANAS_NPU_A8", "1", 1); /* read when the model opens */
+            continue;
+        }
         int valued = 0;
         for (size_t j = N_ALONE; j < N_OPTIONS && !valued; j++)
             valued = strcmp(a, OPTIONS[j]) == 0;
@@ -965,7 +1087,11 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             return -1;
         }
         i++;
-        if (strcmp(a, "--mtp") == 0)
+        if ((k = janas_devices_option(a, v, why, why_len)) != 0) {
+            if (k < 0)
+                return -1;
+            o->devices[k - 1] = janas_devices_mask(v, why, why_len);
+        } else if (strcmp(a, "--mtp") == 0)
             o->mp->mtp_path = v;
         else if (strcmp(a, "--draft") == 0)
             o->mp->draft_path = v;
@@ -1222,6 +1348,14 @@ static void conf_write(const char *path, const struct chat_opts *o)
         fprintf(f, "--no-markdown\n");
     if (!*o->gpu)
         fprintf(f, "--no-gpu\n");
+    for (int k = 0; k < JANAS_DEVICES_OPTIONS; k++)
+        if (o->devices[k]) {
+            char nm[64];
+            janas_devices_name(o->devices[k], nm, sizeof nm);
+            fprintf(f, "%s %s\n", janas_devices_options[k], nm);
+        }
+    if (*o->npu_int8)
+        fprintf(f, "--npu-int8\n");
     if (*o->mcp_config)
         fprintf(f, "--mcp-config %s\n", *o->mcp_config);
     if (!*o->mcp)
@@ -1481,8 +1615,7 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
     struct janas_md md;
     md_init(&md, &term, markdown);
     term_puts(&term, T_MODEL(&term));
-    while ((rc = janas_llm_chat_next(c, piece, sizeof(piece), &len)) ==
-           JANAS_LLM_OK) {
+    while ((rc = engine_next(c, piece, sizeof(piece), &len)) == JANAS_LLM_OK) {
         /* the reasoning in grey: the colour changes only where the
            reasoning starts and ends */
         int th = janas_llm_chat_thinking(c);
@@ -1559,6 +1692,19 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
             sess_seconds += st.output_seconds;
         }
     }
+    /* the NPU made ready meanwhile: said once, so a slow first reply is
+       understood */
+    static double npu_said;
+    double ns = 0;
+    if (term.tty && janas_llm_npu_preparing(llm, NULL, NULL, &ns) == 0 &&
+        ns > npu_said + 0.5) {
+        term_gap(&term);
+        term_printf(&term,
+                    "%s[the NPU made ready for this model in %.0f s, "
+                    "once a session]%s\n",
+                    T_DIM(&term), ns - npu_said, T_RESET(&term));
+        npu_said = ns;
+    }
     if (stats) {
         term_gap(&term);
         report(c);
@@ -1602,13 +1748,14 @@ int main(int argc, char **argv)
     int gpu = 1;      /* the GPU may be given work, if there is one */
     const char *mcp_config = NULL; /* NULL: the default file */
     int mcp = 1, mcp_auto = 0, mcp_instructions = 0, services = 1, no_mtp = 0;
-    int all_tools = 0, profile = 0, tune = 0;
+    int all_tools = 0, profile = 0, tune = 0, npu_int8 = 0;
+    int devices[JANAS_DEVICES_OPTIONS] = {0, 0, 0};
     static char mtp_found[4096];
     struct chat_opts o = {
         &mp,       &cp,         &system_arg, &stats,     &markdown,
         &gpu,      &mcp_config, &mcp,        &mcp_auto,  &mcp_instructions,
         &services, &no_mtp,     mtp_found,   &all_tools, &profile,
-        &tune};
+        &tune,     devices,     &npu_int8};
     /*
      * The settings in layers, each over the one before: the catalog's
      * profile for the model, the chat's own file, the model's file, the
@@ -1852,6 +1999,7 @@ int main(int argc, char **argv)
         idle_llm = llm;
         idle_chat = c;
         line_idle = footer_idle;
+        watch_start(llm);
     } else
         fprintf(stderr, "%s\n/help for the commands\n", desc);
     prep_start(c);
@@ -2088,6 +2236,7 @@ int main(int argc, char **argv)
         footer(llm, c, NULL);
     }
     prep_wait(llm, 1);
+    watch_stop();
     failed_clear();
     free(msg);
     free(system);

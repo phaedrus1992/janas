@@ -219,7 +219,16 @@ enum janas_qtype {
     /* Janas' own, outside the GGUF numbering: the high plane of a Q6_K row
        cut into bit planes. Its block size counts that plane alone; the other
        two are JANAS_Q6KP_PLANE bytes each and are passed separately. */
-    JANAS_Q6_K_P = 214
+    JANAS_Q6_K_P = 214,
+    /* Janas' own too: a down matrix by neuron, its rows the neurons (each
+       its outputs, of the model's width) stored by block of 256 outputs -
+       every neuron's block 0, then every neuron's block 1 - in Q6_K's bit
+       planes laid out as JANAS_Q6_K_P's, after a float per output channel
+       that multiplies the sum (tools/jns_neurons.c): read a neuron at a time,
+       at the depth its contribution earns (janas_q6kpn_axpy). The block size
+       counts the base plane alone, as JANAS_Q6_K_P's; the matrix's bytes add
+       the channels' floats. */
+    JANAS_Q6_K_PN = 215
 };
 
 /* Bytes of one 256-weight block of the type, 0 if unsupported. */
@@ -346,6 +355,38 @@ void janas_q6kp_to_q6k(const struct janas_block_q6kp *base, const uint8_t *p1,
 void janas_q6kp_dequantize(const struct janas_block_q6kp *base,
                            const uint8_t *p1, const uint8_t *p0, float *y,
                            size_t n);
+/* n floats (n a multiple of JANAS_QK) as Q6_K: each group of 16 its scale,
+   chosen among a few near its largest magnitude for the least squared
+   error, the block's factor then fitted by least squares (quant_q6k.c). */
+void janas_q6k_quantize(const float *x, struct janas_block_q6k *y, size_t n);
+/* y[0 .. n) += h times a row of n weights in Q6_K's bit planes read at a
+   level - 3 the three planes, 2 the base and p1, 1 the base alone; the
+   planes below the level may be NULL - the same values as
+   janas_q6kp_dequantize: a row of JANAS_Q6_K_PN, one neuron's outputs. */
+void janas_q6kpn_axpy(const struct janas_block_q6kp *base, const uint8_t *p1,
+                      const uint8_t *p0, int level, float h, float *y,
+                      size_t n);
+/* The same without vector instructions, bit for bit: the reference. */
+void janas_q6kpn_axpy_ref(const struct janas_block_q6kp *base,
+                          const uint8_t *p1, const uint8_t *p0, int level,
+                          float h, float *y, size_t n);
+/* The down by neuron in integers: n <= JANAS_PN_CHUNK neurons of a matrix
+   of `rows` neurons stored by block of outputs (block b of neuron j at
+   base + b * rows + j, its planes at the same index of p1 and p0), neuron
+   i = js[i] read at level lv[i] (1 to 3) with activation h[i]; their block
+   b of 256 outputs added to y[0 .. 256). The factors h d sc are
+   quantized to eight bits over the chunk, as the products by rows quantize
+   their activations, and the sums are exact integers: janas_q6kpn_chunk_ref,
+   without vector instructions, gives the same bits. */
+#define JANAS_PN_CHUNK 128
+void janas_q6kpn_chunk(const struct janas_block_q6kp *base, const uint8_t *p1,
+                       const uint8_t *p0, size_t rows, const uint32_t *js,
+                       const uint8_t *lv, const float *h, uint32_t n, size_t b,
+                       float *y);
+void janas_q6kpn_chunk_ref(const struct janas_block_q6kp *base,
+                           const uint8_t *p1, const uint8_t *p0, size_t rows,
+                           const uint32_t *js, const uint8_t *lv,
+                           const float *h, uint32_t n, size_t b, float *y);
 float janas_q6kp_dot(const struct janas_block_q6kp *w, const uint8_t *p1,
                      const uint8_t *p0, const struct janas_block_q8k *x,
                      size_t nb);

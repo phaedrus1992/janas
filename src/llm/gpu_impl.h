@@ -22,11 +22,20 @@
 
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
+
+/* the spin-wait hint while a submission runs, as pool.c's */
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define gpu_relax() _mm_pause()
+#elif defined(__aarch64__)
+#define gpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define gpu_relax() ((void)0)
+#endif
 
 #define MAX_REGIONS 48
 #define MAX_PENDING 64
@@ -170,8 +179,8 @@ struct janas_gpu {
     uint32_t nvg;  /* vectors a product's workgroup takes (NV_PER_GROUP) */
     /* a mixture's experts in one dispatch (experts_id): Q4_K, Q6_K_P,
        Q6_K, MXFP4 */
-    VkShaderModule sm_id4, sm_id6, sm_id6s, sm_idmx;
-    VkPipeline pipe_id4, pipe_id6, pipe_id6s, pipe_idmx;
+    VkShaderModule sm_id4, sm_id6, sm_id6s, sm_idmx, sm_id3;
+    VkPipeline pipe_id4, pipe_id6, pipe_id6s, pipe_idmx, pipe_id3;
     struct stage ts; /* their table, 3 uvec4 an expert */
     /* the product shaders made for a single vector (prod_index) */
     VkShaderModule pm1[N_PROD];

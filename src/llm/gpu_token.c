@@ -95,10 +95,12 @@ static const char *check_ffn(const struct janas_gpu *g,
         return NULL;
     }
     int gt = ly->gate.type, dt = ly->down.type;
-    if (!(gt == JANAS_Q4_K || (gt == JANAS_MXFP4 && g->pipe_idmx)) ||
+    if (!(gt == JANAS_Q4_K || (gt == JANAS_MXFP4 && g->pipe_idmx) ||
+          (gt == JANAS_Q3_K && g->pipe_id3)) ||
         ly->up.type != gt ||
         !(dt == JANAS_Q4_K || dt == JANAS_Q6_K || dt == JANAS_Q6_K_P ||
-          (dt == JANAS_MXFP4 && g->pipe_idmx)) ||
+          (dt == JANAS_MXFP4 && g->pipe_idmx) ||
+          (dt == JANAS_Q3_K && g->pipe_id3)) ||
         ly->gate.rows != md->eff || ly->up.rows != md->eff ||
         ly->gate.cols != md->dm || ly->up.cols != md->dm ||
         ly->down.rows != md->dm || ly->down.cols != md->eff)

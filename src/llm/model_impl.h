@@ -20,6 +20,7 @@
 #include "gpu.h"
 #include "gpu_token.h"
 #include "jns.h"
+#include "jmath.h"
 #include "quant.h"
 #include "tuner.h"
 
@@ -80,11 +81,22 @@ struct janas_llm_model {
        (and whether the GPU helps) for each kind of pass */
     int p_cores, p_threads, all_threads;
     struct janas_tuner tuner;
+    double last_pass_s; /* janas_llm_model_pass_seconds */
     char tune_key[768];
-    int gpu_use;           /* the current pass may use the GPU */
-    struct janas_gpu *gpu; /* optional, for products over blocks */
-    int resident_gpu;      /* the resident region belongs to the GPU */
-    int gpu_off;           /* weights not shared with it: CPU only */
+    int gpu_use;             /* the current pass may use the GPU */
+    struct janas_gpu *gpu;   /* optional, for products over blocks */
+    struct janas_m_npu *npu; /* optional (JANAS_NPU=1), model_npu.c */
+    int npu_use;             /* the current pass may use the NPU */
+    char npu_why[160];       /* no NPU: why (janas_llm_model_npu_why) */
+    int resident_gpu;        /* the resident region belongs to the GPU */
+    int gpu_off;             /* weights not shared with it: CPU only */
+    /* the user keeps prompts off the GPU (--prompt-on cpu, npu): its fast
+       prompt, which reads them whatever the tuner chose, does not */
+    int prompts_off_gpu;
+    /* the user's devices for prompts, drafts, replies (common/devices.h:
+       janas_devices_vars' order), as this machine has them; 0 as the
+       engine chooses */
+    int dev_on[3];
     /* the experts' arena on the GPU (dense models, and mixtures whose
        every expert fits the cache): 0 not yet, 1 there, -1 not possible;
        arena_stale when a slot changed since - the GPU's copy no longer
@@ -200,6 +212,10 @@ struct janas_llm_model {
     int base; /* buffer holding the base */
     int src;  /* this call: buffer the tokens start from */
     uint32_t base_pos, log_n, replay;
+    /* the call goes on from the one before it in the same pass (the NPU's
+       second half of a block): the state and the convolution's inputs read
+       where that one left them, in the other buffer */
+    int rec_cont;
     uint32_t n_ctx_train; /* what the model was trained for, 0 if unsaid */
 
     /*
@@ -259,6 +275,54 @@ struct janas_llm_model {
     uint32_t *pair_tok, *pair_exp, *order, *count, *glist;
     float *pair_w, *gate, *up, *h, *dout;
     uint32_t *hlen; /* per pair row: the rows of its expert's gate */
+    /* the Ana-Net probe (model_ana.c): its mode (0 off), the fraction of a
+       pair's neurons switched off, each pair row's agreements (ff_buf floats
+       a row), the layer being computed, a token's picture and where it goes */
+    int ana_mode, ana_tok; /* ana_tok: the fraction is of a token's neurons */
+    float ana_frac;
+    float *ana_agree;
+    /* each pair row's expert (n_expert: the shared one), and the norms of
+       the columns of each layer's experts' down matrices, with whether
+       computed yet */
+    uint32_t *ana_exp;
+    float *ana_coln;
+    uint8_t *ana_coln_ok;
+    /* JANAS_ANA_STATS: every pair's record, and the tokens done so far */
+    FILE *ana_stats, *ana_xstats; /* ana_xstats: JANAS_ANA_XSTATS */
+    uint64_t ana_base;
+    /* JANAS_ANA_COARSE: each pair row's h from gate and up at two bits, the
+       choice made on it; the neurons both choices keep, and the true one's */
+    float *ana_coarse;
+    uint64_t ana_both_kept, ana_true_kept;
+    /* JANAS_ANA_GRADE: the fractions of a token's neurons kept at 6, 4 and 2
+       bits of down, and each pair row's levels (3, 2, 1; 0 off) */
+    float ana_grade[3];
+    uint8_t *ana_level;
+    /* JANAS_ANA_GULOW: the routed experts of least weight in a token whose
+       gate and up are read at two bits, and each pair row's mark */
+    int ana_gulow;
+    uint8_t *ana_low;
+    uint32_t ana_layer, ana_width;
+    /* the Janet probe (model_janet.c): a layer's feed-forward recorded, or
+       run by Janet's detectors in its place; NULL when off */
+    struct janas_janet *janet;
+    uint8_t *ana_frame;
+    char ana_dir[512];
+    int ana_frames, ana_frames_max;
+    /* the experts' down matrix by neuron (model_neurons.c): whether a layer
+       has it, whether a token's neurons are ranked into levels and the
+       fractions read at 6, 4 and 2 bits, each pair row's levels, a pass's
+       scores and its pair rows by token */
+    int neuron_down, neuron_rank;
+    float neuron_frac[3];
+    uint8_t *nlevel;
+    float *nscore;
+    /* a token's chunks of neurons, each its sum, and its length; the pair
+       rows whose h needs no eight-bit copy */
+    float *npart;
+    size_t npart_len;
+    uint8_t *nskipq;
+    uint32_t *ntok_first, *ntok_fill, *ntok_list;
     struct janas_block_q8k *xg, *hq;
     uint32_t k_use; /* experts used per token, at most k (see set_experts) */
     int exp_level;  /* planes of the experts' down matrix read: 1, 2 or 3 */
@@ -365,7 +429,7 @@ static inline void rms_norm(float *out, const float *x, const float *w,
 
 static inline float sigmoid(float x)
 {
-    return 1.0f / (1.0f + expf(-x));
+    return 1.0f / (1.0f + janas_expf(-x));
 }
 
 /*
@@ -388,9 +452,53 @@ struct tok_job {
 void janas_m_init_tuner(struct janas_llm_model *m);
 /* Memory the GPU will import collapsed into 2 MB pages (Linux; see
    model_load.c), before the import pins it. */
+/* The Ana-Net probe (model_ana.c, JANAS_ANA_*): set up at load (0, or -1
+   out of memory), each run's agreements after its gate and up products, a
+   pair row's neurons switched off before its down product, a token's
+   picture written once its layers are done, freed. */
+int janas_m_ana_init(struct janas_llm_model *m, size_t pairs);
+void janas_m_ana_agree(struct janas_llm_model *m, const uint8_t *wg,
+                       const uint8_t *wu, const struct janas_jns_matrix *mx,
+                       uint32_t a, uint32_t b);
+void janas_m_ana_mask(struct janas_llm_model *m, size_t g, float *h,
+                      uint32_t ff);
+void janas_m_ana_coln(struct janas_llm_model *m, uint32_t e,
+                      const uint8_t *down, const uint8_t *p1, const uint8_t *p0,
+                      const struct janas_jns_matrix *mx);
+void janas_m_ana_tok(struct janas_llm_model *m, uint32_t n);
+void janas_m_ana_lowmark(struct janas_llm_model *m, uint32_t n);
+void janas_m_ana_grade(struct janas_llm_model *m, const uint8_t *down,
+                       const uint8_t *p1, const uint8_t *p0,
+                       const struct janas_jns_matrix *mx, uint32_t a,
+                       uint32_t b);
+void janas_m_ana_frame(struct janas_llm_model *m, uint32_t n);
+void janas_m_ana_free(struct janas_llm_model *m);
+int janas_m_janet_init(struct janas_llm_model *m);
+void janas_m_janet_rec(struct janas_llm_model *m, uint32_t l, uint32_t n,
+                       int after);
+int janas_m_janet_ffn(struct janas_llm_model *m, uint32_t l, uint32_t n);
+void janas_m_janet_free(struct janas_llm_model *m);
+/* The experts' down matrix by neuron (model_neurons.c): set up at load (0,
+   or -1 out of memory), the levels of a pass's neurons, its experts' down
+   products, freed. An expert whose down matrix is by neuron, applied to the
+   pair rows [a, b): */
+struct janas_neuron_run {
+    const float *scale; /* each output channel's, after the sum */
+    const struct janas_block_q6kp *base;
+    const uint8_t *p1, *p0; /* the planes the cache holds, or NULL */
+    uint32_t rows, cols;    /* neurons, outputs */
+    uint32_t a, b;
+};
+int janas_m_neurons_init(struct janas_llm_model *m, size_t pairs);
+void janas_m_neuron_levels(struct janas_llm_model *m, uint32_t ng);
+void janas_m_neuron_down(struct janas_llm_model *m,
+                         const struct janas_neuron_run *runs, uint32_t n);
+void janas_m_neurons_free(struct janas_llm_model *m);
 void janas_m_huge_pages(void *p, uint64_t bytes);
-/* The longest region of memory the GPU imports (gpu.c janas_gpu_import). */
-#define JANAS_M_REGION_MAX ((uint64_t)4 << 30)
+/* The longest region of memory the GPU imports (gpu.c janas_gpu_import): a
+   page short of 4 GiB, which Mesa's Intel driver gave the kernel as 0 bytes
+   (21 Oct 2026). */
+#define JANAS_M_REGION_MAX (((uint64_t)4 << 30) - 4096)
 /* The next region the GPU imports of bytes, from at: its first byte into
    *from (at, or the 2 MB boundary before it where huge: memory allocated on
    one), and its end, returned: bytes, or past at a multiple of unit (unit
@@ -408,16 +516,88 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
 void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv);
 /* Whether the whole token is asked of the GPU (JANAS_GPU_TOKEN=1). */
 int janas_m_gpu_token_asked(void);
+/* model_npu.c: the NPU for the products of blocks (JANAS_NPU=1), opened
+   once the resident region is read; janas_m_products runs a group of
+   products as janas_gpu_matvec_group does, those the NPU takes there. */
+void janas_m_npu_open(struct janas_llm_model *m);
+void janas_m_npu_close(struct janas_llm_model *m);
+/* Whether the NPU takes products of a pass of n tokens (its candidate has
+   it, and n reaches JANAS_NPU_MIN_N). */
+int janas_m_npu_takes(const struct janas_llm_model *m, uint32_t n);
+/* Whether the tuner may give the NPU the blocks by itself: where its
+   answers measured at par with the CPU's (janas_llm_model_npu_auto). */
+int janas_m_npu_auto(const struct janas_llm_model *m);
+/* The NPU kept awake through a pass of n tokens it takes products of
+   (between them the CPU works long enough for it to be suspended), let
+   sleep otherwise. */
+void janas_m_npu_awake(struct janas_llm_model *m, uint32_t n);
+/* A pass is over: a preparation of the NPU's graphs it began, too
+   (janas_llm_model_npu_preparing). */
+void janas_m_npu_pass_end(struct janas_llm_model *m);
+/*
+ * A feed-forward run (an expert, a shared expert, a dense model's) on the
+ * NPU in one trip: gate, up, the activation and down, its n_vec rows of x
+ * (Q8_K) in, n_vec rows of d_model floats out at dout once finished. w:
+ * the slots of gate, up and down (each matrix at its mx offset in it),
+ * plane: down's planes (Q6_K_P), mx their matrices. 0 with the run in flight
+ * (the caller computes the others, then janas_m_npu_ffn_finish), -1 if it stays
+ * on the CPU. One at a time.
+ */
+struct janas_m_npu_ffn {
+    struct npu_entry *e;
+    float *dout;
+    size_t n_vec, d;
+};
+int janas_m_npu_ffn_begin(struct janas_llm_model *m, const uint8_t *const w[3],
+                          const uint8_t *const plane[2],
+                          const struct janas_jns_matrix *mx,
+                          const struct janas_block_q8k *x, uint32_t n_vec,
+                          float *dout, struct janas_m_npu_ffn *job);
+/* Waits for it and stores its rows; -1 if the NPU failed (the run is then
+   the caller's to compute). */
+int janas_m_npu_ffn_finish(struct janas_llm_model *m,
+                           struct janas_m_npu_ffn *job);
+/*
+ * The block's first layers on the NPU, a graph each (norms, projections,
+ * the FFN, the residual), the attention or the recurrence between them on
+ * the CPU: for dense models laid out as Qwen3, Qwen3.5 or Gemma 4, when at
+ * least nine layers in ten fit the NPU (JANAS_NPU_LAYERS=2: the first ones
+ * alone, however few; 0: never). The number of layers done
+ * (m->n_layer: all), m->x their output, the caller's loop going on from
+ * there; -1 if not done (nothing touched), -2 if the NPU failed halfway
+ * (the block cannot be finished).
+ */
+int janas_m_npu_layers(struct janas_llm_model *m, uint32_t n, uint32_t pos0);
+/* The calibration of the NPU's INT8 activations (JANAS_NPU_A8=1): rows of
+   width values (stride apart) of an input of layer l's products, at site
+   0 the attention's output (wo), 1 the FFN's norm (gate, up), 2 the FFN's
+   intermediate (down), 3 the norm before the attention (q, k, v); their
+   channel maxima kept. Nothing outside a calibration's pass. */
+void janas_m_npu_calib(struct janas_llm_model *m, int site, uint32_t l,
+                       const float *x, uint32_t rows, uint32_t width,
+                       size_t stride);
+void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
+                      const struct janas_matvec_task *t, size_t n);
 uint32_t *janas_m_profile_read(const struct janas_llm_model *m, size_t *used);
 void janas_m_profile_write(const struct janas_llm_model *m);
 void janas_m_norm_quant(struct janas_llm_model *m, const float *w,
                         uint32_t first, uint32_t n);
 void janas_m_residual(struct janas_llm_model *m, uint32_t n);
 void janas_m_post_norm(struct janas_llm_model *m, const float *w, uint32_t n);
+void janas_m_attn_core(struct janas_llm_model *m, const struct layer *ly,
+                       uint32_t n, uint32_t pos0, double ta);
 void janas_m_attn_layer(struct janas_llm_model *m, const struct layer *ly,
                         uint32_t n, uint32_t pos0);
 void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                        uint32_t n);
+/* Its recurrence on a block whose input products are in m->big and betas
+   and alphas in m->ba: the convolution, the state, the gated norm, into
+   m->att. ta: when the layer began (its products counted with it). */
+void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
+                      uint32_t n, double ta);
+/* Qwen3.5's betas then alphas into m->ba, from n normalized rows of xn. */
+void janas_m_rec_ba(struct janas_llm_model *m, const struct layer *ly,
+                    const float *xn, uint32_t n);
 void janas_m_embed(struct janas_llm_model *m, int32_t token, float *x);
 /* sum of exp(l[i] - mx), i < n, vectorized where the CPU can */
 double janas_m_exp_sum(const float *l, uint32_t n, float mx);
@@ -469,7 +649,8 @@ static inline struct janas_gpu *janas_m_gpu(const struct janas_llm_model *m,
 {
     if (!m->gpu || m->gpu_off || (arena && m->arena_stale))
         return NULL;
-    if (m->gpu_use || (m->tuner.allow_gpu && janas_gpu_fast_prompt()))
+    if (m->gpu_use ||
+        (m->tuner.allow_gpu && janas_gpu_fast_prompt() && !m->prompts_off_gpu))
         return m->gpu;
     return NULL;
 }

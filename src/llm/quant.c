@@ -4,6 +4,7 @@
  * quant.c - quantized block formats and dot-product kernels (see quant.h).
  */
 #include "quant.h"
+#include "quant_q6kp.h"
 #include "vmath.h"
 #include "iq3s_grid.h"
 
@@ -571,14 +572,6 @@ float janas_q6k_dot_ref(const struct janas_block_q6k *w,
     return acc;
 }
 
-/* Byte of weight v in a two-bit plane, and the shift of its bits. */
-static inline int q6kp_index(int v, int *shift)
-{
-    int n = v / 128, part = (v % 128) / 32, l = v % 32;
-    *shift = 2 * part;
-    return 32 * n + l;
-}
-
 void janas_q6k_to_planes(const struct janas_block_q6k *src, size_t nb,
                          struct janas_block_q6kp *base, uint8_t *p1,
                          uint8_t *p0)
@@ -622,21 +615,6 @@ void janas_q6kp_to_q6k(const struct janas_block_q6kp *base, const uint8_t *p1,
             ql[l] |= (uint8_t)(part < 2 ? (q & 0xf) : ((q & 0xf) << 4));
         }
     }
-}
-
-/* Twice the value weight v stands for, at the level the planes give. */
-static inline int q6kp_value2(const struct janas_block_q6kp *b,
-                              const uint8_t *a1, const uint8_t *a0, int v,
-                              int level)
-{
-    int sh, i = q6kp_index(v, &sh);
-    int q = (b->q[i] >> sh) & 3;
-    if (level >= 2)
-        q = (q << 2) | ((a1[i] >> sh) & 3);
-    if (level >= 3)
-        q = (q << 2) | ((a0[i] >> sh) & 3);
-    /* the centre of the range the missing bits cover: half a step */
-    return level == 3 ? 2 * q : level == 2 ? 8 * q + 3 : 32 * q + 15;
 }
 
 void janas_q6kp_dequantize(const struct janas_block_q6kp *base,
@@ -1352,6 +1330,7 @@ size_t janas_qtype_block_size(int type)
 {
     switch (type) {
     case JANAS_Q6_K_P:
+    case JANAS_Q6_K_PN:
         return sizeof(struct janas_block_q6kp);
     case JANAS_Q4_K:
         return sizeof(struct janas_block_q4k);

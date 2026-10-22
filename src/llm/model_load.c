@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "attention.h"
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "common/sysinfo.h"
 #include "deltanet.h"
@@ -569,7 +570,7 @@ static int load_mtp(struct janas_llm_model *m, const char *path, char *err,
         snprintf(err, err_len, "%s: not an MTP block of this model", path);
         return -1;
     }
-    m->mtp_res = aligned_alloc(4096, h->resident_bytes);
+    m->mtp_res = janas_aligned_alloc(4096, h->resident_bytes);
     if (!m->mtp_res) {
         snprintf(err, err_len, "out of memory for the MTP block");
         return -1;
@@ -662,12 +663,24 @@ int janas_m_init_draft_head(struct janas_llm_model *m, const uint8_t *src,
     return 0;
 }
 
+uint32_t janas_llm_main_layers(const struct janas_jns *j)
+{
+    const struct janas_arch *a = janas_arch_find(j->h.arch, sizeof(j->h.arch));
+    char key[128];
+    uint32_t nextn = 0;
+    snprintf(key, sizeof(key), "%.32s.nextn_predict_layers", j->h.arch);
+    if (a && a->nextn_in_file && janas_jns_meta_u32(j, key, &nextn) == 0 &&
+        nextn < j->h.n_layer)
+        return j->h.n_layer - nextn; /* the file's last blocks predict ahead */
+    return j->h.n_layer;
+}
+
 /* A buffer a product writes: whole pages, so that the GPU can be given it
    (janas_gpu_import), listed for that. */
 static float *out_alloc(struct janas_llm_model *m, size_t bytes)
 {
     bytes = (bytes + 4095) & ~(size_t)4095;
-    float *p = aligned_alloc(4096, bytes ? bytes : 4096);
+    float *p = janas_aligned_alloc(4096, bytes ? bytes : 4096);
     if (p && m->n_out < (int)(sizeof(m->out) / sizeof(*m->out)))
         m->out[m->n_out++] = (struct janas_out_buf){p, bytes};
     return p;
@@ -689,11 +702,7 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         snprintf(err, err_len, "architecture %.32s not supported", m->j.h.arch);
         goto fail;
     }
-    m->n_layer = m->j.h.n_layer;
-    uint32_t nextn = 0;
-    if (m->a->nextn_in_file &&
-        meta_u32(m, "nextn_predict_layers", &nextn) == 0 && nextn < m->n_layer)
-        m->n_layer -= nextn; /* the file's last blocks predict ahead */
+    m->n_layer = janas_llm_main_layers(&m->j);
     m->d_model = m->j.h.d_model;
     m->n_expert = m->j.h.n_expert;
     m->k = m->j.h.n_expert_used;
@@ -730,8 +739,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
        12288): the buffers take the widest */
     for (uint32_t l = 0; l < m->n_layer; l++) {
         uint32_t r = m->j.layers[l].m[JANAS_JNS_GATE].rows;
+        const struct janas_jns_matrix *dn = &m->j.layers[l].m[JANAS_JNS_DOWN];
+        /* by neuron (tools/jns_neurons.c), its rows are the gate's */
+        int by_neuron = dn->type == JANAS_Q6_K_PN;
         if ((r != m->d_ff && m->n_expert > 1) || r % JANAS_QK ||
-            m->j.layers[l].m[JANAS_JNS_DOWN].rows != m->d_model) {
+            (by_neuron ? dn->rows != r || dn->cols != m->d_model
+                       : dn->rows != m->d_model)) {
             snprintf(err, err_len, "layer %u: expert shapes differ", l);
             goto fail;
         }
@@ -791,7 +804,7 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     }
     /* on 2 MB boundaries: see janas_m_huge_pages */
     if (!m->resident)
-        m->resident = aligned_alloc(
+        m->resident = janas_aligned_alloc(
             JANAS_HUGE_PAGE, (m->j.h.resident_bytes + JANAS_HUGE_PAGE - 1) /
                                  JANAS_HUGE_PAGE * JANAS_HUGE_PAGE);
     if (!m->resident) {
@@ -961,10 +974,10 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
        (gpu_token.h) */
     size_t kvb = (kv_len + 4095) / 4096 * 4096,
            ksb = (ks_len * sizeof(float) + 4095) / 4096 * 4096;
-    m->kcache = aligned_alloc(4096, kvb ? kvb : 4096);
-    m->vcache = aligned_alloc(4096, kvb ? kvb : 4096);
-    m->kscale = aligned_alloc(4096, ksb ? ksb : 4096);
-    m->vscale = aligned_alloc(4096, ksb ? ksb : 4096);
+    m->kcache = janas_aligned_alloc(4096, kvb ? kvb : 4096);
+    m->vcache = janas_aligned_alloc(4096, kvb ? kvb : 4096);
+    m->kscale = janas_aligned_alloc(4096, ksb ? ksb : 4096);
+    m->vscale = janas_aligned_alloc(4096, ksb ? ksb : 4096);
     m->kv_bytes = kvb;
     m->ks_bytes = ksb;
     /* a pair's rows: the experts', or a wider shared feed-forward's */
@@ -1018,6 +1031,18 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     m->gate = out_alloc(m, P * ff * sizeof(float));
     m->up = out_alloc(m, P * ff * sizeof(float));
     m->h = malloc(P * ff * sizeof(float));
+    if (janas_m_ana_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the Ana-Net probe");
+        goto fail;
+    }
+    if (janas_m_janet_init(m) != 0) {
+        snprintf(err, err_len, "the Janet probe could not start");
+        goto fail;
+    }
+    if (janas_m_neurons_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the neurons' levels");
+        goto fail;
+    }
     m->dout = out_alloc(m, P * dm * sizeof(float));
     m->xg = malloc(P * dm / JANAS_QK * sizeof(*m->xg));
     m->hq = malloc(P * ff / JANAS_QK * sizeof(*m->hq));
@@ -1206,8 +1231,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         m->caller_pinned = janas_cpus_save(m->caller_cpus) == 0;
         janas_pin_current_thread(pin);
     }
-    m->cache = janas_expert_cache_create(&m->j, o->cache_bytes, m->exp_level,
-                                         m->io, err, err_len);
+    /* an MTP block in the file has its experts in this cache, in slots of
+       their own where they are larger (issue #34); one in a file of its own
+       has a cache of its own, and the file's block is never asked for */
+    m->cache = janas_expert_cache_create_split(
+        &m->j, m->mtp_own_cache ? m->n_layer : m->j.h.n_layer, m->n_layer,
+        o->cache_bytes, m->exp_level, m->io, err, err_len);
     if (!m->cache)
         goto fail;
     /* reads ahead (model_ffn.c janas_m_prefetch): where they pay, of the
@@ -1307,6 +1336,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             for (int i = 0; i < m->n_out; i++)
                 janas_gpu_import(m->gpu, m->out[i].p, m->out[i].bytes);
     }
+    if (o->no_npu)
+        snprintf(m->npu_why, sizeof m->npu_why,
+                 "left off: the expert cache needs the memory its copies "
+                 "would take (--prompt-on npu asks for it)");
+    else
+        janas_m_npu_open(m);
     janas_m_init_tuner(m);
     return m;
 
@@ -1339,6 +1374,7 @@ void janas_llm_model_free(struct janas_llm_model *m)
         free(m->use_count);
         m->use_count = NULL;
     }
+    janas_m_npu_close(m);
     janas_gpu_tok_destroy(m->gpu, m->gtok);
     free(m->gtok_layers);
     free(m->gblk_layers);
@@ -1353,7 +1389,7 @@ void janas_llm_model_free(struct janas_llm_model *m)
         janas_pool_destroy(m->compute);
     janas_pool_destroy(m->io);
     if (!m->resident_gpu)
-        free(m->resident);
+        janas_aligned_free(m->resident);
     if (m->layers)
         for (uint32_t l = 0; l < m->n_layer; l++) {
             free(m->layers[l].sh_gate);
@@ -1363,16 +1399,19 @@ void janas_llm_model_free(struct janas_llm_model *m)
             free(m->layers[l].beta_own);
         }
     free(m->layers);
-    float *fl[] = {
-        m->conv_buf, m->x,     m->xn,        m->q,        m->kk,
-        m->vv,       m->att,   m->router,    m->rope_cos, m->rope_sin,
-        m->big,      m->qgate, m->ba,        m->mixed,    m->conv_out,
-        m->beta,     m->decay, m->pair_w,    m->gate,     m->up,
-        m->h,        m->dout,  m->log_mixed, m->log_beta, m->log_decay};
+    float *fl[] = {m->att,   m->router, m->rope_cos, m->rope_sin,
+                   m->qgate, m->ba,     m->mixed,    m->conv_out,
+                   m->beta,  m->decay,  m->pair_w,   m->h};
     for (size_t i = 0; i < sizeof(fl) / sizeof(fl[0]); i++)
         free(fl[i]);
-    free(m->kscale);
-    free(m->vscale);
+    /* the products' buffers (out_alloc) and the KV cache: aligned */
+    void *al[] = {m->conv_buf,  m->x,      m->xn,        m->q,
+                  m->kk,        m->vv,     m->big,       m->gate,
+                  m->up,        m->dout,   m->log_mixed, m->log_beta,
+                  m->log_decay, m->ple,    m->ple_g,     m->ssm_buf,
+                  m->kcache,    m->vcache, m->kscale,    m->vscale};
+    for (size_t i = 0; i < sizeof(al) / sizeof(al[0]); i++)
+        janas_aligned_free(al[i]);
     free(m->kv_off);
     free(m->ks_off);
     free(m->kv_cap);
@@ -1381,17 +1420,15 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->kv_hd);
     free(m->kv_heads);
     free(m->rope_cos_swa);
-    free(m->ple);
-    free(m->ple_g);
     free(m->ple_row);
     free(m->ple_q);
     free(m->rope_sin_swa);
     free(m->xres);
     free(m->xbr);
     free(m->hlen);
-    free(m->kcache);
-    free(m->vcache);
-    free(m->ssm_buf);
+    janas_m_ana_free(m);
+    janas_m_janet_free(m);
+    janas_m_neurons_free(m);
     free(m->xq);
     free(m->attq);
     free(m->pair_tok);
@@ -1407,7 +1444,7 @@ void janas_llm_model_free(struct janas_llm_model *m)
     janas_m_assist_free(m);
     if (m->mtp_open)
         janas_jns_close(&m->mtp_j);
-    free(m->mtp_res);
+    janas_aligned_free(m->mtp_res);
     free(m->hid);
     free(m->mtp_hid);
     free(m->cat);
@@ -1756,6 +1793,11 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
                     in_place ? " (in place)" : "");
     } else {
         m->arena_gpu = -1; /* no room for it: the CPU goes on alone */
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr,
+                    "arena: %.1f GB not imported: the experts stay "
+                    "on the CPU\n",
+                    bytes / 1e9);
     }
 }
 
