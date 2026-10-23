@@ -83,6 +83,9 @@ struct janas_m_npu {
     /* seconds: inputs expanded, the CPU's share of the groups, waiting for
        the NPU after it, outputs copied (JANAS_NPU_STATS) */
     double t_expand, t_cpu, t_wait, t_copy;
+    /* the matrices looked up (and the first time loaded or compiled), the
+       runs begun, and the whole of the products' calls that use the NPU */
+    double t_entry, t_begin, t_calls;
     /* by shape (JANAS_NPU_STATS=2): runs and their wait, and the products
        refused with that shape, by reason (0 vectors, 1 type or layout,
        2 weights that may change) */
@@ -292,8 +295,10 @@ void janas_m_npu_close(struct janas_llm_model *m)
         fprintf(stderr,
                 "janas: NPU time: inputs expanded %.2f s, the CPU's share of "
                 "the groups %.2f s, waiting for the NPU %.2f s, outputs "
-                "copied %.2f s\n",
-                n->t_expand, n->t_cpu, n->t_wait, n->t_copy);
+                "copied %.2f s; matrices looked up %.2f s, runs begun %.2f "
+                "s, the products' calls %.2f s\n",
+                n->t_expand, n->t_cpu, n->t_wait, n->t_copy, n->t_entry,
+                n->t_begin, n->t_calls);
     if (getenv("JANAS_NPU_STATS"))
         fprintf(stderr,
                 "janas: NPU feed-forwards in one run: %llu (%.2f s waited), "
@@ -446,7 +451,54 @@ static float *ybuf(struct janas_m_npu *n, size_t rows, int ord)
     return y;
 }
 
-static struct npu_entry *entry(struct janas_m_npu *n,
+/* a matrix made ready for the NPU on the pool's threads, a few rows each:
+   rows of a quantized type dequantized and quantized again to INT8 a row
+   at a time, or bf16 rows turned to FP16 - each value as one thread made
+   it, so the graph and its fingerprint in the cache are the same. On one
+   thread the 422 matrices of Qwen3.8-Flash-Next took 12 s of the first
+   prompt, the graphs already compiled (24 Oct 2026). */
+struct prep_job {
+    int type;          /* the weights' type, or -1: bf16 to FP16 */
+    const uint8_t *w;  /* quantized rows of row_bytes */
+    const uint16_t *b; /* or bf16 rows */
+    size_t row_bytes, rows, cols;
+    float *wf;
+    int8_t *q;
+    uint16_t *s, *f16;
+    atomic_size_t next;
+};
+
+#define PREP_ROWS 32
+
+static void prep_worker(void *arg, int tid, int n_threads)
+{
+    (void)tid;
+    (void)n_threads;
+    struct prep_job *p = arg;
+    for (;;) {
+        size_t r0 = atomic_fetch_add(&p->next, PREP_ROWS);
+        if (r0 >= p->rows)
+            break;
+        size_t nr = r0 + PREP_ROWS < p->rows ? PREP_ROWS : p->rows - r0;
+        size_t a = r0 * p->cols, c = nr * p->cols;
+        if (p->type < 0) {
+            for (size_t k = a; k < a + c; k++)
+                p->f16[k] =
+                    janas_fp32_to_fp16(janas_u2f((uint32_t)p->b[k] << 16));
+            continue;
+        }
+        janas_dequantize(p->type, p->w + r0 * p->row_bytes, p->wf + a, c);
+        janas_npu_quant_rows(p->wf + a, nr, p->cols, p->q + a, p->s + r0);
+    }
+}
+
+static void prep_rows(struct janas_llm_model *m, struct prep_job *p)
+{
+    atomic_init(&p->next, 0);
+    janas_pool_run(m->compute, prep_worker, p);
+}
+
+static struct npu_entry *entry(struct janas_llm_model *m, struct janas_m_npu *n,
                                const struct janas_matvec_task *t, int arena,
                                int ord)
 {
@@ -477,11 +529,27 @@ static struct npu_entry *entry(struct janas_m_npu *n,
         uint16_t *s = q ? malloc(2 * t->rows) : NULL;
         e->y = s ? ybuf(n, t->rows, ord) : NULL;
         if (e->y) {
-            if (t->type == JANAS_Q6_K_P) /* at the level in memory */
-                janas_q6kp_dequantize(t->w, t->plane[0], t->plane[1], wf, rc);
-            else
-                janas_dequantize(t->type, t->w, wf, rc);
-            janas_npu_quant_rows(wf, t->rows, t->cols, q, s);
+            /* rows apart from a multiple of 256 columns, each its own
+               bytes: on the pool */
+            size_t rb = janas_qtype_row_bytes(t->type, t->cols);
+            if (t->type != JANAS_Q6_K_P && t->cols % JANAS_QK == 0 && rb) {
+                struct prep_job p = {.type = t->type,
+                                     .w = t->w,
+                                     .row_bytes = rb,
+                                     .rows = t->rows,
+                                     .cols = t->cols,
+                                     .wf = wf,
+                                     .q = q,
+                                     .s = s};
+                prep_rows(m, &p);
+            } else {
+                if (t->type == JANAS_Q6_K_P) /* at the level in memory */
+                    janas_q6kp_dequantize(t->w, t->plane[0], t->plane[1], wf,
+                                          rc);
+                else
+                    janas_dequantize(t->type, t->w, wf, rc);
+                janas_npu_quant_rows(wf, t->rows, t->cols, q, s);
+            }
             char err[256];
             e->mm = janas_npu_mm_create(n->u, n->block, (int)t->rows,
                                         (int)t->cols, JANAS_NPU_I8, q, s, x,
@@ -593,7 +661,70 @@ const char *janas_llm_model_npu_name(const struct janas_llm_model *m)
 
 /* the input as floats, once for the tasks that share it; -1 when the
    buffer of that width holds another input a product in flight reads */
-static int expand(struct janas_m_npu *n, const struct janas_matvec_task *t)
+/* ---- a run's inputs and outputs moved on the pool's threads ---- */
+
+/* n_vec vectors of len floats from src (every sstride) to dst (every
+   dstride), times scale where scaled; or, with q, Q8_K inputs of len
+   values expanded to floats (a row ending inside a group: that group's
+   first values only). A few vectors a thread at a time, each value as one
+   thread would make it: 10 MB of a mix's input and as much of its output
+   went one thread's way, the NPU's runs waiting on them */
+struct mover {
+    const float *src;
+    const struct janas_block_q8k *q;
+    float *dst;
+    size_t sstride, dstride, len, n_vec;
+    float scale;
+    int scaled;
+    atomic_size_t next;
+};
+
+#define MOVE_VECS 8
+
+static void move_worker(void *arg, int tid, int n_threads)
+{
+    (void)tid;
+    (void)n_threads;
+    struct mover *mv = arg;
+    size_t nb = (mv->len + JANAS_QK - 1) / JANAS_QK;
+    for (;;) {
+        size_t v0 = atomic_fetch_add(&mv->next, MOVE_VECS);
+        if (v0 >= mv->n_vec)
+            break;
+        size_t v1 = v0 + MOVE_VECS < mv->n_vec ? v0 + MOVE_VECS : mv->n_vec;
+        for (size_t v = v0; v < v1; v++) {
+            float *o = mv->dst + v * mv->dstride;
+            if (mv->q) {
+                for (size_t b = 0; b < nb; b++) {
+                    const struct janas_block_q8k *q = mv->q + v * nb + b;
+                    size_t e = mv->len - b * JANAS_QK < JANAS_QK
+                                   ? mv->len - b * JANAS_QK
+                                   : JANAS_QK;
+                    for (size_t k = 0; k < e; k++)
+                        o[b * JANAS_QK + k] = q->d * (float)q->qs[k];
+                }
+            } else if (mv->scaled) {
+                const float *i = mv->src + v * mv->sstride;
+                for (size_t k = 0; k < mv->len; k++)
+                    o[k] = i[k] * mv->scale;
+            } else
+                memcpy(o, mv->src + v * mv->sstride, sizeof(float) * mv->len);
+        }
+    }
+}
+
+/* on the pool from 256 KB on; below, the caller alone */
+static void move(struct janas_llm_model *m, struct mover *mv)
+{
+    atomic_init(&mv->next, 0);
+    if (mv->n_vec * mv->len * sizeof(float) < (256u << 10))
+        move_worker(mv, 0, 1);
+    else
+        janas_pool_run(m->compute, move_worker, mv);
+}
+
+static int expand(struct janas_llm_model *m, struct janas_m_npu *n,
+                  const struct janas_matvec_task *t)
 {
     int i = 0;
     while (n->xb[i].cols != t->cols)
@@ -602,19 +733,12 @@ static int expand(struct janas_m_npu *n, const struct janas_matvec_task *t)
         return 0;
     if (n->xb[i].src)
         return -1;
-    /* a row ending inside a group: that group's first values only */
-    size_t nb = (t->cols + JANAS_QK - 1) / JANAS_QK;
-    float *x = n->xb[i].x;
-    for (size_t v = 0; v < t->n_vec; v++)
-        for (size_t b = 0; b < nb; b++) {
-            const struct janas_block_q8k *q = t->x + v * nb + b;
-            float *o = x + v * t->cols + b * JANAS_QK;
-            size_t e = t->cols - b * JANAS_QK < JANAS_QK
-                           ? t->cols - b * JANAS_QK
-                           : JANAS_QK;
-            for (size_t k = 0; k < e; k++)
-                o[k] = q->d * (float)q->qs[k];
-        }
+    struct mover mv = {.q = t->x,
+                       .dst = n->xb[i].x,
+                       .dstride = t->cols,
+                       .len = t->cols,
+                       .n_vec = t->n_vec};
+    move(m, &mv);
     n->xb[i].src = t->x, n->xb[i].n_vec = t->n_vec;
     return 0;
 }
@@ -661,23 +785,29 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         janas_gpu_matvec_group(g, m->compute, t, nt);
         return;
     }
+    double t_call = now();
     for (int i = 0; i < n->nx; i++)
         n->xb[i].src = NULL; /* the engine rewrites its inputs between calls */
     for (size_t i = 0; i < nt; i++) {
+        double tl = now();
         int st = eligible(m, n, &t[i]), ord = 0;
         for (size_t j = 0; st && j < nn; j++)
             ord += ont[j]->rows == t[i].rows;
-        struct npu_entry *e = st ? entry(n, &t[i], st == 2, ord) : NULL;
+        struct npu_entry *e = st ? entry(m, n, &t[i], st == 2, ord) : NULL;
+        n->t_entry += now() - tl;
         for (size_t j = 0; e && j < nn; j++)
             if (on[j]->y == e->y) { /* another order than when compiled */
                 n->y_clash++;
                 e = NULL;
             }
         double te = now();
-        int ok = e && expand(n, &t[i]) == 0;
+        int ok = e && expand(m, n, &t[i]) == 0;
         n->t_expand += now() - te;
         if (ok) {
-            if (janas_npu_mm_begin(e->mm) == 0) {
+            double tb = now();
+            int begun = janas_npu_mm_begin(e->mm) == 0;
+            n->t_begin += now() - tb;
+            if (begun) {
                 on[nn] = e, ont[nn++] = &t[i];
                 continue;
             }
@@ -713,15 +843,19 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
             check("product", k->rows, k->cols, n->xb[xi].x, k->n_vec * k->cols,
                   on[i]->y, k->n_vec * k->rows);
         }
-        size_t ys = k->y_stride ? k->y_stride : k->rows;
-        for (size_t v = 0; v < k->n_vec; v++)
-            memcpy(k->y + v * ys, on[i]->y + v * k->rows,
-                   sizeof(float) * k->rows);
+        struct mover mv = {.src = on[i]->y,
+                           .dst = k->y,
+                           .sstride = k->rows,
+                           .dstride = k->y_stride ? k->y_stride : k->rows,
+                           .len = k->rows,
+                           .n_vec = k->n_vec};
+        move(m, &mv);
         n->t_copy += now() - tc;
         n->runs++;
     }
     if (nn)
         npu_loud(m, spin);
+    n->t_calls += now() - t_call;
 }
 
 /* ---- bf16 weights on float inputs (qwen4exp's mixes, model_hc.c) ---- */
@@ -729,7 +863,8 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
 /* the matrix's entry, compiled on first use with its weights in FP16 -
    bf16's values exactly, save those below FP16's normal range - keyed by
    w as the products'; NULL if it stays on the CPU */
-static struct npu_entry *entry16(struct janas_m_npu *n, const uint16_t *w,
+static struct npu_entry *entry16(struct janas_llm_model *m,
+                                 struct janas_m_npu *n, const uint16_t *w,
                                  size_t rows, size_t cols)
 {
     size_t h = ((uintptr_t)w >> 6) % NPU_SLOTS;
@@ -753,8 +888,9 @@ static struct npu_entry *entry16(struct janas_m_npu *n, const uint16_t *w,
         uint16_t *f16 = x ? malloc(2 * rows * cols) : NULL;
         e->y = f16 ? ybuf(n, rows, 0) : NULL;
         if (e->y) {
-            for (size_t k = 0; k < rows * cols; k++)
-                f16[k] = janas_fp32_to_fp16(janas_u2f((uint32_t)w[k] << 16));
+            struct prep_job p = {
+                .type = -1, .b = w, .rows = rows, .cols = cols, .f16 = f16};
+            prep_rows(m, &p);
             char err[256];
             e->mm = janas_npu_mm_create(n->u, n->block, (int)rows, (int)cols,
                                         JANAS_NPU_F16, f16, NULL, x, e->y, err,
@@ -787,14 +923,20 @@ int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
     if (!n || (int)nv < n->min_n || (int)nv > n->block || rows < 64 ||
         stable(m, n, w) != 1)
         return -1;
-    struct npu_entry *e = entry16(n, w, rows, cols);
+    struct npu_entry *e = entry16(m, n, w, rows, cols);
     if (!e)
         return -1;
     int i = 0;
     while (n->xb[i].cols != cols)
         i++;
     double te = now();
-    memcpy(n->xb[i].x, x, sizeof(float) * nv * cols);
+    struct mover in = {.src = x,
+                       .dst = n->xb[i].x,
+                       .sstride = cols,
+                       .dstride = cols,
+                       .len = cols,
+                       .n_vec = nv};
+    move(m, &in);
     n->xb[i].src = NULL; /* floats, not a Q8_K input expanded */
     n->t_expand += now() - te;
     int spin = npu_quiet(m);
@@ -807,8 +949,15 @@ int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
         n->cpu_fallbacks++;
         return -1;
     }
-    for (size_t k = 0; k < (size_t)nv * rows; k++)
-        y[k] = e->y[k] * scale;
+    struct mover out = {.src = e->y,
+                        .dst = y,
+                        .sstride = rows,
+                        .dstride = rows,
+                        .len = rows,
+                        .n_vec = nv,
+                        .scale = scale,
+                        .scaled = 1};
+    move(m, &out);
     n->t_copy += now() - tc;
     n->runs++;
     return 0;

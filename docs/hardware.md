@@ -38,6 +38,8 @@ The [hardware report form](https://github.com/prabanta-dev/janas/issues/new?temp
 
 **Whether a GPU can run the GPU backend**, and why not: `bin/x86_64-linux/vkcheck` lists what the backend needs with the answer of the GPU's driver, the decision the engine would take, and three short tests on the device (zero-copy, the int8 dot product, the float operations that keep the GPU's results the CPU's to the bit). It builds alone where Janas does not build yet, macOS with MoltenVK included: `cc -O2 tools/vkcheck.c -o vkcheck -ldl -lm` (on macOS without `-ldl -lm`, with `-I/opt/homebrew/include`). Its output is welcome in a hardware report.
 
+**Whether the GPU computes what the CPU does**: `gpu_check`, in the packages from the release of 24 October 2026, runs every kind of product the GPU takes - each weight type, the rows that end inside a group, the BF16 products - on the GPU Janas would use and compares each with the CPU's, as a card with memory of its own works where it is one; its last line says `ok` or `FAILED`, with the shapes that differ above it. A minute or two. With wrong answers from the GPU and right ones with `JANAS_GPU=0`, its output says whether the products are where it goes wrong.
+
 **What is most wanted, in order.**
 
 1. **CPUs without AVX-VNNI**, and **AMD** — the arithmetic has a path for them and it is the least exercised of all.

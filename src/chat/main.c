@@ -1719,8 +1719,14 @@ int main(int argc, char **argv)
 {
     janas_env_check("janas-chat");
     /* wcwidth() answers for the locale's character set, and in the C locale
-       it answers -1 to everything past ASCII: ask for the user's own */
+       it answers -1 to everything past ASCII: ask for the user's own. Not on
+       Windows, where wcwidth() is not used (term.h) and the user's locale
+       did harm: msvcrt then translated what was written to the console from
+       that locale's code page, so the UTF-8 came out as CP1251 under a
+       Ukrainian one, "в–„" for "▄" (issue #44) */
+#ifndef _WIN32
     setlocale(LC_CTYPE, "");
+#endif
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();

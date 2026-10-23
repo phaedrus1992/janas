@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 Maurizio Cammalleri */
 /*
- * model_janet.c - the Janet probe (job/docs/progetto_jnet.md): a model's
+ * model_janet.c - the Janet probe (job/docs/progetto_janet.md): a model's
  * feed-forward replaced, layer by layer, by Janet's detectors trained to
- * imitate it (job/jnet/lm, jlm ffnfit). A probe: only the CPU's path has it
+ * imitate it (src/janet, janet ffnfit). A probe: only the CPU's path has it
  * (JANAS_GPU=0), and the detectors run in floats, one token at a time.
  *
  * JANAS_JANET_REC=dir with JANAS_JANET_REC_LAYERS=l1,l2,...: for those
  * layers each token's feed-forward input (the normed state, floats) is
  * appended to dir/x<l>.f32 and its output (what the block adds to the
  * residual) to dir/y<l>.f32, d_model floats a token.
- * JANAS_JANET_FFN=file1,file2,...: Janet feed-forwards (jlm ffnfit's files,
+ * JANAS_JANET_FFN=file1,file2,...: Janet feed-forwards (janet ffnfit's files,
  * each naming its layer) run in place of those layers' own; or the control,
  * a SwiGLU trained the same way (its file "SWIGLUF1").
  *
@@ -34,7 +34,7 @@
 #define JANET_MAX_LAYERS 256
 #define JANET_MAX_K 8
 
-/* One layer's Janet feed-forward, as jlm ffnfit writes it (swiglu: the
+/* One layer's Janet feed-forward, as janet ffnfit writes it (swiglu: the
    control, wa its gate and wd its down, wu its up). */
 struct jffn {
     int d, h, K, rectify, in_full, swiglu;
@@ -72,7 +72,7 @@ static int read_floats(FILE *f, float **p, size_t n)
     return *p && fread(*p, sizeof(float), n, f) == n ? 0 : -1;
 }
 
-/* A file of jlm ffnfit: "JANETFF1", then layer, d, h, K, rectify, in_full
+/* A file of janet ffnfit: "JANETFF1", then layer, d, h, K, rectify, in_full
    as 32-bit integers, then the floats. Its layer, or -1. */
 static int jffn_load(const char *path, uint32_t dm, struct jffn **out)
 {

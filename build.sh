@@ -461,10 +461,12 @@ MBEDTLS_INC=($flags)
 
 # A directory with a main.c is a program: its other .c files are its own.
 # Every other .c under src/ goes into the library, but the module for
-# Node.js (src/node/), which is linked on its own below.
+# Node.js (src/node/) and Janet (src/janet/), which are built on their own
+# below.
 tool_dirs=$(for m in src/*/main.c src/services/*/main.c; do dirname "$m"; done)
 lib_list=$(sources src/ find src -name '*.c' ! -name main.c ! -name win_start.c \
-    ! -path 'src/third_party/*' ! -path 'src/node/*') || exit 2
+    ! -path 'src/third_party/*' ! -path 'src/node/*' ! -path 'src/janet/*') ||
+    exit 2
 objs=()
 while IFS= read -r src; do
     grep -qx "$(dirname "$src")" <<<"$tool_dirs" && continue
@@ -577,6 +579,7 @@ for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
         echo "build.sh: no sources match $src" >&2
         exit 2
     fi
+    [ "$src" = src/janet/main.c ] && continue # below
     exe="$BIN/$(basename "${src%.c}")$SUFFIX$EXE"
     own=()
     if [ "$(basename "$src")" = main.c ]; then
@@ -595,6 +598,43 @@ for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
     "$CC" "${CFLAGS[@]}" "${TP_INC[@]}" "$src" "${own[@]}" "${START[@]}" \
         "$OBJ/libjanas.a" "${THIRD[@]}" "${LDSTATIC[@]}" "${LDLIBS[@]}" -o "$exe"
 done
+
+# Janet (src/janet/README.md), a neural network of the project's own:
+# janet, its trainer and probes for language models, and janet-check,
+# the same in double for the derivatives' check, with
+# OpenMP and the x86-64 features its code takes at build time (AVX2, FMA,
+# F16C, AVX-VNNI: it has no run-time choice yet); janet-mnist and
+# janet-mnist-deep, which choose their kernels at run time. Linux
+# x86-64 only, for now. The probes against third parties' libraries
+# (src/janet/probes/) are built by hand, as their files say.
+if [ -d src/janet ] && [ "$OS" != windows ] && [ "$CPU" = x86_64 ]; then
+    JANET=(-march=x86-64-v3 -mavxvnni -fopenmp)
+    MNIST=()
+    [ "$VARIANT" = release ] && JANET+=(-O3) && MNIST+=(-O3)
+    janet_list=$(sources src/janet find src/janet -maxdepth 1 -name '*.c' \
+        ! -name main.c) || exit 2
+    for kind in "" -check; do
+        extra=()
+        [ "$kind" = -check ] && extra=(-DJANET_DOUBLE)
+        jobjs=()
+        while IFS= read -r c; do
+            obj=$(objname "$c")
+            obj="${obj%.o}$kind.o"
+            jobjs+=("$obj")
+            compile "$c" "$obj" "${CFLAGS[@]}" "${JANET[@]}" "${extra[@]}"
+        done < <(sort <<<"$janet_list")
+        exe="$BIN/janet$kind$SUFFIX"
+        echo "LD  $exe"
+        "$CC" "${CFLAGS[@]}" "${JANET[@]}" "${extra[@]}" src/janet/main.c \
+            "${jobjs[@]}" "$OBJ/libjanas.a" "${LDLIBS[@]}" -o "$exe"
+    done
+    for m in mnist mnist_deep; do
+        exe="$BIN/janet-${m/_/-}$SUFFIX"
+        echo "LD  $exe"
+        "$CC" "${CFLAGS[@]}" "${MNIST[@]}" "src/janet/mnist/$m.c" \
+            "$OBJ/libjanas.a" "${LDLIBS[@]}" -o "$exe"
+    done
+fi
 
 if [ "$ACTION" = test ]; then
     status=0

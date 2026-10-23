@@ -2,6 +2,12 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-24] - The chat's text on a Windows console in any language, gpu_check in the packages, the NPU made ready sooner
+
+- **Fixed: janas-chat on a Windows console printed every character past ASCII as mojibake** under a locale whose code page is not UTF-8 (issue #44, Ukrainian: "в–„" for "▄"). The chat asked for the user's locale, which on Windows it never used - the widths of characters are counted there without it - and msvcrt then translated what was written to the console from that locale's code page. Not asked for on Windows any more; the rest of the systems as before.
+- **`gpu_check` in the Linux and Windows packages**: every kind of product the GPU takes, run on the GPU Janas would use and compared with the CPU's, its last line `ok` or `FAILED` with the shapes that differ above it ([hardware](docs/hardware.md)); for the cards that answer wrong with the GPU and right with `JANAS_GPU=0` (issue #43).
+- **The NPU made ready on the compute threads**: each matrix it takes dequantized and quantized again to INT8 a few rows a thread, the BF16 mixes turned to FP16 the same way, its inputs and outputs moved on the threads too - each value as before, so the graphs already compiled are found in the cache again. Qwen3.8-Flash-Next's 422 matrices went from 19.3 s to 11.4 s, the wait the chat shows as "preparing the NPU".
+
 ## [2026-10-23] - Qwen3.8-Flash-Next's mixes of the streams faster on the CPU, at eight bits faster than BF16
 
 - **A reply 8.7% faster, a prompt 10% faster, the same bits**: on the CPU (Core Ultra 9 185H, 12 threads, a 12 GiB expert cache), 1,024 tokens of Italian prose and then 200 generated, two runs each alternated with the commit before, a reply went from 10.07 to 10.95 tokens/s and the prompt from 21.75 to 24.0; the mixes of the streams from about 30 ms a token to 19.7. Against llama.cpp, 400 tokens of C and 400 of Italian prose, every position gives the same digits as before.
