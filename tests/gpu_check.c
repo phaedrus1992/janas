@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "common/aligned.h"
 #include "llm/gpu.h"
 #include "llm/matvec.h"
 #include "llm/quant.h"
@@ -38,7 +39,7 @@ int main(void)
     const char *bg = getenv("GPU_CHECK_BIG_GB");
     if (bg) {
         size_t big = (size_t)atoi(bg) << 30;
-        uint8_t *b = aligned_alloc(4096, big);
+        uint8_t *b = janas_aligned_alloc(4096, big);
         if (b)
             memset(b, 1, big);
     }
@@ -51,7 +52,7 @@ int main(void)
     enum { MAXR = 4096, MAXC = 4096, MAXV = 64 };
     size_t wbytes = (size_t)MAXR * (MAXC / JANAS_QK) * 144;
     wbytes = (wbytes + 4095) / 4096 * 4096;
-    uint8_t *w = aligned_alloc(4096, wbytes);
+    uint8_t *w = janas_aligned_alloc(4096, wbytes);
     for (size_t i = 0; i < wbytes; i++)
         w[i] = (uint8_t)rnd();
     struct janas_block_q4k *wb = (struct janas_block_q4k *)w;
@@ -62,7 +63,7 @@ int main(void)
     /* Q6_K weights too, with small scales */
     size_t w6bytes = (size_t)MAXR * (MAXC / JANAS_QK) * 210 + 4096;
     w6bytes = (w6bytes + 4095) / 4096 * 4096;
-    uint8_t *w6 = aligned_alloc(4096, w6bytes);
+    uint8_t *w6 = janas_aligned_alloc(4096, w6bytes);
     for (size_t i = 0; i < w6bytes; i++)
         w6[i] = (uint8_t)rnd();
     struct janas_block_q6k *w6b = (struct janas_block_q6k *)w6;
@@ -72,7 +73,7 @@ int main(void)
        ql, qh, scales, d at byte 208 */
     size_t nb6 = (w6bytes - 4096) / 210;
     size_t wabytes = (nb6 * JANAS_Q6KA_BLOCK + 4095) / 4096 * 4096;
-    uint8_t *wa = aligned_alloc(4096, wabytes);
+    uint8_t *wa = janas_aligned_alloc(4096, wabytes);
     memset(wa, 0, wabytes);
     for (size_t b = 0; b < nb6; b++) {
         uint8_t *d = wa + b * JANAS_Q6KA_BLOCK;
@@ -87,7 +88,7 @@ int main(void)
     pbase = (pbase + 4095) / 4096 * 4096;
     size_t pplane = (size_t)MAXR * (MAXC / JANAS_QK) * JANAS_Q6KP_PLANE;
     size_t wpbytes = pbase + 2 * pplane;
-    uint8_t *wp = aligned_alloc(4096, wpbytes);
+    uint8_t *wp = janas_aligned_alloc(4096, wpbytes);
     for (size_t i = 0; i < wpbytes; i++)
         wp[i] = (uint8_t)rnd();
     struct janas_block_q6kp *wpb = (struct janas_block_q6kp *)wp;
@@ -97,7 +98,7 @@ int main(void)
     /* Q5_K */
     size_t w5bytes = (size_t)MAXR * (MAXC / JANAS_QK) * 176;
     w5bytes = (w5bytes + 4095) / 4096 * 4096;
-    uint8_t *w5 = aligned_alloc(4096, w5bytes);
+    uint8_t *w5 = janas_aligned_alloc(4096, w5bytes);
     for (size_t i = 0; i < w5bytes; i++)
         w5[i] = (uint8_t)rnd();
     struct janas_block_q5k *w5b = (struct janas_block_q5k *)w5;
@@ -108,7 +109,7 @@ int main(void)
     /* Q8_0: blocks of 32, eight to 256 weights */
     size_t w8bytes = (size_t)MAXR * (MAXC / JANAS_QK) * 272;
     w8bytes = (w8bytes + 4095) / 4096 * 4096;
-    uint8_t *w8 = aligned_alloc(4096, w8bytes);
+    uint8_t *w8 = janas_aligned_alloc(4096, w8bytes);
     for (size_t i = 0; i < w8bytes; i++)
         w8[i] = (uint8_t)rnd();
     struct janas_block_q8_0 *w8b = (struct janas_block_q8_0 *)w8;
@@ -126,7 +127,7 @@ int main(void)
     size_t w3bytes = (size_t)MAXR * (MAXC / JANAS_QK) * 110 + 4096;
     w3bytes = (w3bytes + 4095) / 4096 * 4096;
     for (int k = 0; k < 2; k++) {
-        w3[k] = aligned_alloc(4096, w3bytes);
+        w3[k] = janas_aligned_alloc(4096, w3bytes);
         for (size_t i = 0; i < w3bytes; i++)
             w3[k][i] = (uint8_t)rnd();
         for (size_t b = 0; b + 110 <= w3bytes; b += 110) {
@@ -137,7 +138,7 @@ int main(void)
     /* IQ4_XS: 136-byte blocks, d, scales_h, scales_l, nibbles */
     size_t wxbytes = (size_t)MAXR * (MAXC / JANAS_QK) * 136;
     wxbytes = (wxbytes + 4095) / 4096 * 4096;
-    uint8_t *wx = aligned_alloc(4096, wxbytes);
+    uint8_t *wx = janas_aligned_alloc(4096, wxbytes);
     for (size_t i = 0; i < wxbytes; i++)
         wx[i] = (uint8_t)rnd();
     for (size_t b = 0; b + 136 <= wxbytes; b += 136) {
@@ -150,7 +151,7 @@ int main(void)
     for (int k = 0; k < 5; k++) {
         w32bytes[k] = (size_t)MAXR * (MAXC / JANAS_QK) * 8 * s32[k];
         w32bytes[k] = (w32bytes[k] + 4095) / 4096 * 4096;
-        w32[k] = aligned_alloc(4096, w32bytes[k]);
+        w32[k] = janas_aligned_alloc(4096, w32bytes[k]);
         for (size_t i = 0; i < w32bytes[k]; i++)
             w32[k][i] = (uint8_t)rnd();
         for (size_t b = 0; b + s32[k] <= w32bytes[k]; b += s32[k]) {
@@ -324,17 +325,17 @@ int main(void)
            bad ? "FAILED" : "ok");
     janas_gpu_destroy(g);
     janas_pool_destroy(pool);
-    free(w);
-    free(w6);
-    free(wa);
-    free(wp);
-    free(w5);
-    free(w8);
+    janas_aligned_free(w);
+    janas_aligned_free(w6);
+    janas_aligned_free(wa);
+    janas_aligned_free(wp);
+    janas_aligned_free(w5);
+    janas_aligned_free(w8);
     for (int k = 0; k < 5; k++)
-        free(w32[k]);
-    free(wx);
-    free(w3[0]);
-    free(w3[1]);
+        janas_aligned_free(w32[k]);
+    janas_aligned_free(wx);
+    janas_aligned_free(w3[0]);
+    janas_aligned_free(w3[1]);
     free(x);
     free(xf);
     free(ya);

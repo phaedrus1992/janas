@@ -516,8 +516,8 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         tok = e && atoi(e) > 0;
         blocks = b ? atoi(b) > 0 : -1; /* -1: not said */
     }
-    int prompt =
-        janas_gpu_fast_prompt() && n >= JANAS_GPU_FAST_N && blocks != 0;
+    int prompt = janas_gpu_fast_prompt() && !m->prompts_off_gpu &&
+                 n >= JANAS_GPU_FAST_N && blocks != 0;
     /* A short pass (a chain of drafts to verify) where the tuner chose the
        GPU for it: the whole pass in one submission, the CPU idle, rather
        than the products by groups beside the CPU - on the development

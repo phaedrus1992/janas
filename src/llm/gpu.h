@@ -141,6 +141,9 @@ unsigned janas_gpu_subgroup(const struct janas_gpu *g);
    discrete GPU (single tokens too), 2 on an integrated one;
    JANAS_GPU_MIN_N sets it. */
 size_t janas_gpu_min_n(const struct janas_gpu *g);
+/* ... set by the engine: 1 where the user asked for replies on the GPU
+   (--reply-on gpu). */
+void janas_gpu_set_min_n(struct janas_gpu *g, size_t n);
 /* The most vectors the shaders with the lanes on the vectors take
    (*_mvd.comp: subgroups of 8 lanes, JANAS_GPU_MVD=0 leaves them out),
    beyond which a product goes to the slower shaders of many vectors: 8,

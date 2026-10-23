@@ -80,6 +80,7 @@ static int type_geometry(uint32_t type, uint64_t *blck, uint64_t *size)
         {13, 256, 176}, /* Q5_K */
         {14, 256, 210}, /* Q6_K */
         {214, 256, 82}, /* Q6_K_P, the base plane and the scales */
+        {215, 256, 82}, /* Q6_K_PN, the same by neuron */
         {15, 256, 292}, /* Q8_K */
         {20, 32, 18},   /* IQ4_NL */
         {21, 256, 110}, /* IQ3_S */
@@ -517,6 +518,10 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
                 mx->cols == 0 || mx->cols % blck ||
                 __builtin_mul_overflow(mx->cols / blck, size, &row_bytes) ||
                 __builtin_mul_overflow(row_bytes, mx->rows, &total) ||
+                /* by neuron: a float per output channel first */
+                __builtin_add_overflow(
+                    total, mx->type == 215 ? (uint64_t)mx->cols * 4 : 0,
+                    &total) ||
                 total != mx->bytes || mx->offset % 256 ||
                 !inside(mx->offset, mx->bytes, 0, ly->slot_bytes)) {
                 janas_jns_close(out);
@@ -551,7 +556,8 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
             }
             uint64_t total;
             /* a bare plane: 64 bytes per 256 weights, no scales */
-            if (ly->m[JANAS_JNS_DOWN].type != 214 ||
+            if ((ly->m[JANAS_JNS_DOWN].type != 214 &&
+                 ly->m[JANAS_JNS_DOWN].type != 215) ||
                 px->type != ly->m[JANAS_JNS_DOWN].type ||
                 px->rows != ly->m[JANAS_JNS_DOWN].rows ||
                 px->cols != ly->m[JANAS_JNS_DOWN].cols || px->cols % 256 ||

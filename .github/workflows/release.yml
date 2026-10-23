@@ -68,7 +68,7 @@ jobs:
           set -euo pipefail
           B=bin/x86_64-linux
           P="$PACKAGE/janas"
-          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
+          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs" "$P/node"
           for f in janas-chat janas-server janas-get janas-bench janas-mcp \
                    gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
             install -m 755 "$B/$f" "$P/"
@@ -83,6 +83,9 @@ jobs:
           sed -E 's#\(([a-z]+)/README\.md\)#(janas-\1.md)#g' \
             src/services/README.md > "$P/services/README.md"
           install -m 755 "$B/libjanas_llm.so" "$B/libjanas_mcp.so" "$P/lib/"
+          # the library as a module for Node.js, with its types for TypeScript
+          install -m 755 "$B/janas.node" "$P/node/"
+          install -m 644 "$B/janas.d.ts" "$P/node/"
           install -m 644 include/janas/* "$P/include/janas/"
           install -m 644 docs/*.md "$P/docs/"
           install -m 644 dist/README.md "$P/README.md"
@@ -90,6 +93,13 @@ jobs:
           # nothing but programs, libraries and text: no script of any kind
           if find "$P" -type f \( -name '*.sh' -o -name '*.py' \) | grep -q .; then
             echo "a script in the package"; exit 1
+          fi
+          # the module, as packed, loads where the runner has Node.js
+          if command -v node >/dev/null; then
+            node -e 'const j = require(process.argv[1]);
+              if (j.abiVersion() !== 1) process.exit(1);
+              console.log("janas.node " + j.version + " loads in Node " + process.version)' \
+              "$(realpath "$P/node/janas.node")"
           fi
           # the newest C library the programs ask for
           find "$P" -type f -perm -u+x ! -name '*.so' -print0 |

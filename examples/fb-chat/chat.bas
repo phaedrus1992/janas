@@ -1,11 +1,12 @@
 '' SPDX-License-Identifier: GPL-3.0-or-later
 '' Copyright (C) 2026 Maurizio Cammalleri
-'' chat.bas - the smallest chat on Janas-LLM, in FreeBASIC.
+'' chat.bas - the smallest chat on Janas-LLM, in FreeBASIC, procedure by
+'' procedure (llm.bi); chat_oop.bas beside it is the same with objects.
 ''
 '' What a BASIC MODERN or FreeBASIC program needs to do: open a model, make a
 '' conversation, send a message, read the reply as it is written.
 ''
-''   fbc tools/chat.bas -i include -p bin/x86_64-linux -x janas-chat-fb
+''   fbc examples/fb-chat/chat.bas -i include -p bin/x86_64-linux -x janas-chat-fb
 ''   LD_LIBRARY_PATH=bin/x86_64-linux ./janas-chat-fb model.jns
 ''   echo "Ciao" | LD_LIBRARY_PATH=bin/x86_64-linux ./janas-chat-fb model.jns
 ''
@@ -101,7 +102,7 @@ do
     dim as janas_llm_chat_stats st
     st.size = sizeof(st)
     if janas_llm_chat_stats(chat, @st) = JANAS_LLM_OK then
-        print using "[#### token in ###.## s, ##.# token/s, context #####/#####]"; _
+        print using "[#### token in ###.## s, ###.# token/s, context #####/#####]"; _
             st.output_tokens; st.output_seconds; _
             st.output_tokens / st.output_seconds; _
             st.context_used; st.context_size

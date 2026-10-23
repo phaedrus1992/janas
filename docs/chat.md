@@ -51,6 +51,10 @@ Qwen3.5-0.8B does not take `--head 4`: with it, it answered "3" to "2+3". Gemma 
 | `--no-spec` | no speculative decoding (slower, and the same text: see below) |
 | `--no-markdown` | print the model's marks instead of reading them |
 | `--no-gpu` | never give the GPU work, whatever the mode says |
+| `--prompt-on <devices>` | what reads the prompts: `auto` (default: what measures fastest on this machine), `cpu`, `gpu`, `npu`, `npu+gpu` (both in each pass), or a list apart by commas for the engine to choose from, such as `npu,gpu`; the CPU takes part in every pass, the NPU in blocks of 64 tokens and more; a choice wins over `--mode` |
+| `--drafts-on <devices>` | the same for the passes that check guessed tokens (2 to 16 at a time) |
+| `--reply-on <devices>` | the same for a reply's tokens, one at a time; `gpu` gives an integrated GPU single tokens, which it does not take by default |
+| `--npu-int8` | the NPU reads prompts with eight-bit activations (dense Qwen3 models): faster, a little less exact |
 | `--mode auto\|eco\|max` | power mode: `eco` never uses the GPU for speed alone |
 | `--think on\|off\|N` | reasoning before replying, for models that do it; a number: on, at most N tokens of it, then a sentence that closes it and the answer |
 | `--stats` | a line of counters after every reply: speeds, time to the first token, threads, memory |
@@ -111,6 +115,8 @@ The chat starts by itself the services of Janas it finds beside it - `janas-flig
 **The services' tools are given when they are needed.** Written into the system message, the tools of three services made it four thousand tokens, over a minute of a large model before the first message, and every service more made it longer. The system message now holds a catalog, a line a service, and the model opens a service when a question needs it: that service's instructions and tools come back as the answer of the call, its tools can be called from then on, and the next reply is held to be a call (a small model told to call one made the answer up instead). With Qwen3.6-35B-A3B the system message went from 4,057 tokens to 616, and opening the weather costs about a thousand tokens, once in a conversation, when the first question about the weather comes. `--all-tools` writes them all into the system message as before.
 
 **The system message is read ahead.** It used to be four thousand tokens with the services' tools, and the first reply waited for all of it. `janas-chat` now reads it as soon as it starts, while you write, and says so: a line in the conversation when it begins, and "reading the tools ahead" with how far it is in the status line, where it is the last thing to be dropped on a narrow window; a message sent before the end waits for it, with "waiting for the tools" and the share, and Ctrl-C leaves the rest to the reply. Once read it is kept in `~/.cache/janas` (2 GiB at most for these files), and the next chat on the same model finds it there: "System message and tools ready". Changing the system message or the tools reads them again.
+
+**The NPU made ready, in sight.** The first blocks the NPU reads in a session wait while it is made ready: the weights it takes copied in eight bits and its graphs compiled, 17 s for Qwen3.5-2B on the development laptop, about 50 s for Qwen3-4B (21 October 2026). The status line says so meanwhile, wherever it happens - while the system message is read ahead, or in a reply -: "preparing the NPU 12/25, 8 s", the graphs made of those to make and the seconds gone; after the reply a line says how long it took, once a session. A program on the library has the same from `janas_llm_npu_preparing`, which may be called from another thread while the engine works.
 
 ## Tools from MCP servers
 

@@ -249,9 +249,42 @@ void janas_m_attn_layer(struct janas_llm_model *m, const struct layer *ly,
                                       .rows = kvd,
                                       .cols = dm,
                                       .n_vec = n}};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, t, (size_t)nt);
+    janas_m_products(m, janas_m_gpu(m, 0), t, (size_t)nt);
     if (nt == 2) /* Gemma 4's full layers: V is K, before K's norm */
         memcpy(m->vv, m->kk, (size_t)n * kvd * sizeof(float));
+    janas_m_attn_core(m, ly, n, pos0, ta);
+    if (m->npu) /* the NPU's calibration (JANAS_NPU_A8=1) */
+        janas_m_npu_calib(m, 0, m->ana_layer, m->att, n, qd, qd);
+    double tc = now();
+    /* the output gate (qwen3next) goes with the quantization now */
+    struct tok_job tj = {.m = m, .ly = ly, .n = n};
+    if (n < 2)
+        for (uint32_t j = 0; j < n; j++)
+            att_out_tok(m, ly, j);
+    else
+        janas_pool_run(m->compute, att_out_worker, &tj);
+    struct janas_matvec_task to = {.type = (int)ly->wo->type,
+                                   .w = data(m, ly->wo),
+                                   .x = m->attq,
+                                   .y = m->xn,
+                                   .rows = dm,
+                                   .cols = qd,
+                                   .n_vec = n};
+    janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
+    if (ly->post_attn)
+        janas_m_post_norm(m, f32(m, ly->post_attn), n);
+    janas_m_residual(m, n);
+    m->phase[JANAS_PH_WO] += now() - tc;
+}
+
+/* The attention of a block whose q, k and v are in m->q, m->kk and m->vv
+   (products done): q's and k's norms, RoPE, the keys and values into the
+   cache, the attention into m->att. ta: when the layer began (its q, k and
+   v counted with it). */
+void janas_m_attn_core(struct janas_llm_model *m, const struct layer *ly,
+                       uint32_t n, uint32_t pos0, double ta)
+{
+    uint32_t hd = ly->hd, qd = m->n_head * hd, kvd = ly->n_kv * hd;
     int8_t *kc = m->kcache + m->kv_off[ly->slot];
     int8_t *vc = m->vcache + m->kv_off[ly->slot];
     float *kcs = m->kscale + m->ks_off[ly->slot];
@@ -286,25 +319,6 @@ void janas_m_attn_layer(struct janas_llm_model *m, const struct layer *ly,
                        m->q + (size_t)s * qd, kc, kcs, vc, vcs, len, pos0 + s,
                        m->att + (size_t)s * qd);
     }
-    double tc = now();
-    m->phase[JANAS_PH_ATTN] += tc - tb;
+    m->phase[JANAS_PH_ATTN] += now() - tb;
     trace_row(m, "kqv_out", m->att + (size_t)(n - 1) * qd, qd);
-    /* the output gate (qwen3next) goes with the quantization now */
-    if (n < 2)
-        for (uint32_t j = 0; j < n; j++)
-            att_out_tok(m, ly, j);
-    else
-        janas_pool_run(m->compute, att_out_worker, &tj);
-    struct janas_matvec_task to = {.type = (int)ly->wo->type,
-                                   .w = data(m, ly->wo),
-                                   .x = m->attq,
-                                   .y = m->xn,
-                                   .rows = dm,
-                                   .cols = qd,
-                                   .n_vec = n};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &to, 1);
-    if (ly->post_attn)
-        janas_m_post_norm(m, f32(m, ly->post_attn), n);
-    janas_m_residual(m, n);
-    m->phase[JANAS_PH_WO] += now() - tc;
 }
