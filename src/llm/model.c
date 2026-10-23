@@ -252,6 +252,9 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
 {
     if (!drop || n_kv > m->n_ctx || keep + drop > n_kv || m->hd_max > 512)
         return -1;
+    /* qwen4exp: its n-gram history first (the one part that can refuse) */
+    if (m->hc_n && janas_m_hc_shift(m, keep, drop, n_kv) != 0)
+        return -1;
     uint32_t move = n_kv - keep - drop, slots = m->n_attn + (m->mtp ? 1u : 0u);
     size_t elt = (size_t)1 << m->kv16;
     float cs[256], sn[256];
@@ -316,6 +319,8 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
         }
     }
     free(ring_tmp);
+    if (m->hc_n) /* and the indexer's keys and blocks */
+        janas_m_qsa_shift(m, keep, drop, n_kv);
     if (m->ring_hi > keep + drop)
         m->ring_hi -= drop;
     /* the recurrent state holds what it has seen, dropped tokens included -
@@ -470,6 +475,7 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
        where it can (model_gpu.c) */
     /* not where the NPU takes this pass's products: then the block goes
        product by product, the NPU's to it, the others as before */
+    m->gtok_tokens = tokens; /* qwen4exp's n-gram embeddings */
     int gpu = logits && !janas_m_npu_takes(m, n)
                   ? janas_m_gpu_token(m, pos0, n, all_logits, logits)
                   : -1;
@@ -489,6 +495,12 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
             m->log_n = 0;
         }
         return 0;
+    }
+    /* qwen4exp: its layers on the streams of the residual (model_hc.c) */
+    if (m->hc_n) {
+        if (janas_m_hc_layers(m, tokens, n, pos0) != 0)
+            return -1;
+        goto output;
     }
     /* a dense block's first layers on the NPU, graph by graph, as many as
        it holds (model_npu.c); the others here */
@@ -576,13 +588,22 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
         }
     }
     janas_m_ana_frame(m, n); /* the Ana-Net probe's picture */
-    m->ring_hi = pos0 + n;   /* the rings hold up to here */
+output:
+    m->ring_hi = pos0 + n; /* the rings hold up to here */
     double td = now();
     uint32_t first = all_logits ? 0 : n - 1;
-    /* with an MTP block, every token's final hidden state is kept for it */
+    /* with an MTP block, every token's final hidden state is kept for it:
+       qwen4exp's is its residual's streams before the last mix, which is
+       the output norm (llama.cpp's h_nextn) */
     int keep = m->mtp || m->asst;
-    janas_m_norm_quant(m, f32(m, m->out_norm), keep ? 0 : first, n);
-    if (keep)
+    if (m->hc_n && keep)
+        memcpy(m->hid, m->hc_res, (size_t)n * m->hc_n * dm * sizeof(float));
+    if (m->hc_n) {
+        janas_m_hc_head(m, first, n);
+        td = now(); /* the mix's time is the mixes' */
+    } else
+        janas_m_norm_quant(m, f32(m, m->out_norm), keep ? 0 : first, n);
+    if (keep && !m->hc_n)
         memcpy(m->hid, m->xn, (size_t)n * dm * sizeof(float));
     struct janas_matvec_task to = {.type = (int)m->output->type,
                                    .w = data(m, m->output),
@@ -635,6 +656,11 @@ int janas_llm_model_recurrent(const struct janas_llm_model *m)
 const float *janas_llm_model_hidden(const struct janas_llm_model *m)
 {
     return m->hid;
+}
+
+uint32_t janas_llm_model_hidden_width(const struct janas_llm_model *m)
+{
+    return m->hc_n ? m->hc_n * m->d_model : m->d_model;
 }
 
 const float *janas_llm_model_normed(const struct janas_llm_model *m)
@@ -756,6 +782,28 @@ int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
     size_t nbd = dm / JANAS_QK, nbc = 2 * dm / JANAS_QK;
     const struct layer *ly = &m->mtp_layer;
     double ta = now();
+    if (m->hc_n) { /* qwen4exp's block, on the residual's streams */
+        uint32_t first = all_logits ? 0 : n - 1;
+        for (uint32_t j = 0; j < n; j++)
+            embed(m, tokens[j], m->x + (size_t)j * dm);
+        set_rope(m, n, pos0);
+        if (janas_m_hc_mtp(m, hidden, n, pos0, first) != 0)
+            return -1;
+        m->phase[JANAS_PH_QKV] += now() - ta;
+        if (!logits)
+            return 0;
+        double tl = now();
+        struct janas_matvec_task to = {.type = (int)m->output->type,
+                                       .w = data(m, m->output),
+                                       .x = m->xq + first * nbd,
+                                       .y = logits,
+                                       .rows = m->n_vocab,
+                                       .cols = dm,
+                                       .n_vec = n - first};
+        janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
+        m->phase[JANAS_PH_OUTPUT] += now() - tl;
+        return 0;
+    }
     /*
      * [norm(embedding); norm(hidden)], projected back to d_model. Settled on
      * data (tests/mtp_eval.c, 398 positions of C source): this order, with

@@ -215,7 +215,8 @@ static int mtp_step(struct janas_llm_model *m, const int32_t *hist,
                     float min_conf, struct planner *pl, float *hrow,
                     int32_t *draft, float *survs, int *n_draft)
 {
-    uint32_t dm = janas_llm_model_n_embd(m);
+    /* a row of hidden state: d_model, or qwen4exp's streams */
+    uint32_t dm = janas_llm_model_hidden_width(m);
     *n_draft = 0;
     janas_llm_mtp_note_tokens(m, hist + pos + 1, acc + 1);
     if (!drafting)
@@ -442,7 +443,7 @@ janas_llm_session_create(struct janas_llm_model *m,
     s->cap = janas_llm_model_n_ctx(m);
     s->hist = malloc((s->cap + MAX_SPEC_K + 2) * sizeof(int32_t));
     s->logits = malloc((size_t)(MAX_SPEC_K + 1) * s->nv * sizeof(float));
-    s->hrow = malloc(janas_llm_model_n_embd(m) * sizeof(float));
+    s->hrow = malloc(janas_llm_model_hidden_width(m) * sizeof(float));
     s->smp = janas_sampler_create(s->nv);
     if (o->draft)
         s->dlogits = malloc((size_t)s->nv * sizeof(float));

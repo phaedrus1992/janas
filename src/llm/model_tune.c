@@ -245,6 +245,9 @@ void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv)
     if (m->own_compute)
         janas_pool_set_active(m->compute, m->tuner.cand[cand].threads);
     m->gpu_use = m->tuner.cand[cand].gpu;
+    if (m->gpu && nv >= JANAS_GPU_FAST_N && janas_gpu_repeatable() &&
+        janas_gpu_fast_prompt())
+        m->gpu_use = 0; /* the fast products alone: gpu.h */
     m->npu_use = m->tuner.cand[cand].npu;
     janas_m_npu_awake(m, nv);
     if (m->gpu) {
@@ -252,6 +255,7 @@ void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv)
                              m->gpu_use && (nv >= janas_gpu_min_n(m->gpu) ||
                                             janas_m_gpu_token_asked()));
         janas_gpu_set_only_fast(m->gpu, !m->gpu_use);
+        janas_gpu_set_pass(m->gpu, nv);
     }
 }
 

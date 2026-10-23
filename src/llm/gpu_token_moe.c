@@ -79,8 +79,8 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           VkPipeline *bound, VkDeviceAddress YD, uint32_t n)
 {
     VkDeviceAddress B = t->buf.addr;
-    uint32_t np = n * md->k, nbd = md->dm / JANAS_QK, nbf = md->eff / JANAS_QK;
-    int dt = ly->down.type;
+    uint32_t np = n * md->k, nbd = md->dm / JANAS_QK, nbf = t->effp / JANAS_QK;
+    int dt = ly->down.type, gtp = ly->gate.type;
     struct push_ga pg = {.nb = nbd};
     janas_g_push_addr(
         pg.src, B + (janas_g_x_in_32(ly->gate.type) ? t->o_q32 : t->o_q256));
@@ -90,30 +90,34 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
     janas_gt_push(g, &pg, sizeof(pg));
     g->vkCmdDispatch(g->cb, np, 1, 1);
     janas_g_compute_barrier(g);
-    struct push_id pi = {.rows = md->eff, .nb = nbd, .tiles = t->tiles1};
+    struct push_id pi = {
+        .rows = md->eff, .nb = nbd, .tiles = t->tiles1, .ngroups = md->dm / 32};
     janas_g_push_addr(pi.t, B + t->o_tab1);
     janas_gt_bind(g, bound,
-                  ly->gate.type == JANAS_MXFP4  ? g->pipe_idmx
-                  : ly->gate.type == JANAS_Q3_K ? g->pipe_id3
-                                                : g->pipe_id4);
+                  gtp == JANAS_MXFP4  ? g->pipe_idmx
+                  : gtp == JANAS_Q3_K ? g->pipe_id3
+                  : gtp == JANAS_Q2_0 ? g->pipe_idb[2]
+                                      : g->pipe_id4);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind);
     janas_g_compute_barrier(g);
     struct push_ac ac = {.blocks = np * nbf};
     janas_g_push_addr(ac.g, B + t->o_egu);
-    janas_g_push_addr(ac.u, B + t->o_egu + (size_t)np * md->eff * 4);
+    janas_g_push_addr(ac.u, B + t->o_egu + (size_t)np * t->effp * 4);
     janas_g_push_addr(ac.x, B + t->o_eh);
     janas_gt_bind(g, bound, janas_g_x_in_32(dt) ? g->pipea32 : g->pipea);
     janas_gt_push(g, &ac, sizeof(ac));
     g->vkCmdDispatch(g->cb, np * nbf, 1, 1);
     janas_g_compute_barrier(g);
-    pi = (struct push_id){.rows = md->dm, .nb = nbf, .tiles = t->tiles2};
+    pi = (struct push_id){
+        .rows = md->dm, .nb = nbf, .tiles = t->tiles2, .ngroups = md->eff / 32};
     janas_g_push_addr(pi.t, B + t->o_tab2);
     janas_gt_bind(g, bound,
                   dt == JANAS_Q4_K    ? g->pipe_id4
                   : dt == JANAS_Q6_K  ? g->pipe_id6s
                   : dt == JANAS_MXFP4 ? g->pipe_idmx
                   : dt == JANAS_Q3_K  ? g->pipe_id3
+                  : dt == JANAS_Q2_0  ? g->pipe_idb[2]
                                       : g->pipe_id6);
     janas_gt_push(g, &pi, sizeof(pi));
     g->vkCmdDispatchIndirect(g->cb, t->buf.buf, t->o_ind + 16);
@@ -159,7 +163,7 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
 {
     const struct janas_gpu_tok_layer *ly = &md->layers[l];
     uint32_t k = md->k, ne = md->n_expert, np = n * k, nd = 0;
-    uint32_t nbd = md->dm / JANAS_QK, nbf = md->eff / JANAS_QK;
+    uint32_t nbd = md->dm / JANAS_QK, nbf = t->effp / JANAS_QK, ep = t->effp;
     janas_gt_sync_range(g, t, t->o_pe, (size_t)np * 4, 0);
     const uint32_t *pe = (const uint32_t *)(t->buf.map + t->o_pe);
     uint32_t *cnt = t->cnt, *gt = (uint32_t *)(t->buf.map + t->o_gt),
@@ -189,9 +193,10 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
     uint32_t *t1 = (uint32_t *)(t->buf.map + t->o_tab1),
              *t2 = (uint32_t *)(t->buf.map + t->o_tab2);
     uint32_t n1 = 0, n2 = 0; /* tiles */
-    size_t gb = (size_t)md->eff * nbd * janas_qtype_block_size(ly->gate.type),
-           db =
-               (size_t)md->dm * nbf * janas_qtype_block_size(ly->down.type) + 4,
+    /* the matrices' bytes; a down matrix's rows may end inside a group */
+    size_t gb = (size_t)md->eff * janas_qtype_row_bytes(ly->gate.type, md->dm),
+           db = (size_t)md->dm * janas_qtype_row_bytes(ly->down.type, md->eff) +
+                4,
            pb = (size_t)md->dm * nbf * JANAS_Q6KP_PLANE;
     for (uint32_t i = 0; i < nd; i++) {
         uint32_t e = t->ids[i], a = cnt[e], nv = cnt[e + 1] - a;
@@ -209,12 +214,12 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
         if (!wg || !wu || !wd)
             return -1;
         VkDeviceAddress x = B + t->o_xg + (VkDeviceAddress)a * nbd * 320;
+        /* gate and up at ep floats a pair: the rows past eff stay zero */
         table_entry(t1 + 12 * (2 * i), wg, x,
-                    B + t->o_egu + (VkDeviceAddress)a * md->eff * 4, nv,
-                    md->eff, 0, 0);
+                    B + t->o_egu + (VkDeviceAddress)a * ep * 4, nv, ep, 0, 0);
         table_entry(t1 + 12 * (2 * i + 1), wu, x,
-                    B + t->o_egu + ((VkDeviceAddress)np + a) * md->eff * 4, nv,
-                    md->eff, 0, 0);
+                    B + t->o_egu + ((VkDeviceAddress)np + a) * ep * 4, nv, ep,
+                    0, 0);
         table_entry(t2 + 12 * i, wd,
                     B + t->o_eh + (VkDeviceAddress)a * nbf * 320,
                     B + t->o_dout + (VkDeviceAddress)a * md->dm * 4, nv, md->dm,

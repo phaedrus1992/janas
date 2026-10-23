@@ -7,6 +7,11 @@
 #include "quant_q6kp.h"
 #include "vmath.h"
 #include "iq3s_grid.h"
+#include "iq1s_grid.h"
+#include "iq2s_grid.h"
+#include "iq2xs_grid.h"
+#include "iq2xxs_grid.h"
+#include "iq3xxs_grid.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -944,6 +949,116 @@ float janas_q4_1_dot_ref(const struct janas_block_q4_1 *w,
     return dm_dot_ref((const uint8_t *)w, sizeof(*w), 0, x, nb);
 }
 
+/* The value of weight l of a Q5_0 block, 0-31: the weight is d (q - 16). */
+static inline int q5_0_value(const struct janas_block_q5_0 *b, int l)
+{
+    uint32_t qh;
+    memcpy(&qh, b->qh, 4);
+    int lo = l < 16 ? b->qs[l] & 15 : b->qs[l - 16] >> 4;
+    return lo | (int)((qh >> l) & 1) << 4;
+}
+
+void janas_q5_0_dequantize(const struct janas_block_q5_0 *x, float *y, size_t n)
+{
+    for (size_t b = 0; b < n / 32; b++, y += 32) {
+        float d = janas_fp16_to_fp32(x[b].d);
+        for (int l = 0; l < 32; l++)
+            y[l] = d * (float)(q5_0_value(&x[b], l) - 16);
+    }
+}
+
+/* One lane per block position, as Q8_0. */
+float janas_q5_0_dot_ref(const struct janas_block_q5_0 *w,
+                         const struct janas_block_q8k *x, size_t nb)
+{
+    float acc[8] = {0};
+    for (size_t b = 0; b < nb; b++)
+        for (int k = 0; k < 8; k++) {
+            const struct janas_block_q5_0 *wk = w + 8 * b + k;
+            int32_t dot = 0;
+            for (int l = 0; l < 32; l++)
+                dot += (q5_0_value(wk, l) - 16) * x[b].qs32[32 * k + l];
+            acc[k] = fmaf(janas_fp16_to_fp32(wk->d) * x[b].d32[k], (float)dot,
+                          acc[k]);
+        }
+    return ((acc[0] + acc[4]) + (acc[2] + acc[6])) +
+           ((acc[1] + acc[5]) + (acc[3] + acc[7]));
+}
+
+/* The value of weight i of a Q2_0 block, 0-3: the weight is d (q - 1). */
+static inline int q2_0_value(const struct janas_block_q2_0 *b, int i)
+{
+    return b->qs[i / 4] >> 2 * (i % 4) & 3;
+}
+
+void janas_q2_0_dequantize(const struct janas_block_q2_0 *x, float *y, size_t n)
+{
+    for (size_t b = 0; b < n / 64; b++, y += 64) {
+        float d = janas_fp16_to_fp32(x[b].d);
+        for (int i = 0; i < 64; i++)
+            y[i] = (float)(q2_0_value(&x[b], i) - 1) * d;
+    }
+}
+
+/* One lane per block of 32 activations, two per Q2_0 block, as Q8_0. */
+float janas_q2_0_dot_ref(const struct janas_block_q2_0 *w,
+                         const struct janas_block_q8k *x, size_t nb)
+{
+    float acc[8] = {0};
+    for (size_t b = 0; b < nb; b++)
+        for (int k = 0; k < 8; k++) {
+            const struct janas_block_q2_0 *wk = w + 4 * b + k / 2;
+            int32_t dot = 0;
+            for (int l = 0; l < 32; l++)
+                dot += (q2_0_value(wk, 32 * (k % 2) + l) - 1) *
+                       x[b].qs32[32 * k + l];
+            acc[k] = fmaf(janas_fp16_to_fp32(wk->d) * x[b].d32[k], (float)dot,
+                          acc[k]);
+        }
+    return ((acc[0] + acc[4]) + (acc[2] + acc[6])) +
+           ((acc[1] + acc[5]) + (acc[3] + acc[7]));
+}
+
+/* The two-bit value of weight e of a Q2_K block. */
+static inline int q2k_value(const struct janas_block_q2k *w, int e)
+{
+    int n = e / 128, j = e % 128 / 32, l = e % 32;
+    return w->qs[32 * n + l] >> 2 * j & 3;
+}
+
+void janas_q2k_dequantize(const struct janas_block_q2k *x, float *y, size_t n)
+{
+    for (size_t b = 0; b < n / JANAS_QK; b++, y += JANAS_QK) {
+        float d = janas_fp16_to_fp32(x[b].d),
+              mn = janas_fp16_to_fp32(x[b].dmin);
+        for (int e = 0; e < JANAS_QK; e++) {
+            /* as ggml's dequantize_row_q2_K */
+            uint8_t sc = x[b].scales[e / 16];
+            float dl = d * (float)(sc & 15), ml = mn * (float)(sc >> 4);
+            y[e] = dl * (float)q2k_value(&x[b], e) - ml;
+        }
+    }
+}
+
+float janas_q2k_dot_ref(const struct janas_block_q2k *w,
+                        const struct janas_block_q8k *x, size_t nb)
+{
+    float acc = 0.0f, accm = 0.0f;
+    for (size_t b = 0; b < nb; b++) {
+        int32_t sumi = 0, summ = 0;
+        for (int g = 0; g < 16; g++) {
+            int32_t s = 0;
+            for (int e = 16 * g; e < 16 * g + 16; e++)
+                s += q2k_value(&w[b], e) * x[b].qs[e];
+            sumi += (w[b].scales[g] & 15) * s;
+            summ += (w[b].scales[g] >> 4) * x[b].bsums[g];
+        }
+        acc = fmaf(janas_fp16_to_fp32(w[b].d) * x[b].d, (float)sumi, acc);
+        accm = fmaf(janas_fp16_to_fp32(w[b].dmin) * x[b].d, (float)summ, accm);
+    }
+    return acc - accm;
+}
+
 /* The sixteen 6-bit scales of a Q3_K block, less their offset of 32. */
 static inline void q3k_scales(const uint8_t *q, int8_t sc[16])
 {
@@ -1037,6 +1152,253 @@ float janas_iq3s_dot_ref(const struct janas_block_iq3s *w,
             sumi += iq3s_scale(&w[b], g) * s;
         }
         acc = fmaf(janas_fp16_to_fp32(w[b].d) * x[b].d, (float)sumi, acc);
+    }
+    return acc;
+}
+
+/* The sign byte of an IQ2 and IQ3 7-bit index: the eighth sign makes the
+   count of negative weights even (ggml's ksigns_iq2xs) */
+static inline uint32_t iq_signs(uint32_t i)
+{
+    return i | (uint32_t)__builtin_parity(i) << 7;
+}
+
+/* Sub-group l (0-31) of an IQ2 block of the type: its grid entry (eight
+   magnitudes), its signs (bit j for weight j), its scale 1 + 2 s */
+static inline void iq2_sub(int type, const void *blk, int l, uint64_t *grid,
+                           uint32_t *signs, int *scale)
+{
+    int g = l / 4, k = l % 4;
+    if (type == JANAS_IQ2_XXS) {
+        const struct janas_block_iq2xxs *w = blk;
+        uint32_t aux[2];
+        memcpy(aux, w->qs + 4 * g, 8);
+        *grid = iq2xxs_grid[aux[0] >> 8 * k & 255];
+        *signs = iq_signs(aux[1] >> 7 * k & 127);
+        *scale = 1 + 2 * (int)(aux[1] >> 28);
+    } else if (type == JANAS_IQ2_XS) {
+        const struct janas_block_iq2xs *w = blk;
+        uint32_t q = w->qs[4 * g + k];
+        *grid = iq2xs_grid[q & 511];
+        *signs = iq_signs(q >> 9);
+        *scale = 1 + 2 * (w->scales[g] >> 4 * (k / 2) & 15);
+    } else {
+        const struct janas_block_iq2s *w = blk;
+        *grid = iq2s_grid[w->qs[4 * g + k] |
+                          ((uint32_t)w->qh[g] << (8 - 2 * k) & 0x300)];
+        *signs = w->qs[32 + 4 * g + k];
+        *scale = 1 + 2 * (w->scales[g] >> 4 * (k / 2) & 15);
+    }
+}
+
+static size_t iq2_size(int type)
+{
+    return type == JANAS_IQ2_XXS  ? sizeof(struct janas_block_iq2xxs)
+           : type == JANAS_IQ2_XS ? sizeof(struct janas_block_iq2xs)
+                                  : sizeof(struct janas_block_iq2s);
+}
+
+void janas_iq2_dequantize(int type, const void *x, float *y, size_t n)
+{
+    const uint8_t *b8 = x;
+    for (size_t b = 0; b < n / JANAS_QK; b++, b8 += iq2_size(type)) {
+        uint16_t h;
+        memcpy(&h, b8, 2);
+        float d = janas_fp16_to_fp32(h);
+        for (int l = 0; l < 32; l++, y += 8) {
+            uint64_t grid;
+            uint32_t signs;
+            int scale;
+            iq2_sub(type, b8, l, &grid, &signs, &scale);
+            /* as ggml's dequantize_row_iq2_*: d (0.5 + s) / 4 */
+            float dl = d * (0.5f + (float)((scale - 1) / 2)) * 0.25f;
+            for (int j = 0; j < 8; j++)
+                y[j] = dl * (float)(grid >> 8 * j & 0xff) *
+                       (signs >> j & 1 ? -1.0f : 1.0f);
+        }
+    }
+}
+
+float janas_iq2_dot_ref(int type, const void *w,
+                        const struct janas_block_q8k *x, size_t nb)
+{
+    const uint8_t *b8 = w;
+    float acc = 0.0f;
+    for (size_t b = 0; b < nb; b++, b8 += iq2_size(type)) {
+        int32_t sumi = 0;
+        for (int l = 0; l < 32; l++) {
+            uint64_t grid;
+            uint32_t signs;
+            int scale, s = 0;
+            iq2_sub(type, b8, l, &grid, &signs, &scale);
+            for (int j = 0; j < 8; j++) {
+                int v = (int)(grid >> 8 * j & 0xff);
+                s += (signs >> j & 1 ? -v : v) * x[b].qs[8 * l + j];
+            }
+            sumi += scale * s;
+        }
+        uint16_t h;
+        memcpy(&h, b8, 2);
+        acc = fmaf(janas_fp16_to_fp32(h) * 0.125f * x[b].d, (float)sumi, acc);
+    }
+    return acc;
+}
+
+/* IQ1_M: the block's d, from the top nibbles of its four scale words */
+static inline float iq1m_d(const struct janas_block_iq1m *w)
+{
+    uint16_t sc[4];
+    memcpy(sc, w->scales, 8);
+    uint16_t h = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    return janas_fp16_to_fp32(h);
+}
+
+/* sub-group l (0-31) of an IQ1_M block: its grid entry, whether its shift
+   is negative, its half's 2 s + 1 */
+static inline void iq1m_sub(const struct janas_block_iq1m *w, int l,
+                            uint64_t *grid, int *neg, int *scale)
+{
+    int g = l / 4, k = l % 4;
+    uint8_t qh = w->qh[2 * g + k / 2];
+    uint32_t idx = w->qs[4 * g + k] | ((uint32_t)qh << (k % 2 ? 4 : 8) & 0x700);
+    *grid = iq1s_grid[idx];
+    *neg = qh >> (k % 2 ? 7 : 3) & 1;
+    uint16_t sc;
+    memcpy(&sc, w->scales + 2 * (g / 2), 2);
+    *scale = 2 * (sc >> (6 * (g % 2) + 3 * (k / 2)) & 7) + 1;
+}
+
+/* the same for IQ1_S: one scale and one shift for the group */
+static inline void iq1s_sub(const struct janas_block_iq1s *w, int l,
+                            uint64_t *grid, int *neg, int *scale)
+{
+    int g = l / 4, k = l % 4;
+    uint32_t qh = w->qh[g];
+    *grid = iq1s_grid[w->qs[4 * g + k] | (qh >> 3 * k & 7) << 8];
+    *neg = qh >> 15 & 1;
+    *scale = 2 * (int)(qh >> 12 & 7) + 1;
+}
+
+void janas_iq1s_dequantize(const struct janas_block_iq1s *x, float *y, size_t n)
+{
+    for (size_t b = 0; b < n / JANAS_QK; b++) {
+        float d = janas_fp16_to_fp32(x[b].d);
+        for (int l = 0; l < 32; l++, y += 8) {
+            uint64_t grid;
+            int neg, scale;
+            iq1s_sub(&x[b], l, &grid, &neg, &scale);
+            /* as ggml's dequantize_row_iq1_s */
+            float dl = d * (float)scale, delta = neg ? -0.125f : 0.125f;
+            for (int j = 0; j < 8; j++)
+                y[j] = dl * ((float)(int8_t)(grid >> 8 * j & 0xff) + delta);
+        }
+    }
+}
+
+float janas_iq1s_dot_ref(const struct janas_block_iq1s *w,
+                         const struct janas_block_q8k *x, size_t nb)
+{
+    float acc = 0.0f;
+    for (size_t b = 0; b < nb; b++) {
+        int32_t sumi = 0;
+        for (int l = 0; l < 32; l++) {
+            uint64_t grid;
+            int neg, scale, s = 0;
+            iq1s_sub(&w[b], l, &grid, &neg, &scale);
+            for (int j = 0; j < 8; j++)
+                s += (8 * (int8_t)(grid >> 8 * j & 0xff) + (neg ? -1 : 1)) *
+                     x[b].qs[8 * l + j];
+            sumi += scale * s;
+        }
+        acc = fmaf(janas_fp16_to_fp32(w[b].d) * 0.125f * x[b].d, (float)sumi,
+                   acc);
+    }
+    return acc;
+}
+
+void janas_iq1m_dequantize(const struct janas_block_iq1m *x, float *y, size_t n)
+{
+    for (size_t b = 0; b < n / JANAS_QK; b++) {
+        float d = iq1m_d(&x[b]);
+        for (int l = 0; l < 32; l++, y += 8) {
+            uint64_t grid;
+            int neg, scale;
+            iq1m_sub(&x[b], l, &grid, &neg, &scale);
+            /* as ggml's dequantize_row_iq1_m */
+            float dl = d * (float)scale, delta = neg ? -0.125f : 0.125f;
+            for (int j = 0; j < 8; j++)
+                y[j] = dl * ((float)(int8_t)(grid >> 8 * j & 0xff) + delta);
+        }
+    }
+}
+
+float janas_iq1m_dot_ref(const struct janas_block_iq1m *w,
+                         const struct janas_block_q8k *x, size_t nb)
+{
+    float acc = 0.0f;
+    for (size_t b = 0; b < nb; b++) {
+        int32_t sumi = 0;
+        for (int l = 0; l < 32; l++) {
+            uint64_t grid;
+            int neg, scale, s = 0;
+            iq1m_sub(&w[b], l, &grid, &neg, &scale);
+            for (int j = 0; j < 8; j++)
+                s += (8 * (int8_t)(grid >> 8 * j & 0xff) + (neg ? -1 : 1)) *
+                     x[b].qs[8 * l + j];
+            sumi += scale * s;
+        }
+        acc = fmaf(iq1m_d(&w[b]) * 0.125f * x[b].d, (float)sumi, acc);
+    }
+    return acc;
+}
+
+/* group g's word of an IQ3_XXS block: four sign indices and the scale */
+static inline uint32_t iq3xxs_aux(const struct janas_block_iq3xxs *w, int g)
+{
+    uint32_t aux;
+    memcpy(&aux, w->qs + 64 + 4 * g, 4);
+    return aux;
+}
+
+static inline int iq3xxs_value(const struct janas_block_iq3xxs *w, int g, int e)
+{
+    int k = e / 8, j = e % 8;
+    int v =
+        (int)(iq3xxs_grid[w->qs[8 * g + 2 * k + j / 4]] >> 8 * (j % 4) & 0xff);
+    return iq_signs(iq3xxs_aux(w, g) >> 7 * k & 127) >> j & 1 ? -v : v;
+}
+
+void janas_iq3xxs_dequantize(const struct janas_block_iq3xxs *x, float *y,
+                             size_t n)
+{
+    for (size_t b = 0; b < n / JANAS_QK; b++) {
+        float d = janas_fp16_to_fp32(x[b].d);
+        for (int g = 0; g < 8; g++, y += 32) {
+            /* as ggml's dequantize_row_iq3_xxs */
+            float db = d * (0.5f + (float)(iq3xxs_aux(&x[b], g) >> 28)) * 0.5f;
+            for (int e = 0; e < 32; e++) {
+                int v = iq3xxs_value(&x[b], g, e);
+                y[e] = db * (float)(v < 0 ? -v : v) * (v < 0 ? -1.0f : 1.0f);
+            }
+        }
+    }
+}
+
+float janas_iq3xxs_dot_ref(const struct janas_block_iq3xxs *w,
+                           const struct janas_block_q8k *x, size_t nb)
+{
+    float acc = 0.0f;
+    for (size_t b = 0; b < nb; b++) {
+        int32_t sumi = 0;
+        for (int g = 0; g < 8; g++) {
+            int32_t s = 0;
+            for (int e = 0; e < 32; e++)
+                s += iq3xxs_value(&w[b], g, e) * x[b].qs[32 * g + e];
+            sumi += (1 + 2 * (int32_t)(iq3xxs_aux(&w[b], g) >> 28)) * s;
+        }
+        acc =
+            fmaf(janas_fp16_to_fp32(w[b].d) * 0.25f * x[b].d, (float)sumi, acc);
     }
     return acc;
 }
@@ -1152,6 +1514,27 @@ static dot51_fn dot51_impl = janas_q5_1_dot_ref;
 typedef float (*dot41_fn)(const struct janas_block_q4_1 *,
                           const struct janas_block_q8k *, size_t);
 static dot41_fn dot41_impl = janas_q4_1_dot_ref;
+typedef float (*dot2k_fn)(const struct janas_block_q2k *,
+                          const struct janas_block_q8k *, size_t);
+static dot2k_fn dot2k_impl = janas_q2k_dot_ref;
+typedef float (*dotx1s_fn)(const struct janas_block_iq1s *,
+                           const struct janas_block_q8k *, size_t);
+static dotx1s_fn dotx1s_impl = janas_iq1s_dot_ref;
+typedef float (*dotx1_fn)(const struct janas_block_iq1m *,
+                          const struct janas_block_q8k *, size_t);
+static dotx1_fn dotx1_impl = janas_iq1m_dot_ref;
+typedef float (*dotx2_fn)(int, const void *, const struct janas_block_q8k *,
+                          size_t);
+static dotx2_fn dotx2_impl = janas_iq2_dot_ref;
+typedef float (*dotx3_fn)(const struct janas_block_iq3xxs *,
+                          const struct janas_block_q8k *, size_t);
+static dotx3_fn dotx3_impl = janas_iq3xxs_dot_ref;
+typedef float (*dot50_fn)(const struct janas_block_q5_0 *,
+                          const struct janas_block_q8k *, size_t);
+static dot50_fn dot50_impl = janas_q5_0_dot_ref;
+typedef float (*dot20_fn)(const struct janas_block_q2_0 *,
+                          const struct janas_block_q8k *, size_t);
+static dot20_fn dot20_impl = janas_q2_0_dot_ref;
 typedef float (*dot3_fn)(const struct janas_block_q3k *,
                          const struct janas_block_q8k *, size_t);
 static dot3_fn dot3_impl = janas_q3k_dot_ref;
@@ -1184,6 +1567,13 @@ __attribute__((constructor)) static void dot_kernels_init(void)
         dot40_impl = q4_0_dot_avx2;
         dot51_impl = q5_1_dot_avx2;
         dot41_impl = q4_1_dot_avx2;
+        dot50_impl = q5_0_dot_avx2;
+        dotx3_impl = iq3xxs_dot_avx2;
+        dotx2_impl = iq2_dot_avx2;
+        dotx1_impl = iq1m_dot_avx2;
+        dotx1s_impl = iq1s_dot_avx2;
+        dot2k_impl = q2k_dot_avx2;
+        dot20_impl = q2_0_dot_avx2;
         dot3_impl = q3k_dot_avx2;
         dotis_impl = iq3s_dot_avx2;
         dot6p_impl = q6kp_dotn_avx2;
@@ -1201,6 +1591,13 @@ __attribute__((constructor)) static void dot_kernels_init(void)
             dot40_impl = q4_0_dot_vnni;
             dot51_impl = q5_1_dot_vnni;
             dot41_impl = q4_1_dot_vnni;
+            dot50_impl = q5_0_dot_vnni;
+            dotx3_impl = iq3xxs_dot_vnni;
+            dotx2_impl = iq2_dot_vnni;
+            dotx1_impl = iq1m_dot_vnni;
+            dotx1s_impl = iq1s_dot_vnni;
+            dot2k_impl = q2k_dot_vnni;
+            dot20_impl = q2_0_dot_vnni;
             dot3_impl = q3k_dot_vnni;
             dotis_impl = iq3s_dot_vnni;
             dot6p_impl = q6kp_dotn_vnni;
@@ -1267,6 +1664,48 @@ float janas_q4_1_dot(const struct janas_block_q4_1 *w,
                      const struct janas_block_q8k *x, size_t nb)
 {
     return dot41_impl(w, x, nb);
+}
+
+float janas_q5_0_dot(const struct janas_block_q5_0 *w,
+                     const struct janas_block_q8k *x, size_t nb)
+{
+    return dot50_impl(w, x, nb);
+}
+
+float janas_iq3xxs_dot(const struct janas_block_iq3xxs *w,
+                       const struct janas_block_q8k *x, size_t nb)
+{
+    return dotx3_impl(w, x, nb);
+}
+
+float janas_iq2_dot(int type, const void *w, const struct janas_block_q8k *x,
+                    size_t nb)
+{
+    return dotx2_impl(type, w, x, nb);
+}
+
+float janas_q2k_dot(const struct janas_block_q2k *w,
+                    const struct janas_block_q8k *x, size_t nb)
+{
+    return dot2k_impl(w, x, nb);
+}
+
+float janas_iq1s_dot(const struct janas_block_iq1s *w,
+                     const struct janas_block_q8k *x, size_t nb)
+{
+    return dotx1s_impl(w, x, nb);
+}
+
+float janas_iq1m_dot(const struct janas_block_iq1m *w,
+                     const struct janas_block_q8k *x, size_t nb)
+{
+    return dotx1_impl(w, x, nb);
+}
+
+float janas_q2_0_dot(const struct janas_block_q2_0 *w,
+                     const struct janas_block_q8k *x, size_t nb)
+{
+    return dot20_impl(w, x, nb);
 }
 
 float janas_q3k_dot(const struct janas_block_q3k *w,
@@ -1350,10 +1789,26 @@ size_t janas_qtype_block_size(int type)
         return 8 * sizeof(struct janas_block_q5_1);
     case JANAS_Q4_1:
         return 8 * sizeof(struct janas_block_q4_1);
+    case JANAS_Q5_0:
+        return 8 * sizeof(struct janas_block_q5_0);
+    case JANAS_Q2_0:
+        return 4 * sizeof(struct janas_block_q2_0);
     case JANAS_Q3_K:
         return sizeof(struct janas_block_q3k);
+    case JANAS_Q2_K:
+        return sizeof(struct janas_block_q2k);
     case JANAS_IQ3_S:
         return sizeof(struct janas_block_iq3s);
+    case JANAS_IQ3_XXS:
+        return sizeof(struct janas_block_iq3xxs);
+    case JANAS_IQ2_XXS:
+    case JANAS_IQ2_XS:
+    case JANAS_IQ2_S:
+        return iq2_size(type);
+    case JANAS_IQ1_M:
+        return sizeof(struct janas_block_iq1m);
+    case JANAS_IQ1_S:
+        return sizeof(struct janas_block_iq1s);
     case JANAS_IQ4_XS:
         return sizeof(struct janas_block_iq4xs);
     default:
@@ -1394,11 +1849,34 @@ void janas_dequantize(int type, const void *w, float *y, size_t n)
     case JANAS_Q4_1:
         janas_q4_1_dequantize(w, y, n);
         return;
+    case JANAS_Q5_0:
+        janas_q5_0_dequantize(w, y, n);
+        return;
+    case JANAS_Q2_0:
+        janas_q2_0_dequantize(w, y, n);
+        return;
     case JANAS_Q3_K:
         janas_q3k_dequantize(w, y, n);
         return;
+    case JANAS_Q2_K:
+        janas_q2k_dequantize(w, y, n);
+        return;
     case JANAS_IQ3_S:
         janas_iq3s_dequantize(w, y, n);
+        return;
+    case JANAS_IQ3_XXS:
+        janas_iq3xxs_dequantize(w, y, n);
+        return;
+    case JANAS_IQ2_XXS:
+    case JANAS_IQ2_XS:
+    case JANAS_IQ2_S:
+        janas_iq2_dequantize(type, w, y, n);
+        return;
+    case JANAS_IQ1_M:
+        janas_iq1m_dequantize(w, y, n);
+        return;
+    case JANAS_IQ1_S:
+        janas_iq1s_dequantize(w, y, n);
         return;
     default:
         /* callers check janas_qtype_block_size first: this is a bug */
@@ -1430,10 +1908,26 @@ float janas_dot(int type, const void *w, const struct janas_block_q8k *x,
         return janas_q5_1_dot(w, x, nb);
     case JANAS_Q4_1:
         return janas_q4_1_dot(w, x, nb);
+    case JANAS_Q5_0:
+        return janas_q5_0_dot(w, x, nb);
+    case JANAS_Q2_0:
+        return janas_q2_0_dot(w, x, nb);
     case JANAS_Q3_K:
         return janas_q3k_dot(w, x, nb);
+    case JANAS_Q2_K:
+        return janas_q2k_dot(w, x, nb);
     case JANAS_IQ3_S:
         return janas_iq3s_dot(w, x, nb);
+    case JANAS_IQ3_XXS:
+        return janas_iq3xxs_dot(w, x, nb);
+    case JANAS_IQ2_XXS:
+    case JANAS_IQ2_XS:
+    case JANAS_IQ2_S:
+        return janas_iq2_dot(type, w, x, nb);
+    case JANAS_IQ1_M:
+        return janas_iq1m_dot(w, x, nb);
+    case JANAS_IQ1_S:
+        return janas_iq1s_dot(w, x, nb);
     case JANAS_Q6_K_P: /* the base plane alone: two bits per weight */
         return janas_q6kp_dot(w, NULL, NULL, x, nb);
     default:
@@ -1566,11 +2060,29 @@ void janas_dot_rows(int type, const void *w, size_t row_bytes,
         case JANAS_Q4_1:
             f = use_vnni ? q4_1_rows_vnni : q4_1_rows_avx2;
             break;
+        case JANAS_Q5_0:
+            f = use_vnni ? q5_0_rows_vnni : q5_0_rows_avx2;
+            break;
+        case JANAS_Q2_0:
+            f = use_vnni ? q2_0_rows_vnni : q2_0_rows_avx2;
+            break;
         case JANAS_Q3_K:
             f = use_vnni ? q3k_rows_vnni : q3k_rows_avx2;
             break;
+        case JANAS_Q2_K:
+            f = use_vnni ? q2k_rows_vnni : q2k_rows_avx2;
+            break;
         case JANAS_IQ3_S:
             f = use_vnni ? iq3s_rows_vnni : iq3s_rows_avx2;
+            break;
+        case JANAS_IQ3_XXS:
+            f = use_vnni ? iq3xxs_rows_vnni : iq3xxs_rows_avx2;
+            break;
+        case JANAS_IQ1_M:
+            f = use_vnni ? iq1m_rows_vnni : iq1m_rows_avx2;
+            break;
+        case JANAS_IQ1_S:
+            f = use_vnni ? iq1s_rows_vnni : iq1s_rows_avx2;
             break;
         }
         if (f) {
@@ -1593,7 +2105,10 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
         (type == JANAS_Q4_K || type == JANAS_Q6_K || type == JANAS_Q5_K ||
          type == JANAS_Q8_0 || type == JANAS_IQ4_NL || type == JANAS_IQ4_XS ||
          type == JANAS_Q4_0 || type == JANAS_Q5_1 || type == JANAS_Q4_1 ||
-         type == JANAS_Q3_K || type == JANAS_IQ3_S || type == JANAS_MXFP4)) {
+         type == JANAS_Q3_K || type == JANAS_IQ3_S || type == JANAS_MXFP4 ||
+         type == JANAS_Q5_0 || type == JANAS_Q2_0 || type == JANAS_IQ3_XXS ||
+         type == JANAS_IQ2_XXS || type == JANAS_IQ2_XS || type == JANAS_IQ2_S ||
+         type == JANAS_IQ1_M || type == JANAS_IQ1_S || type == JANAS_Q2_K)) {
         float r[8];
         int g = 1;
         for (; v < nv; v += (size_t)g) {
@@ -1637,12 +2152,42 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
                 (use_vnni ? q4_1_dotn_vnni : q4_1_dotn_avx2)(w, xv, x_stride, g,
                                                              nb, r);
                 break;
+            case JANAS_Q5_0:
+                (use_vnni ? q5_0_dotn_vnni : q5_0_dotn_avx2)(w, xv, x_stride, g,
+                                                             nb, r);
+                break;
+            case JANAS_Q2_0:
+                (use_vnni ? q2_0_dotn_vnni : q2_0_dotn_avx2)(w, xv, x_stride, g,
+                                                             nb, r);
+                break;
             case JANAS_Q3_K:
                 (use_vnni ? q3k_dotn_vnni : q3k_dotn_avx2)(w, xv, x_stride, g,
                                                            nb, r);
                 break;
+            case JANAS_Q2_K:
+                (use_vnni ? q2k_dotn_vnni : q2k_dotn_avx2)(w, xv, x_stride, g,
+                                                           nb, r);
+                break;
             case JANAS_IQ3_S:
                 (use_vnni ? iq3s_dotn_vnni : iq3s_dotn_avx2)(w, xv, x_stride, g,
+                                                             nb, r);
+                break;
+            case JANAS_IQ3_XXS:
+                (use_vnni ? iq3xxs_dotn_vnni
+                          : iq3xxs_dotn_avx2)(w, xv, x_stride, g, nb, r);
+                break;
+            case JANAS_IQ2_XXS:
+            case JANAS_IQ2_XS:
+            case JANAS_IQ2_S:
+                (use_vnni ? iq2_dotn_vnni : iq2_dotn_avx2)(type, w, xv,
+                                                           x_stride, g, nb, r);
+                break;
+            case JANAS_IQ1_M:
+                (use_vnni ? iq1m_dotn_vnni : iq1m_dotn_avx2)(w, xv, x_stride, g,
+                                                             nb, r);
+                break;
+            case JANAS_IQ1_S:
+                (use_vnni ? iq1s_dotn_vnni : iq1s_dotn_avx2)(w, xv, x_stride, g,
                                                              nb, r);
                 break;
             default:
@@ -1657,4 +2202,116 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
 #endif
     for (; v < nv; v++)
         out[v * out_stride] = janas_dot(type, w, x + v * x_stride, nb);
+}
+
+size_t janas_qtype_row_bytes(int type, size_t n)
+{
+    size_t sub, bytes; /* the types in blocks of 32 or 64 weights */
+    switch (type) {
+    case JANAS_Q8_0:
+        sub = 32, bytes = sizeof(struct janas_block_q8_0);
+        break;
+    case JANAS_IQ4_NL:
+        sub = 32, bytes = sizeof(struct janas_block_iq4nl);
+        break;
+    case JANAS_MXFP4:
+        sub = 32, bytes = sizeof(struct janas_block_mxfp4);
+        break;
+    case JANAS_Q4_0:
+        sub = 32, bytes = sizeof(struct janas_block_q4_0);
+        break;
+    case JANAS_Q5_1:
+        sub = 32, bytes = sizeof(struct janas_block_q5_1);
+        break;
+    case JANAS_Q4_1:
+        sub = 32, bytes = sizeof(struct janas_block_q4_1);
+        break;
+    case JANAS_Q5_0:
+        sub = 32, bytes = sizeof(struct janas_block_q5_0);
+        break;
+    case JANAS_Q2_0:
+        sub = 64, bytes = sizeof(struct janas_block_q2_0);
+        break;
+    default:
+        sub = JANAS_QK, bytes = janas_qtype_block_size(type);
+    }
+    return n % sub == 0 ? n / sub * bytes : 0;
+}
+
+/* The largest group of a type in blocks of 32 or 64: Q8_0's. */
+#define TAIL_GROUP (8 * sizeof(struct janas_block_q8_0))
+
+/* The tail of a row, its bytes past `full`, into pad padded with zero
+   blocks to a whole group. */
+static void tail_group(int type, const void *row, size_t full, size_t row_bytes,
+                       uint8_t *pad)
+{
+    size_t tb = row_bytes - full;
+    memcpy(pad, (const uint8_t *)row + full, tb);
+    memset(pad + tb, 0, janas_qtype_block_size(type) - tb);
+}
+
+float janas_dot_n(int type, const void *w, const struct janas_block_q8k *x,
+                  size_t n)
+{
+    size_t nb = n / JANAS_QK;
+    if (n % JANAS_QK == 0)
+        return janas_dot(type, w, x, nb);
+    _Alignas(64) uint8_t pad[TAIL_GROUP];
+    tail_group(type, w, nb * janas_qtype_block_size(type),
+               janas_qtype_row_bytes(type, n), pad);
+    float s = nb ? janas_dot(type, w, x, nb) : 0.0f;
+    return s + janas_dot(type, pad, x + nb, 1);
+}
+
+void janas_dot_rows_n(int type, const void *w, size_t row_bytes,
+                      const struct janas_block_q8k *x, size_t n, size_t rows,
+                      float *y)
+{
+    size_t nb = n / JANAS_QK;
+    if (n % JANAS_QK == 0) {
+        janas_dot_rows(type, w, row_bytes, x, nb, rows, y);
+        return;
+    }
+    /* the whole groups row by row, then the tails a few rows at a time */
+    enum { CHUNK = 32 };
+    size_t gb = janas_qtype_block_size(type), full = nb * gb;
+    _Alignas(64) uint8_t pad[CHUNK * TAIL_GROUP];
+    float t[CHUNK];
+    if (nb)
+        janas_dot_rows(type, w, row_bytes, x, nb, rows, y);
+    for (size_t r0 = 0; r0 < rows; r0 += CHUNK) {
+        size_t c = rows - r0 < CHUNK ? rows - r0 : CHUNK;
+        for (size_t i = 0; i < c; i++)
+            tail_group(type, (const uint8_t *)w + (r0 + i) * row_bytes, full,
+                       row_bytes, pad + i * gb);
+        janas_dot_rows(type, pad, gb, x + nb, 1, c, t);
+        for (size_t i = 0; i < c; i++)
+            y[r0 + i] = (nb ? y[r0 + i] : 0.0f) + t[i];
+    }
+}
+
+void janas_dot_multi_n(int type, const void *w, const struct janas_block_q8k *x,
+                       size_t x_stride, size_t nv, size_t n, float *out,
+                       size_t out_stride)
+{
+    size_t nb = n / JANAS_QK;
+    if (n % JANAS_QK == 0) {
+        janas_dot_multi(type, w, x, x_stride, nv, nb, out, out_stride);
+        return;
+    }
+    _Alignas(64) uint8_t pad[TAIL_GROUP];
+    tail_group(type, w, nb * janas_qtype_block_size(type),
+               janas_qtype_row_bytes(type, n), pad);
+    if (nb)
+        janas_dot_multi(type, w, x, x_stride, nv, nb, out, out_stride);
+    float t[8];
+    for (size_t v = 0; v < nv; v += 8) {
+        size_t g = nv - v < 8 ? nv - v : 8;
+        janas_dot_multi(type, pad, x + v * x_stride + nb, x_stride, g, 1, t, 1);
+        for (size_t i = 0; i < g; i++) {
+            float *o = out + (v + i) * out_stride;
+            *o = (nb ? *o : 0.0f) + t[i];
+        }
+    }
 }

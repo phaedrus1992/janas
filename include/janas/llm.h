@@ -557,8 +557,11 @@ JANAS_LLM_API int32_t janas_llm_chat_aside(
 
 /* Whether the model calls a tool, from the next reply on: as it judges
    (AUTO, default), never (NONE), at least one (REQUIRED), or the function
-   named (FUNCTION, name of len bytes). parallel 0 allows one call at most
-   where calls are required. */
+   named (FUNCTION, name of len bytes). REQUIRED with a name (len bytes, or
+   to its end with -1; NULL or "": any): the calls only to the functions
+   whose names begin with it, where one does - janas-chat holds the reply
+   after a service is opened to that service's tools. parallel 0 allows one
+   call at most where calls are required. */
 #define JANAS_LLM_TOOLS_AUTO 0
 #define JANAS_LLM_TOOLS_NONE 1
 #define JANAS_LLM_TOOLS_REQUIRED 2

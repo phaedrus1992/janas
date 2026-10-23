@@ -1099,24 +1099,20 @@ int janas_expert_cache_can_prefetch(const struct janas_expert_cache *c)
     return c->pf_ring[0] != NULL;
 }
 
-int janas_expert_cache_begin(struct janas_expert_cache *c, uint32_t layer,
-                             const uint32_t *ids, size_t n,
-                             const uint8_t **slots, uint8_t *ready)
+/* begin, and with same set the request before's still: its slots are not
+   taken for this one's (victim) */
+static int begin_req(struct janas_expert_cache *c, uint32_t layer,
+                     const uint32_t *ids, size_t n, const uint8_t **slots,
+                     uint8_t *ready, int same)
 {
-    if (c->wide && layer >= c->n_layer) {
-        if (c->outstanding || c->asked_wide)
-            return -1;
-        int rc = janas_expert_cache_begin(c->wide, layer, ids, n, slots, ready);
-        c->asked_wide = rc >= 0;
-        return rc;
-    }
     if (layer >= c->n_layer || n > c->n_slots || n > 256 || c->outstanding ||
         c->asked_wide)
         return -1;
     /* held until finish: the background filling waits for its turn */
     pthread_mutex_lock(&c->api_lock);
     c->last_request = now();
-    c->request++;
+    if (!same)
+        c->request++;
     /* a layer before the last one asked: a new pass */
     if (layer < c->cur_layer) {
         c->last_pass_asked = c->pass_asked;
@@ -1178,11 +1174,26 @@ int janas_expert_cache_begin(struct janas_expert_cache *c, uint32_t layer,
         }
     c->st.requests += n;
     for (size_t i = 0; i < n; i++)
-        slots[i] = c->arena + (size_t)s[i] * c->slot_bytes;
+        slots[i] =
+            s[i] != NONE ? c->arena + (size_t)s[i] * c->slot_bytes : NULL;
     c->outstanding = 1;
     if (start_jobs(c) != 0)
         c->batch_rc = -1; /* finish() reports it, and waits all the same */
     return queued;
+}
+
+int janas_expert_cache_begin(struct janas_expert_cache *c, uint32_t layer,
+                             const uint32_t *ids, size_t n,
+                             const uint8_t **slots, uint8_t *ready)
+{
+    if (c->wide && layer >= c->n_layer) {
+        if (c->outstanding || c->asked_wide)
+            return -1;
+        int rc = janas_expert_cache_begin(c->wide, layer, ids, n, slots, ready);
+        c->asked_wide = rc >= 0;
+        return rc;
+    }
+    return begin_req(c, layer, ids, n, slots, ready, 0);
 }
 
 void janas_expert_cache_present(struct janas_expert_cache *c, uint32_t layer,
@@ -1227,6 +1238,29 @@ int janas_expert_cache_fetch(struct janas_expert_cache *c, uint32_t layer,
     if (janas_expert_cache_begin(c, layer, ids, n, slots, ready) < 0)
         return -1;
     return janas_expert_cache_finish(c);
+}
+
+int janas_expert_cache_fetch_many(struct janas_expert_cache *c, uint32_t layer,
+                                  const uint32_t *ids, size_t n,
+                                  const uint8_t **slots)
+{
+    if (c->wide && layer >= c->n_layer)
+        return janas_expert_cache_fetch_many(c->wide, layer, ids, n, slots);
+    /* room besides the slots read ahead, which a request never takes */
+    if (2 * n > c->n_slots)
+        return -1;
+    uint8_t ready[256];
+    for (size_t i = 0; i < n; i += 256) {
+        size_t k = n - i < 256 ? n - i : 256;
+        if (begin_req(c, layer, ids + i, k, slots + i, ready, i > 0) < 0)
+            return -1;
+        if (janas_expert_cache_finish(c) != 0)
+            return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (!slots[i])
+            return -1;
+    return 0;
 }
 
 void janas_expert_cache_stats(const struct janas_expert_cache *c,

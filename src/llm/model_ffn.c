@@ -148,7 +148,12 @@ static void act_worker(void *arg, int tid, int n_threads)
             janas_m_ana_mask(m, g, h, ff);
         if (m->nskipq && m->nskipq[g]) /* down by neuron reads h itself */
             continue;
-        janas_q8k_quantize_det(h, m->hq + g * stride / JANAS_QK, ff);
+        /* a width no multiple of 256 (qwen4exp's 640) quantized with zeros
+           after it: the down matrix's rows end inside the last group */
+        uint32_t fw = (ff + JANAS_QK - 1) / JANAS_QK * JANAS_QK;
+        if (fw > ff)
+            memset(h + ff, 0, (fw - ff) * sizeof(float));
+        janas_q8k_quantize_det(h, m->hq + g * stride / JANAS_QK, fw);
     }
 }
 

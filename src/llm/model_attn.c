@@ -253,6 +253,10 @@ void janas_m_attn_layer(struct janas_llm_model *m, const struct layer *ly,
     if (nt == 2) /* Gemma 4's full layers: V is K, before K's norm */
         memcpy(m->vv, m->kk, (size_t)n * kvd * sizeof(float));
     janas_m_attn_core(m, ly, n, pos0, ta);
+    /* qwen4exp: past its budget, the sparse attention - not in its MTP
+       block, whose indexer is left unused: dense, as llama.cpp's */
+    if (m->ix_heads && ly->ix_q)
+        janas_m_qsa(m, ly, n, pos0);
     if (m->npu) /* the NPU's calibration (JANAS_NPU_A8=1) */
         janas_m_npu_calib(m, 0, m->ana_layer, m->att, n, qd, qd);
     double tc = now();

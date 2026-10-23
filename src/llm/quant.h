@@ -140,9 +140,105 @@ struct janas_block_iq3s {
     uint8_t scales[JANAS_QK / 64];
 };
 
+/*
+ * IQ3_XXS: 256 weights in eight groups of 32, 98 bytes. Group g: eight 8-bit
+ * indices into a grid of 256 entries of four magnitudes each (qs[8g + k],
+ * weights 4k to 4k + 3), then a 32-bit word at qs[64 + 4g]: four 7-bit
+ * indices of sign bytes (bits 7k, for weights 8k to 8k + 7; the eighth sign
+ * makes the count of negative ones even) and the scale s in its top four
+ * bits. The weight is d (1 + 2 s) / 4 times the signed magnitude.
+ */
+struct janas_block_iq3xxs {
+    uint16_t d; /* fp16 */
+    uint8_t qs[3 * JANAS_QK / 8];
+};
+
+/*
+ * IQ2_XXS, IQ2_XS, IQ2_S: 256 weights in 32 sub-groups of eight, each an
+ * entry of a grid (eight magnitudes) and a sign byte (bit j for weight j),
+ * a scale s for every one or two of them; the weight is d (1 + 2 s) / 8
+ * times the signed magnitude. IQ2_XXS (66 bytes): per group of 32 two
+ * words, four 8-bit indices into a grid of 256, then four 7-bit indices of
+ * sign bytes (the eighth sign making the count of negative ones even) and
+ * the group's scale in the top four bits. IQ2_XS (74 bytes): per
+ * sub-group a 16-bit word, a 9-bit index into a grid of 512 and a 7-bit
+ * index of a sign byte; scales[g]: the scales of sub-groups 4g, 4g + 1
+ * (low nibble) and 4g + 2, 4g + 3. IQ2_S (82 bytes): qs[4g + k] the low
+ * eight bits of a 10-bit index into a grid of 1024 (the high two in bits
+ * 2k of qh[g]), qs[32 + 4g + k] its sign byte as it is, scales as IQ2_XS.
+ */
+struct janas_block_iq2xxs {
+    uint16_t d; /* fp16 */
+    uint16_t qs[JANAS_QK / 8];
+};
+struct janas_block_iq2xs {
+    uint16_t d; /* fp16 */
+    uint16_t qs[JANAS_QK / 8];
+    uint8_t scales[JANAS_QK / 32];
+};
+struct janas_block_iq2s {
+    uint16_t d; /* fp16 */
+    uint8_t qs[JANAS_QK / 4];
+    uint8_t qh[JANAS_QK / 32];
+    uint8_t scales[JANAS_QK / 32];
+};
+
+/*
+ * IQ1_M: 256 weights in 32 sub-groups of eight, 56 bytes: each an 11-bit
+ * index into a grid of 2048 entries of eight levels -1, 0, 1 (qs[4g + k]
+ * the low eight bits; the high three in bits 0-2 or 4-6 of qh[2g + k / 2],
+ * for k even or odd) plus a shift of +1/8, or -1/8 where bit 3 or 7 of that
+ * byte is set; a 3-bit scale s for each half of a group (the 16-bit word
+ * g / 2 of scales, bits 6 (g % 2) and 3 more), the weight d (2 s + 1)
+ * (level + shift). d is an fp16 whose four nibbles are the top four bits
+ * of the four scale words.
+ */
+/* IQ1_S (50 bytes): IQ1_M's grid with one scale and one shift per group of
+   32: qh[g] holds the high three bits of its four indices (bits 3k), the
+   scale s in bits 12-14 and the shift's sign in bit 15; d an fp16 first. */
+struct janas_block_iq1s {
+    uint16_t d; /* fp16 */
+    uint8_t qs[JANAS_QK / 8];
+    uint16_t qh[JANAS_QK / 32];
+};
+struct janas_block_iq1m {
+    uint8_t qs[JANAS_QK / 8];
+    uint8_t qh[JANAS_QK / 16];
+    uint8_t scales[JANAS_QK / 32];
+};
+
+/*
+ * Q2_K: 256 weights in sixteen groups of 16, 84 bytes. scales[g]: group g's
+ * scale (low nibble) and min (high); qs: in each half of the block (32
+ * bytes) bits 2j of byte l are weight 32 j + l of that half, l < 32. Weight
+ * i of group g is d * scale * q - dmin * min, q in 0..3.
+ */
+struct janas_block_q2k {
+    uint8_t scales[JANAS_QK / 16];
+    uint8_t qs[JANAS_QK / 4];
+    uint16_t d, dmin; /* fp16 */
+};
+
 /* Q4_1: Q5_1 without the fifth bits, q of four (0-15). */
 struct janas_block_q4_1 {
     uint16_t d, m; /* fp16 */
+    uint8_t qs[16];
+};
+
+/* Q5_0: Q5_1 without the minimum, the weight d * (q - 16). */
+struct janas_block_q5_0 {
+    uint16_t d; /* fp16 */
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
+
+/*
+ * Q2_0 (ggml's type 42): 64 weights d * (q - 1), q of two bits, so -1 to 2:
+ * weight i in bits 2 (i % 4) of qs[i / 4]. Four blocks cover a Q8_K block,
+ * each two of its blocks of 32.
+ */
+struct janas_block_q2_0 {
+    uint16_t d; /* fp16 */
     uint8_t qs[16];
 };
 
@@ -198,6 +294,15 @@ _Static_assert(sizeof(struct janas_block_iq4xs) == 136, "iq4_xs block size");
 _Static_assert(sizeof(struct janas_block_q4_0) == 18, "q4_0 block size");
 _Static_assert(sizeof(struct janas_block_q5_1) == 24, "q5_1 block size");
 _Static_assert(sizeof(struct janas_block_q4_1) == 20, "q4_1 block size");
+_Static_assert(sizeof(struct janas_block_q5_0) == 22, "q5_0 block size");
+_Static_assert(sizeof(struct janas_block_q2_0) == 18, "q2_0 block size");
+_Static_assert(sizeof(struct janas_block_iq3xxs) == 98, "iq3_xxs block size");
+_Static_assert(sizeof(struct janas_block_iq2xxs) == 66, "iq2_xxs block size");
+_Static_assert(sizeof(struct janas_block_iq2xs) == 74, "iq2_xs block size");
+_Static_assert(sizeof(struct janas_block_iq2s) == 82, "iq2_s block size");
+_Static_assert(sizeof(struct janas_block_iq1m) == 56, "iq1_m block size");
+_Static_assert(sizeof(struct janas_block_iq1s) == 50, "iq1_s block size");
+_Static_assert(sizeof(struct janas_block_q2k) == 84, "q2_k block size");
 _Static_assert(sizeof(struct janas_block_q3k) == 110, "q3k block size");
 _Static_assert(sizeof(struct janas_block_iq3s) == 110, "iq3_s block size");
 _Static_assert(sizeof(struct janas_block_q8k) == 628, "q8k block size");
@@ -206,16 +311,25 @@ _Static_assert(sizeof(struct janas_block_q8k) == 628, "q8k block size");
 enum janas_qtype {
     JANAS_Q4_0 = 2, /* sizes per 256 weights: 8 blocks, 144 bytes */
     JANAS_Q4_1 = 3, /* 8 blocks, 160 bytes */
+    JANAS_Q5_0 = 6, /* 8 blocks, 176 bytes */
     JANAS_Q5_1 = 7, /* 8 blocks, 192 bytes */
     JANAS_Q8_0 = 8,
+    JANAS_Q2_K = 10, /* 84 bytes per 256 weights */
     JANAS_Q3_K = 11, /* sizes counted per 256 weights: 8 blocks, 272 bytes */
     JANAS_Q4_K = 12,
     JANAS_Q5_K = 13,
     JANAS_Q6_K = 14,
+    JANAS_IQ2_XXS = 16, /* 66 bytes per 256 weights */
+    JANAS_IQ2_XS = 17,  /* 74 */
+    JANAS_IQ3_XXS = 18, /* 98 */
     JANAS_IQ4_NL = 20,
     JANAS_IQ3_S = 21, /* sizes per 256 weights: 8 blocks, 144 bytes */
+    JANAS_IQ2_S = 22, /* 82 bytes per 256 weights */
+    JANAS_IQ1_S = 19, /* 50 bytes per 256 weights */
+    JANAS_IQ1_M = 29, /* 56 */
     JANAS_IQ4_XS = 23,
     JANAS_MXFP4 = 39, /* sizes per 256 weights: 8 blocks, 136 bytes */
+    JANAS_Q2_0 = 42,  /* 4 blocks of 64, 72 bytes */
     /* Janas' own, outside the GGUF numbering: the high plane of a Q6_K row
        cut into bit planes. Its block size counts that plane alone; the other
        two are JANAS_Q6KP_PLANE bytes each and are passed separately. */
@@ -233,6 +347,27 @@ enum janas_qtype {
 
 /* Bytes of one 256-weight block of the type, 0 if unsupported. */
 size_t janas_qtype_block_size(int type);
+
+/*
+ * A row of n weights with n no multiple of JANAS_QK, as the 640 of
+ * Qwen3.8-Flash-Next's experts: only in the types stored in blocks of 32 or
+ * 64, its bytes the n / JANAS_QK whole groups, then the tail's blocks. Its
+ * product is the whole groups' as janas_dot gives it, plus the tail's as
+ * janas_dot gives the tail padded with zero blocks to a whole group (no
+ * whole group: the tail's alone); the activations are (n + JANAS_QK - 1) /
+ * JANAS_QK Q8_K blocks, those past n zero. A row whose n is a multiple of
+ * JANAS_QK is janas_dot's, janas_dot_rows', janas_dot_multi's.
+ */
+/* The bytes of a row of n weights of the type, 0 if it cannot end at n. */
+size_t janas_qtype_row_bytes(int type, size_t n);
+float janas_dot_n(int type, const void *w, const struct janas_block_q8k *x,
+                  size_t n);
+void janas_dot_rows_n(int type, const void *w, size_t row_bytes,
+                      const struct janas_block_q8k *x, size_t n, size_t rows,
+                      float *y);
+void janas_dot_multi_n(int type, const void *w, const struct janas_block_q8k *x,
+                       size_t x_stride, size_t nv, size_t n, float *out,
+                       size_t out_stride);
 
 /*
  * Dot product of nb blocks of a supported type with nb Q8_K blocks. Aborts on
@@ -471,6 +606,59 @@ void janas_q4_1_dequantize(const struct janas_block_q4_1 *x, float *y,
 float janas_q4_1_dot(const struct janas_block_q4_1 *w,
                      const struct janas_block_q8k *x, size_t nb);
 float janas_q4_1_dot_ref(const struct janas_block_q4_1 *w,
+                         const struct janas_block_q8k *x, size_t nb);
+/* IQ2_XXS, IQ2_XS, IQ2_S: one exact integer sum per 256 weights, scales
+   included, then one fma, as IQ3_S; w is nb blocks of the type */
+void janas_iq2_dequantize(int type, const void *x, float *y, size_t n);
+float janas_iq2_dot(int type, const void *w, const struct janas_block_q8k *x,
+                    size_t nb);
+float janas_iq2_dot_ref(int type, const void *w,
+                        const struct janas_block_q8k *x, size_t nb);
+/* Q2_K: Q4_K's scheme, an exact sum for the scales and one for the mins,
+   then an fma each */
+void janas_q2k_dequantize(const struct janas_block_q2k *x, float *y, size_t n);
+float janas_q2k_dot(const struct janas_block_q2k *w,
+                    const struct janas_block_q8k *x, size_t nb);
+float janas_q2k_dot_ref(const struct janas_block_q2k *w,
+                        const struct janas_block_q8k *x, size_t nb);
+/* IQ1_M: (8 level + shift sign) times the half's 2 s + 1, one exact integer
+   sum per 256 weights, then one fma with d / 8 */
+void janas_iq1m_dequantize(const struct janas_block_iq1m *x, float *y,
+                           size_t n);
+void janas_iq1s_dequantize(const struct janas_block_iq1s *x, float *y,
+                           size_t n);
+float janas_iq1s_dot(const struct janas_block_iq1s *w,
+                     const struct janas_block_q8k *x, size_t nb);
+float janas_iq1s_dot_ref(const struct janas_block_iq1s *w,
+                         const struct janas_block_q8k *x, size_t nb);
+float janas_iq1m_dot(const struct janas_block_iq1m *w,
+                     const struct janas_block_q8k *x, size_t nb);
+float janas_iq1m_dot_ref(const struct janas_block_iq1m *w,
+                         const struct janas_block_q8k *x, size_t nb);
+/* IQ3_XXS: one exact integer sum per 256 weights, scales included, then
+   one fma, as IQ3_S */
+void janas_iq3xxs_dequantize(const struct janas_block_iq3xxs *x, float *y,
+                             size_t n);
+float janas_iq3xxs_dot(const struct janas_block_iq3xxs *w,
+                       const struct janas_block_q8k *x, size_t nb);
+float janas_iq3xxs_dot_ref(const struct janas_block_iq3xxs *w,
+                           const struct janas_block_q8k *x, size_t nb);
+/* Q5_0 (nb groups of eight blocks): per block position the exact sum of
+   (q - 16) x a in a lane of its own, the eight added as janas_hsum8 does */
+void janas_q5_0_dequantize(const struct janas_block_q5_0 *x, float *y,
+                           size_t n);
+float janas_q5_0_dot(const struct janas_block_q5_0 *w,
+                     const struct janas_block_q8k *x, size_t nb);
+float janas_q5_0_dot_ref(const struct janas_block_q5_0 *w,
+                         const struct janas_block_q8k *x, size_t nb);
+/* Q2_0 (nb groups of four blocks): a lane for each block of 32
+   activations, the exact sum of (q - 1) x a times d and their scale, the
+   eight added as janas_hsum8 does */
+void janas_q2_0_dequantize(const struct janas_block_q2_0 *x, float *y,
+                           size_t n);
+float janas_q2_0_dot(const struct janas_block_q2_0 *w,
+                     const struct janas_block_q8k *x, size_t nb);
+float janas_q2_0_dot_ref(const struct janas_block_q2_0 *w,
                          const struct janas_block_q8k *x, size_t nb);
 float janas_q8_0_dot(const struct janas_block_q8_0 *w,
                      const struct janas_block_q8k *x, size_t nb);

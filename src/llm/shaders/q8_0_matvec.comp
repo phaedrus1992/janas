@@ -11,7 +11,10 @@
 // come in the 32-block layout of convert_x (20 uvec4 a Q8_K block: qs32 in
 // 16, bsums32 in 2, d32 in 2), shared across the subgroup as in
 // q4k_matvec.comp. A weight block is 34 bytes, so every other one starts 2
-// bytes off a 4-byte boundary: its words are realigned.
+// bytes off a 4-byte boundary: its words are realigned. A row may end
+// inside a group of 256 (tail, an even number of blocks of 32 past the whole
+// groups, so that rows start on words): as janas_dot_rows_n, the whole
+// groups' sum, then the tail's from zero, padded with zero blocks, added.
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
@@ -27,7 +30,12 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
 
-layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+layout(push_constant) uniform P {
+    uvec2 w, x, y;
+    uint rows, nb, nv, xs, ys, level;
+    uvec2 p1, p0;
+    uint tail; /* blocks of 32 past the whole groups: 0, 2, 4 or 6 */
+} p;
 
 int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
 int dp4(uvec4 a, uvec4 b) { return dp(a.x, b.x) + dp(a.y, b.y) + dp(a.z, b.z) + dp(a.w, b.w); }
@@ -48,15 +56,32 @@ void main()
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
-    float acc[NV][8];
-    for (uint v = 0; v < NV; v++)
+    float acc[NV][8], res[NV];
+    for (uint v = 0; v < NV; v++) {
+        res[v] = 0.0;
         for (uint k = 0; k < 8u; k++)
             acc[v][k] = 0.0;
-    uint gw = row * p.nb * 68u; /* words: a group of eight blocks is 272 bytes */
-    for (uint b = 0; b < p.nb; b++, gw += 68u) {
+    }
+    /* words: a group of eight blocks is 272 bytes, the tail 34 a block */
+    uint tw = p.tail * 34u / 4u;
+    uint gw = row * (p.nb * 68u + tw);
+    for (uint b = 0; b <= p.nb; b++, gw += 68u) {
+        bool last = b == p.nb;
+        if (last && p.tail == 0u)
+            break;
+        uint nk = last ? p.tail : 8u, nw = last ? tw : 68u;
         uint wg[68];
         for (uint i = 0; i < 68u; i++)
-            wg[i] = W.v[gw + i];
+            wg[i] = i < nw ? W.v[gw + i] : 0u;
+        if (last)
+            /* the whole groups' sum aside, the tail's from zero */
+            for (uint v = 0; v < NV; v++) {
+                if (p.nb > 0u)
+                    res[v] = ((acc[v][0] + acc[v][4]) + (acc[v][2] + acc[v][6])) +
+                             ((acc[v][1] + acc[v][5]) + (acc[v][3] + acc[v][7]));
+                for (uint k = 0; k < 8u; k++)
+                    acc[v][k] = 0.0;
+            }
         float d[8];
         uvec4 q[8][2];
         for (uint k = 0; k < 8u; k++) {
@@ -82,15 +107,20 @@ void main()
                                     uintBitsToFloat(s1.z), uintBitsToFloat(s1.w));
             for (uint k = 0; k < 8u; k++) {
                 int dot = dp4(q[k][0], bc(xr, 2u * k)) + dp4(q[k][1], bc(xr, 2u * k + 1u));
-                acc[v][k] = fma(d[k] * d32[k], float(dot), acc[v][k]);
+                /* the tail's empty blocks: the CPU's zero blocks add 0 */
+                if (k < nk)
+                    acc[v][k] = fma(d[k] * d32[k], float(dot), acc[v][k]);
             }
             xo[v] += 20u;
         }
     }
     if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
-            if (v0 + v < p.nv)
-                Y.v[(v0 + v) * p.ys + row] =
-                    ((acc[v][0] + acc[v][4]) + (acc[v][2] + acc[v][6])) +
-                    ((acc[v][1] + acc[v][5]) + (acc[v][3] + acc[v][7]));
+            if (v0 + v < p.nv) {
+                float r = ((acc[v][0] + acc[v][4]) + (acc[v][2] + acc[v][6])) +
+                          ((acc[v][1] + acc[v][5]) + (acc[v][3] + acc[v][7]));
+                if (p.tail != 0u)
+                    r = res[v] + r;
+                Y.v[(v0 + v) * p.ys + row] = r;
+            }
 }

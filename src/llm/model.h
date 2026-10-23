@@ -32,7 +32,7 @@ struct janas_llm_options {
      */
     struct janas_pool *shared_compute;
     const char *mtp_path;     /* MTP block (tools/hf2jns_mtp), or NULL */
-    uint64_t mtp_cache_bytes; /* RAM for its experts; 0: 256 MiB */
+    uint64_t mtp_cache_bytes; /* RAM for its experts; 0: all of them */
     uint32_t draft_vocab;     /* lowest token ids in the draft head; 0: 32768 */
     int use_gpu; /* integrated GPU for products over blocks, if usable
                     (environment JANAS_GPU=0/1 overrides) */
@@ -55,6 +55,12 @@ struct janas_llm_options {
                         (environment JANAS_HEAD_BITS overrides) */
     int no_npu;      /* 1: the NPU left off, its copies' memory being the
                         expert cache's (janas_llm_open) */
+    int ple_ram;     /* 1: the per-layer table (Gemma 4's per-layer
+                        embeddings, Qwen3.8-Flash-Next's n-grams) read into
+                        memory at load, where the machine holds it beside the
+                        experts (janas_llm_open); 0: read a row at a time
+                        from the file (environment JANAS_PLE_RAM=0/1
+                        overrides) */
 };
 
 struct janas_llm_model;
@@ -72,9 +78,9 @@ uint32_t janas_llm_model_n_ctx(const struct janas_llm_model *m);
    beyond that length falls apart. */
 uint32_t janas_llm_model_n_ctx_train(const struct janas_llm_model *m);
 /* The memory the model holds: its resident weights as read (a table read
-   from the file a row at a time, Gemma 4's per-layer embeddings, is not
-   held), its expert cache's arena, and its keys and values with their
-   scales. */
+   from the file a row at a time, Gemma 4's per-layer embeddings or
+   Qwen3.8-Flash-Next's n-grams, is not held unless read into memory), its
+   expert cache's arena, and its keys and values with their scales. */
 void janas_llm_model_memory(const struct janas_llm_model *m, uint64_t *resident,
                             uint64_t *cache, uint64_t *kv);
 
@@ -97,6 +103,11 @@ void janas_llm_model_head_requant(const struct janas_llm_model *m,
                                   uint64_t *before, uint64_t *after);
 /* The output head's type in the file (BF16 30, F16 1) when it was rewritten
    as Q8_0 at load, else 0; and its bytes before and after. */
+/* qwen4exp's mixes of the streams as JANAS_HC_MIX rewrote them at load:
+   its value ("q8"), or NULL when they are as in the file; and
+   their bytes before and after. */
+const char *janas_llm_model_hc_quant(const struct janas_llm_model *m,
+                                     uint64_t *before, uint64_t *after);
 int janas_llm_model_head16(const struct janas_llm_model *m, uint64_t *before,
                            uint64_t *after);
 /* How the attention scores are computed (janas_attn_scores), and whether the
@@ -216,8 +227,10 @@ int janas_llm_model_decode(struct janas_llm_model *m, int32_t token,
 
 /*
  * Multi-token prediction, when the model was loaded with an MTP block.
- * janas_llm_model_hidden: the final hidden states (n x d_model) of the
- * tokens of the last forward call. janas_llm_mtp_forward runs the MTP block
+ * janas_llm_model_hidden: the final hidden states (n rows of
+ * janas_llm_model_hidden_width floats: d_model, or for qwen4exp its
+ * residual's streams before the last mix) of the tokens of the last forward
+ * call. janas_llm_mtp_forward runs the MTP block
  * on n rows at positions pos0 .. pos0 + n - 1: row j combines tokens[j]
  * with the hidden state in row j of hidden (the main model's state for the
  * token before it), and its logits guess the token after tokens[j].
@@ -236,6 +249,9 @@ int janas_llm_mtp_chain_fixed(const struct janas_llm_model *m);
    go back no further than the start of its last forward call. */
 int janas_llm_model_recurrent(const struct janas_llm_model *m);
 const float *janas_llm_model_hidden(const struct janas_llm_model *m);
+/* The floats of a row of janas_llm_model_hidden and janas_llm_mtp_hidden:
+   d_model, or qwen4exp's residual of hc_n streams. */
+uint32_t janas_llm_model_hidden_width(const struct janas_llm_model *m);
 /* The final hidden states after the output norm, rows of d_model floats,
    of the last forward call: its last row, or all of them when it was asked
    for all logits. With logits NULL that call computes these and no logits
@@ -268,6 +284,7 @@ enum {
     JANAS_PH_EXPERTS,
     JANAS_PH_OUTPUT,
     JANAS_PH_SSM, /* Gated DeltaNet convolution and recurrence */
+    JANAS_PH_MIX, /* qwen4exp's mixes of the residual's streams */
     JANAS_PH_COUNT
 };
 /* The model's compute pool, to hand to a second model as shared_compute. */
@@ -327,6 +344,8 @@ int janas_llm_model_candidates(const struct janas_llm_model *m, int *threads,
 int janas_llm_model_npu_used(const struct janas_llm_model *m);
 /* The NPU's name, or NULL when none is used. */
 const char *janas_llm_model_npu_name(const struct janas_llm_model *m);
+/* Whether the NPU takes products of weights of this type (model_npu.c). */
+int janas_llm_npu_type(int type);
 /* Seconds spent making the NPU's graphs so far (a matrix's or a layer's
    first block: its weights prepared, the graph compiled and run once):
    kept out of the tuner's costs, as the waits for the disk are, and out of

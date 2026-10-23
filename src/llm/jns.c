@@ -87,6 +87,13 @@ static int type_geometry(uint32_t type, uint64_t *blck, uint64_t *size)
         {23, 256, 136}, /* IQ4_XS */
         {30, 1, 2},     /* BF16 */
         {39, 32, 17},   /* MXFP4 */
+        {42, 64, 18},   /* Q2_0 */
+        {18, 256, 98},  /* IQ3_XXS */
+        {16, 256, 66},  /* IQ2_XXS */
+        {17, 256, 74},  /* IQ2_XS */
+        {22, 256, 82},  /* IQ2_S */
+        {29, 256, 56},  /* IQ1_M */
+        {19, 256, 50},  /* IQ1_S */
     };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
         if (t[i].type == type) {
@@ -345,6 +352,33 @@ int janas_jns_meta_ints(const struct janas_jns *j, const char *key,
         return -1;
     memcpy(count, j->metadata + p + 4, 8);
     *data = (const int32_t *)(const void *)(j->metadata + p + 12);
+    return 0;
+}
+
+int janas_jns_meta_uint_at(const struct janas_jns *j, const char *key,
+                           uint64_t i, uint64_t *out, uint64_t *count)
+{
+    uint32_t t, et;
+    uint64_t p, n;
+    if (!find_key(j, key, &t, &p) || t != GG_ARRAY)
+        return -1;
+    memcpy(&et, j->metadata + p, 4);
+    memcpy(&n, j->metadata + p + 4, 8);
+    uint64_t sz = et == GG_U8 || et == GG_I8     ? 1
+                  : et == GG_U16 || et == GG_I16 ? 2
+                  : et == GG_U32 || et == GG_I32 ? 4
+                  : et == GG_U64 || et == GG_I64 ? 8
+                                                 : 0;
+    if (!sz || i >= n)
+        return -1;
+    const uint8_t *e = j->metadata + p + 12 + i * sz; /* validated at open */
+    uint64_t v = 0;
+    memcpy(&v, e, sz); /* little-endian, as the file */
+    if ((et == GG_I8 || et == GG_I16 || et == GG_I32) && (e[sz - 1] & 0x80))
+        v |= ~0ull << (8 * sz); /* sign-extended */
+    *out = v;
+    if (count)
+        *count = n;
     return 0;
 }
 

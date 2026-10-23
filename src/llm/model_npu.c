@@ -36,6 +36,7 @@
 #include "gpu.h"
 #include "model_impl.h"
 #include "quant.h"
+#include "vmath.h"
 
 /* the inputs of a layer's products, for INT8 activations: the attention's
    output (wo), the FFN's norm (gate and up), the FFN's intermediate
@@ -330,7 +331,8 @@ void janas_m_npu_close(struct janas_llm_model *m)
 
 /* the types janas_dequantize unpacks (it aborts on any other), and the
    down matrix in planes: every quantization of the catalog's files - Q3_K
-   of the 30B in three bits, Q5_1 and Q8_0 of Gemma 4 26B-A4B among them */
+   of the 30B in three bits, Q5_1 and Q8_0 of Gemma 4 26B-A4B among them -
+   and Qwen3.8-Flash-Next's (Q2_0, Q5_0, the IQ1, IQ2 and IQ3 kinds, Q2_K) */
 static int dequant_type(int type)
 {
     switch (type) {
@@ -346,10 +348,24 @@ static int dequant_type(int type)
     case JANAS_IQ4_XS:
     case JANAS_IQ3_S:
     case JANAS_MXFP4:
+    case JANAS_Q5_0:
+    case JANAS_Q2_0:
+    case JANAS_Q2_K:
+    case JANAS_IQ3_XXS:
+    case JANAS_IQ2_XXS:
+    case JANAS_IQ2_XS:
+    case JANAS_IQ2_S:
+    case JANAS_IQ1_M:
+    case JANAS_IQ1_S:
         return 1;
     default:
         return 0;
     }
+}
+
+int janas_llm_npu_type(int type)
+{
+    return dequant_type(type);
 }
 
 static int npu_type(int type)
@@ -541,7 +557,11 @@ static void refused(struct janas_m_npu *n, const struct janas_matvec_task *t,
 static int eligible(const struct janas_llm_model *m, struct janas_m_npu *n,
                     const struct janas_matvec_task *t)
 {
-    size_t nb = t->cols / JANAS_QK;
+    /* a row may end inside a group of 256 (qwen4exp's 640): its
+       activations' last group whole. Outputs further apart than their rows
+       (a recurrent layer's q|k|v and z side by side in one buffer) are
+       copied there: until 22 Oct 2026 they stayed on the CPU */
+    size_t nb = (t->cols + JANAS_QK - 1) / JANAS_QK;
     /* the output head stays on the CPU: a chat's prompt asks it for one
        token, and over many (an evaluation's every logit) its INT8 copy
        would add an error no chat has */
@@ -550,9 +570,12 @@ static int eligible(const struct janas_llm_model *m, struct janas_m_npu *n,
     if (!t->w || (int)t->n_vec < n->min_n || (int)t->n_vec > n->block) {
         return refused(n, t, 0), n->no_n++, 0;
     }
-    if (!npu_type(t->type) || t->cols % JANAS_QK ||
+    if (!npu_type(t->type) ||
+        (t->cols % JANAS_QK &&
+         (t->type == JANAS_Q6_K_P ||
+          janas_qtype_row_bytes(t->type, t->cols) == 0)) ||
         (t->x_stride && t->x_stride != nb) ||
-        (t->y_stride && t->y_stride != t->rows))
+        (t->y_stride && t->y_stride < t->rows))
         return refused(n, t, 1), n->no_type++, 0;
     int st = stable(m, n, t->w);
     if (t->type == JANAS_Q6_K_P && st &&
@@ -579,13 +602,17 @@ static int expand(struct janas_m_npu *n, const struct janas_matvec_task *t)
         return 0;
     if (n->xb[i].src)
         return -1;
-    size_t nb = t->cols / JANAS_QK;
+    /* a row ending inside a group: that group's first values only */
+    size_t nb = (t->cols + JANAS_QK - 1) / JANAS_QK;
     float *x = n->xb[i].x;
     for (size_t v = 0; v < t->n_vec; v++)
         for (size_t b = 0; b < nb; b++) {
             const struct janas_block_q8k *q = t->x + v * nb + b;
             float *o = x + v * t->cols + b * JANAS_QK;
-            for (int k = 0; k < JANAS_QK; k++)
+            size_t e = t->cols - b * JANAS_QK < JANAS_QK
+                           ? t->cols - b * JANAS_QK
+                           : JANAS_QK;
+            for (size_t k = 0; k < e; k++)
                 o[k] = q->d * (float)q->qs[k];
         }
     n->xb[i].src = t->x, n->xb[i].n_vec = t->n_vec;
@@ -695,6 +722,96 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
     }
     if (nn)
         npu_loud(m, spin);
+}
+
+/* ---- bf16 weights on float inputs (qwen4exp's mixes, model_hc.c) ---- */
+
+/* the matrix's entry, compiled on first use with its weights in FP16 -
+   bf16's values exactly, save those below FP16's normal range - keyed by
+   w as the products'; NULL if it stays on the CPU */
+static struct npu_entry *entry16(struct janas_m_npu *n, const uint16_t *w,
+                                 size_t rows, size_t cols)
+{
+    size_t h = ((uintptr_t)w >> 6) % NPU_SLOTS;
+    for (size_t i = 0; i < NPU_SLOTS; i++, h = (h + 1) % NPU_SLOTS) {
+        struct npu_entry *e = &n->e[h];
+        if (e->w == w && e->mm)
+            return e;
+        if (e->w == w && e->bad)
+            return NULL;
+        if (e->w && e->w != w)
+            continue;
+        double t_setup = now();
+        e->w = w, e->bad = 1, e->in_arena = 0;
+        e->plane[0] = e->plane[1] = NULL;
+        e->elems = 2 * rows * cols; /* two bytes a weight, against the
+                                       budget of INT8 copies */
+        if (n->used + e->elems > n->budget)
+            return NULL; /* stays on the CPU for good */
+        prep_begin(n, 0);
+        float *x = xbuf(n, cols);
+        uint16_t *f16 = x ? malloc(2 * rows * cols) : NULL;
+        e->y = f16 ? ybuf(n, rows, 0) : NULL;
+        if (e->y) {
+            for (size_t k = 0; k < rows * cols; k++)
+                f16[k] = janas_fp32_to_fp16(janas_u2f((uint32_t)w[k] << 16));
+            char err[256];
+            e->mm = janas_npu_mm_create(n->u, n->block, (int)rows, (int)cols,
+                                        JANAS_NPU_F16, f16, NULL, x, e->y, err,
+                                        sizeof err);
+            if (!e->mm)
+                fprintf(stderr, "janas: NPU: %zu x %zu (bf16) on the CPU: %s\n",
+                        rows, cols, err);
+        }
+        free(f16);
+        atomic_fetch_add(&n->prep_done, 1);
+        e->bad = !e->mm;
+        if (e->mm)
+            n->used += e->elems;
+        if (e->bad)
+            e->y = NULL;
+        n->setup_s += now() - t_setup;
+        return e->bad ? NULL : e;
+    }
+    return NULL;
+}
+
+int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
+                      const float *x, float *y, uint32_t rows, uint32_t cols,
+                      uint32_t nv, float scale)
+{
+    struct janas_m_npu *n =
+        m->npu_use && m->npu && m->npu->lmode != 1 ? m->npu : NULL;
+    /* not the narrow ones (a mix's inject, 4 rows): a run's fixed cost,
+       some 0.45 ms, is more than the CPU takes */
+    if (!n || (int)nv < n->min_n || (int)nv > n->block || rows < 64 ||
+        stable(m, n, w) != 1)
+        return -1;
+    struct npu_entry *e = entry16(n, w, rows, cols);
+    if (!e)
+        return -1;
+    int i = 0;
+    while (n->xb[i].cols != cols)
+        i++;
+    double te = now();
+    memcpy(n->xb[i].x, x, sizeof(float) * nv * cols);
+    n->xb[i].src = NULL; /* floats, not a Q8_K input expanded */
+    n->t_expand += now() - te;
+    int spin = npu_quiet(m);
+    double tw = now();
+    int r = janas_npu_mm_run(e->mm);
+    double tc = now();
+    n->t_wait += tc - tw;
+    npu_loud(m, spin);
+    if (r != 0) {
+        n->cpu_fallbacks++;
+        return -1;
+    }
+    for (size_t k = 0; k < (size_t)nv * rows; k++)
+        y[k] = e->y[k] * scale;
+    n->t_copy += now() - tc;
+    n->runs++;
+    return 0;
 }
 
 /* ---- a feed-forward in one run ---- */
@@ -837,7 +954,10 @@ int janas_m_npu_ffn_begin(struct janas_llm_model *m, const uint8_t *const w[3],
     if (!ffn_type((int)g->type, 0) || !ffn_type((int)u->type, 0) ||
         !ffn_type((int)d->type, 1) || g->rows != u->rows ||
         g->cols != u->cols || d->cols != g->rows || d->rows != g->cols ||
-        g->cols % JANAS_QK || g->rows % JANAS_QK) {
+        g->cols % JANAS_QK ||
+        (g->rows % JANAS_QK &&
+         (d->type == JANAS_Q6_K_P ||
+          janas_qtype_row_bytes((int)d->type, d->cols) == 0))) {
         n->ffn_refused++;
         return -1;
     }
@@ -1392,8 +1512,8 @@ static int layers_fit(const struct janas_llm_model *m)
     int gemma = a->sandwich && a->swa && a->rec == JANAS_REC_NONE;
     if ((a->rec != JANAS_REC_NONE && a->rec != JANAS_REC_Q35) ||
         (a->attn_gate && a->rec != JANAS_REC_Q35) || a->shared_expert ||
-        ((a->sandwich || a->swa || m->ple_dim) && !gemma) || m->n_expert > 1 ||
-        m->janet || m->pred_fn || !m->cache)
+        a->hc || ((a->sandwich || a->swa || m->ple_dim) && !gemma) ||
+        m->n_expert > 1 || m->janet || m->pred_fn || !m->cache)
         return 0;
     uint32_t qd = 0;
     for (uint32_t l = 0; l < m->n_layer; l++) {

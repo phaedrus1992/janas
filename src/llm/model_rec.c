@@ -197,9 +197,11 @@ static void rec_worker(void *arg, int tid, int n_threads)
 }
 
 #if defined(__x86_64__)
-/* rms_norm(o) * w * SiLU(z), in place, n a multiple of 8. */
+/* rms_norm(o) * w * SiLU(z), in place, n a multiple of 8; with sig, times
+   sigmoid(z) instead (qwen4exp) */
 __attribute__((target("avx2,fma"))) static void
-gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps)
+gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps,
+          int sig)
 {
     __m256 acc = _mm256_setzero_ps();
     for (uint32_t i = 0; i < n; i += 8) {
@@ -210,13 +212,21 @@ gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps)
     for (uint32_t i = 0; i < n; i += 8) {
         __m256 v = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(o + i), sc),
                                  _mm256_loadu_ps(w + i));
-        _mm256_storeu_ps(o + i,
-                         _mm256_mul_ps(v, janas_silu8(_mm256_loadu_ps(z + i))));
+        __m256 zv = _mm256_loadu_ps(z + i);
+        /* sigmoid(z) as silu's: 1 / (1 + e^-z) */
+        __m256 g =
+            sig ? _mm256_div_ps(_mm256_set1_ps(1.0f),
+                                _mm256_add_ps(_mm256_set1_ps(1.0f),
+                                              janas_exp8(_mm256_sub_ps(
+                                                  _mm256_setzero_ps(), zv))))
+                : janas_silu8(zv);
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(v, g));
     }
 }
 #endif
 
-/* 3. RMS norm (ssm_norm) of each head's output, gated by SiLU(z): item =
+/* 3. RMS norm (ssm_norm) of each head's output, gated by SiLU(z) - by
+      sigmoid(z) in qwen4exp, the one difference from Qwen3.5's - item =
       (token, value head). */
 static void gate_worker(void *arg, int tid, int n_threads)
 {
@@ -236,13 +246,14 @@ static void gate_worker(void *arg, int tid, int n_threads)
                       ds * rf + r * ds;
 #if defined(__x86_64__)
         if (m->avx2) {
-            gate_avx2(o, z, w, ds, m->eps);
+            gate_avx2(o, z, w, ds, m->eps, m->a->hc);
             continue;
         }
 #endif
         rms_norm(o, o, w, ds, m->eps);
         for (uint32_t i = 0; i < ds; i++)
-            o[i] *= z[i] / (1.0f + janas_expf(-z[i]));
+            o[i] *= m->a->hc ? 1.0f / (1.0f + janas_expf(-z[i]))
+                             : z[i] / (1.0f + janas_expf(-z[i]));
     }
 }
 

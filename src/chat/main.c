@@ -1546,9 +1546,12 @@ static int run_calls(janas_llm_chat *c, int autorun)
                     term_printf(&term, "%s\n", janas_llm_last_error());
                 free(more);
                 /* and the next reply is a call: told to call one, a small
-                   model (Qwen3.5-0.8B) still made up the weather instead */
-                janas_llm_chat_tool_choice(c, JANAS_LLM_TOOLS_REQUIRED, NULL, 0,
-                                           1);
+                   model (Qwen3.5-0.8B) still made up the weather instead;
+                   and to one of the service's own tools: Qwen3.8-Flash-Next
+                   (two bits a weight) opened the service again and again,
+                   its name being that of its tools' prefix (22 Oct 2026) */
+                janas_llm_chat_tool_choice(c, JANAS_LLM_TOOLS_REQUIRED,
+                                           mcpc_opened_prefix(), -1, 1);
             }
             if (rc != 0 && key && failed.n < FAILED_MAX) {
                 failed.call[failed.n++] = key;

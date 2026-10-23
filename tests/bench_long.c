@@ -97,7 +97,7 @@ static void report_phases(const char *what, const double *a, const double *b,
                           uint32_t n)
 {
     static const char *names[JANAS_PH_COUNT] = {
-        "qkv", "attention", "wo", "router", "experts", "output", "ssm"};
+        "qkv", "attention", "wo", "router", "experts", "output", "ssm", "mix"};
     double total = 0;
     printf("%s, ms/token:", what);
     for (int i = 0; i < JANAS_PH_COUNT; i++) {

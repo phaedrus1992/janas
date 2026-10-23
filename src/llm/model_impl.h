@@ -27,7 +27,10 @@
 #define MAX_K 64
 #define MAX_CONV 8
 #define MAX_SSM_DIM 256
-#define SSM_ROWS 32 /* state rows per recurrence work item */
+#define SSM_ROWS 32           /* state rows per recurrence work item */
+#define JANAS_NG_MAX_LEN 4    /* qwen4exp's n-grams: the longest */
+#define JANAS_NG_MAX_HEADS 32 /* and their heads, all lengths together */
+#define JANAS_QSA_MAX 8192    /* qwen4exp's sparse attention: positions kept */
 
 struct layer {
     int rec;       /* Gated DeltaNet layer (qwen3next), else attention */
@@ -67,6 +70,21 @@ struct layer {
     const uint16_t *router16; /* router weights, f16 (in place of the f32) */
     uint16_t *router_own;     /* the zero router of a dense layer, if any */
     float *conv_t;            /* conv weights transposed: d_conv x conv_ch */
+    /* qwen4exp (model_hc.c): the hyper-connections before the token mixer
+       (0) and before the feed-forward (1) - the streams' norms (f32, hc_n
+       x d_model), the gate's two matrices of low rank and the inject (bf16)
+       - and the n-gram embeddings' at the layer that has them: the key and
+       value projections, the norms of the keys, of the streams as queries
+       and of the conv's inputs, the conv's weights (kernel x channels, as
+       f32) */
+    const struct janas_jns_tensor *hc_norm[2], *hc_down[2], *hc_up[2],
+        *hc_inject[2];
+    const struct janas_jns_tensor *ng_key, *ng_value, *ng_nkey, *ng_nquery,
+        *ng_nconv;
+    float *ng_conv;
+    /* qwen4exp's sparse attention (model_qsa.c): the indexer's query and key
+       projections (bf16) and their norms */
+    const struct janas_jns_tensor *ix_q, *ix_k, *ix_qn, *ix_kn;
 };
 
 _Static_assert(JANAS_ATTN_MAX_BLOCK == JANAS_LLM_MAX_BLOCK, "block size");
@@ -74,6 +92,12 @@ _Static_assert(JANAS_ATTN_MAX_BLOCK == JANAS_LLM_MAX_BLOCK, "block size");
 struct janas_llm_model {
     struct janas_jns j;
     uint8_t *resident; /* the resident region, read at load */
+    /* its bytes [res_hole[0], res_hole[1]) never read there: the
+       per-layer table, read a row at a time from the file (model_ple.c,
+       model_hc.c), kept out of the GPU's imports, which would pin its
+       untouched pages (28.8 GB on Qwen3.8-Flash-Next) */
+    uint64_t res_hole[2];
+    int ple_ram; /* that table read into memory all the same (ple_ram) */
     struct janas_pool *compute, *io;
     int own_compute; /* zero when the pool came from the caller */
     /* compute threads: the pool lists one CPU per performance core, their
@@ -181,6 +205,15 @@ struct janas_llm_model {
                                                  with a GPU copy */
     int gtok_state, gtok_kv;
     uint64_t gtok_loads;
+    /* qwen4exp on the GPU: the pass's tokens (its n-gram embeddings), each
+       attention layer's input at bf16 as the GPU made it (n_attn x blk x
+       d_model, for the indexer's keys), the ring of the n-gram conv
+       imported; the indexer's raw and pooled keys imported, the cos and
+       sin of a piece's positions for it (janas_gpu_tok_model ix_rope) */
+    const int32_t *gtok_tokens;
+    float *gtok_att_in;
+    int gtok_ng_in, gtok_ix_in;
+    float *gtok_ix_rope;
     /* the aligned copy of its Q6_K weights for the GPU (JANAS_GPU_REPACK),
        in the GPU driver's memory, kept for a rebuild */
     uint8_t *gtok_repack;
@@ -338,7 +371,7 @@ struct janas_llm_model {
     struct janas_out_buf {
         float *p;
         size_t bytes;
-    } out[24];
+    } out[40];
     int n_out;
     int warm_use;        /* preload the most used experts, and count them */
     uint32_t *use_count; /* experts used this session, n_layer * n_expert */
@@ -347,6 +380,11 @@ struct janas_llm_model {
        load (head16_to_q8_0), else 0; and the bytes before and after */
     int head16;
     uint64_t head16_before, head16_after;
+    /* qwen4exp's mixes of the streams rewritten at load (JANAS_HC_MIX:
+       "q8"; empty: as in the file), their bytes before and
+       after (model_hc_quant.c) */
+    char hc_quant[8];
+    uint64_t hc_quant_before, hc_quant_after;
     /* the caller's CPUs before the load pinned it (a cpu_set_t), given
        back when the model is freed */
     unsigned char caller_cpus[128];
@@ -372,6 +410,46 @@ struct janas_llm_model {
     int pfb_mode, pfb_on;
     uint64_t warm_experts; /* experts preloaded at open from the profile */
     double warm_seconds;
+
+    /* qwen4exp (model_hc.c): hc_n streams of the residual (0: the usual
+       one) and the rank of their gates; a block's streams (blk x hc_n x
+       d_model), the same normalized and rounded to bf16, the gates' inner
+       activations (blk x hc_rank) and outputs (blk x hc_n x d_model), the
+       inject weights (blk x hc_n); the final mix's tensors */
+    uint32_t hc_n, hc_rank;
+    float *hc_res, *hc_xn, *hc_lo, *hc_gate, *hc_inj;
+    const struct janas_jns_tensor *hco_norm, *hco_down, *hco_up;
+    /* the inputs of the mixes' quantized matrices (an MTP block's), in Q8_K
+       (blk x hc_n x d_model / 256); its MTP block's final mix */
+    struct janas_block_q8k *hc_q;
+    const struct janas_jns_tensor *mtp_hco_norm, *mtp_hco_down, *mtp_hco_up;
+    /* its n-gram embeddings: the layer (n_layer: none), the longest n-gram,
+       heads per length and a head's numbers (a row of the table), the
+       conv's kernel (its dilation is the longest n-gram), the hash's
+       multipliers, the heads' rows in the table, the token that cuts a
+       context. Tokens and the conv's inputs kept by position in rings of
+       ng_cap, ng_hi one past the last written. A block's embeddings, keys
+       (later the queries' norms), values, gated values and conv inputs, a
+       row as read; the table read a row at a time from the file */
+    uint32_t ng_layer, ng_len, ng_per, ng_dim, ng_kernel, ng_cap, ng_hi;
+    uint64_t ng_mult[JANAS_NG_MAX_LEN];
+    uint32_t ng_off[JANAS_NG_MAX_HEADS], ng_vocab[JANAS_NG_MAX_HEADS];
+    int32_t ng_eos;
+    const struct janas_jns_tensor *ng_tab;
+    int32_t *ng_tok;
+    float *ng_hist, *ng_emb, *ng_kq, *ng_val, *ng_gv;
+    uint8_t *ng_raw;
+    struct janas_block_q8k *ng_q;
+    /* its sparse attention (model_qsa.c; ix_heads 0: none): the indexer's
+       heads and their size, the positions a query keeps in whole blocks
+       and the block; the raw keys of every position (f16, n_attn x n_ctx x
+       ix_dim), the pooled keys of every block, a block's queries and keys,
+       its input at bf16, a query's blocks' scores, a selection, the
+       positions chosen */
+    uint32_t ix_heads, ix_dim, ix_top, ix_ratio;
+    uint16_t *ix_raw;
+    float *ix_pool, *ix_qs, *ix_kb, *ix_xb, *ix_score;
+    uint32_t *ix_sel, *ix_pos;
 
     double phase[JANAS_PH_COUNT];
 };
@@ -508,6 +586,9 @@ uint64_t janas_m_import_next(uint64_t at, uint64_t bytes, uint64_t unit,
                              int huge, uint64_t *from);
 int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
                        uint64_t bytes, uint64_t unit);
+/* A buffer the products read or write, in whole pages, listed for the GPU
+   to be given (model_load.c); janas_aligned_free releases it. */
+float *janas_m_out_alloc(struct janas_llm_model *m, size_t bytes);
 void janas_m_arena_to_gpu(struct janas_llm_model *m);
 /* A block on the GPU whole (model_gpu.c): 0; -1, the CPU to run it; -2,
    the GPU failed after replaying on the base in place, the state lost. */
@@ -555,6 +636,15 @@ int janas_m_npu_ffn_begin(struct janas_llm_model *m, const uint8_t *const w[3],
                           float *dout, struct janas_m_npu_ffn *job);
 /* Waits for it and stores its rows; -1 if the NPU failed (the run is then
    the caller's to compute). */
+/*
+ * y (nv rows of rows) = scale w x (nv rows of cols floats) for bf16 weights
+ * in the resident region, on the NPU (its candidate has it, nv reaches
+ * JANAS_NPU_MIN_N): the weights in FP16, the result close to the CPU's.
+ * 0, or -1 with nothing written (the caller computes it).
+ */
+int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
+                      const float *x, float *y, uint32_t rows, uint32_t cols,
+                      uint32_t nv, float scale);
 int janas_m_npu_ffn_finish(struct janas_llm_model *m,
                            struct janas_m_npu_ffn *job);
 /*
@@ -614,10 +704,84 @@ int janas_m_assist_draft(struct janas_llm_model *m, int32_t token,
                          float *conf);
 int janas_m_ple_inputs(struct janas_llm_model *m, const int32_t *tokens,
                        uint32_t n);
+/* y (n rows of rows) = scale w x (n rows of cols): w bf16, rows of cols,
+   x already at bf16 (janas_m_round_bf16), as llama.cpp meets a bf16 matrix;
+   each row and token one thread's, the same bits whatever the threads
+   (model_ple.c) */
+void janas_m_bf16_product(struct janas_llm_model *m, const uint16_t *w,
+                          const float *x, float *y, uint32_t rows,
+                          uint32_t cols, uint32_t n, float scale);
+/* the same for Q8_0 weights, x kept as it is (janas_q8w_dot): the CPU's,
+   the same bits whatever the threads */
+void janas_m_q8w_product(struct janas_llm_model *m, const void *w,
+                         const float *x, float *y, uint32_t rows, uint32_t cols,
+                         uint32_t n, float scale);
+/* a tensor's reserved field, in memory: its products on float inputs
+   (janas_m_q8w_product), a mix rewritten at load from BF16 */
+#define JANAS_TENSOR_FLOAT_IN 1
+float janas_m_round_bf16(float f);
 void janas_m_ple_layer(struct janas_llm_model *m, const struct layer *ly,
                        uint32_t l, uint32_t n);
 int janas_m_exp_tracing(void);
 void janas_m_exp_report(void);
+/* qwen4exp (model_hc.c): its tensors and buffers at load (0, or -1 with
+   err), freed with the model; a block's layers on the embeddings in x,
+   the final mix of the streams into xn and xq (tokens first .. n - 1) */
+int janas_m_hc_load(struct janas_llm_model *m, char *err, size_t err_len);
+/* layer l's tensors from file j: the main model's, or its MTP block's */
+int janas_m_hc_layer_load(struct janas_llm_model *m, const struct janas_jns *j,
+                          uint32_t l, struct layer *ly, char *err,
+                          size_t err_len);
+int janas_m_hc_alloc(struct janas_llm_model *m, char *err, size_t err_len);
+/* the mixes' BF16 matrices quantized in place as JANAS_HC_MIX asks, once
+   the resident region is read (model_hc_quant.c): 0, or -1 with err */
+int janas_m_hc_requant(struct janas_llm_model *m, char *err, size_t err_len);
+void janas_m_hc_free(struct janas_llm_model *m);
+int janas_m_hc_layers(struct janas_llm_model *m, const int32_t *tokens,
+                      uint32_t n, uint32_t pos0);
+void janas_m_hc_head(struct janas_llm_model *m, uint32_t first, uint32_t n);
+/* The MTP block of qwen4exp (janas_llm_mtp_forward): the tokens'
+   embeddings in x and the rope set, hidden the trunk's residual after its
+   last layer (hc_n x d_model a row, janas_llm_model_hidden); the block's
+   own residual into mtp_hid, its final mix of rows first .. n - 1 into xn
+   and xq. 0, or -1. */
+int janas_m_hc_mtp(struct janas_llm_model *m, const float *hidden, uint32_t n,
+                   uint32_t pos0, uint32_t first);
+/* the n-gram layer's start for a block (the GPU's, model_gpu.c): its
+   history checked, its tokens into the ring, their rows of the table into
+   ng_emb (n x d_model); the caller sets ng_hi to pos0 + n once the block
+   is done. 0, or -1 (the history is not there). */
+int janas_m_hc_ng_begin(struct janas_llm_model *m, const int32_t *tokens,
+                        uint32_t n, uint32_t pos0);
+/* The cos and sin (n_rot floats a row: the cos, then the sin) of
+   positions pos0 .. pos0 + n - 1, then of the first position of each block
+   from pos0 / ix_ratio on (n / ix_ratio + 2 rows), as the indexer turns its
+   queries and its blocks' keys: janas_gpu_tok_model's ix_rope */
+void janas_m_qsa_rope(const struct janas_llm_model *m, float *out,
+                      uint32_t pos0, uint32_t n);
+/* the indexer's keys of n positions from pos0 of attention layer ly, from
+   its input at bf16 (xb, n x d_model) - the CPU's own, after a block
+   on the GPU (model_gpu.c; model_qsa.c) */
+void janas_m_qsa_keys(struct janas_llm_model *m, const struct layer *ly,
+                      const float *xb, uint32_t n, uint32_t pos0);
+/* the n-gram rings when the context moves along (janas_llm_model_shift):
+   0, or -1 if the history to move is no longer in them */
+int janas_m_hc_shift(struct janas_llm_model *m, uint32_t keep, uint32_t drop,
+                     uint32_t n_kv);
+/* qwen4exp's sparse attention (model_qsa.c): its tensors and buffers once
+   the layers are loaded (0, or -1 with err), freed; after a block's dense
+   attention, the rows of the queries that see more than it keeps, again
+   over the positions chosen */
+int janas_m_qsa_load(struct janas_llm_model *m, char *err, size_t err_len);
+void janas_m_qsa_free(struct janas_llm_model *m);
+void janas_m_qsa(struct janas_llm_model *m, const struct layer *ly, uint32_t n,
+                 uint32_t pos0);
+/* The pooled keys of the blocks before n, from the raw keys put back (a
+   state loaded) */
+void janas_m_qsa_restore(struct janas_llm_model *m, uint32_t n);
+/* the raw keys and the blocks when the context moves along */
+void janas_m_qsa_shift(struct janas_llm_model *m, uint32_t keep, uint32_t drop,
+                       uint32_t n_kv);
 /* which experts a moe_block call runs */
 enum { MOE_ALL, MOE_SHARED, MOE_ROUTED };
 /* The router of layer l applied ahead to the state x (for the predictor
@@ -647,7 +811,12 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
 static inline struct janas_gpu *janas_m_gpu(const struct janas_llm_model *m,
                                             int arena)
 {
-    if (!m->gpu || m->gpu_off || (arena && m->arena_stale))
+    /* JANAS_GPU_REPEATABLE=1: the experts' products never on the GPU - the
+       memory it can read of the arena changes as the cache fills, and a
+       product it could read went to the fast prompt's tiles, one it could
+       not to the CPU (gpu.h) */
+    if (!m->gpu || m->gpu_off || (arena && m->arena_stale) ||
+        (arena && janas_gpu_repeatable()))
         return NULL;
     if (m->gpu_use ||
         (m->tuner.allow_gpu && janas_gpu_fast_prompt() && !m->prompts_off_gpu))

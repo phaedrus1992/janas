@@ -147,6 +147,32 @@ const struct janas_model_entry janas_catalog[] = {
      .flat_sha =
          "138d1db3af7e48d3bd36a428f7a81dfd8813434521aced84459c546e4830ab5b",
      .ram_gb = 32},
+    /* Qwen Community License 1.0 (MODELS.md): converted files may be
+       published with its notice, which the repository carries */
+    {.name = "qwen3.8-flash-next",
+     .what = "Qwen3.8-Flash-Next, 512 experts, ISTA's 2-bit GSQ, with its MTP "
+             "block",
+     .repo = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+     .parts = {"Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+               "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"},
+     .part_sha =
+         {"69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720",
+          "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"},
+     .gguf_gb = 66.4,
+     .out = "qwen3.8-flash-next-gsq-q20.jns",
+     .jns_repo = "prabanta-dev/Qwen3.8-Flash-Next-JNS",
+     .jns_gb = 68.38,
+     .flat_sha =
+         "b5b4dbe4e3ae01bffc41acefa0d1e62afdfe4b5b9bc24c2a3fab591a41f9087f",
+     .extra = JANAS_EXTRA_BLOCK,
+     .extra_repo = "unsloth/Qwen3.8-Flash-Next-GGUF",
+     .extra_src = "MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+     .extra_src_sha =
+         "8087dbb39fc73f79ac069b1debe4069a44b73ada900c8bd761569d43a5a90231",
+     .extra_out = "qwen3.8-flash-next-mtp-q4km.jns",
+     .extra_sha =
+         "d9c9dd94ef2e52391613db98c2e34c574341c48ab8752454696534d0f69a29ca",
+     .ram_gb = 32},
     {.name = "qwen3-30b-a3b",
      .what = "Qwen3-30B-A3B, mixture of experts",
      .repo = "Qwen/Qwen3-30B-A3B-GGUF",

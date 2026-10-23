@@ -165,6 +165,13 @@ void janas_expert_cache_warm_progress(const struct janas_expert_cache *c,
 int janas_expert_cache_fetch(struct janas_expert_cache *c, uint32_t layer,
                              const uint32_t *ids, size_t n,
                              const uint8_t **slots);
+/* The same for more than 256 experts (a prompt's block on the GPU asks for
+   up to all of a layer's), up to half the slots: requests of 256 that count
+   as one, so that none takes a slot an earlier one gave. 0, or -1 (a slot
+   not given, or I/O error). */
+int janas_expert_cache_fetch_many(struct janas_expert_cache *c, uint32_t layer,
+                                  const uint32_t *ids, size_t n,
+                                  const uint8_t **slots);
 
 /*
  * The same request in two steps, so that computing on the experts already in

@@ -36,7 +36,8 @@ struct janas_gpu_tok_layer {
     /* a Gated DeltaNet layer (qwen3.5) in place of the attention: q|k|v and
        z products, beta then alpha (2 nv x dm, f32), the convolution
        (d_conv x conv_ch, transposed), dt and A (nv), the heads' norm (ds),
-       the output product; its state slot */
+       the output product; its state slot (an attention layer's: its KV
+       slot, its row of att_in) */
     int rec;
     struct janas_matvec_task ssm_qkv, ssm_z, ssm_out;
     const float *ssm_beta, *ssm_alpha, *conv_w, *dt, *ssm_a, *ssm_norm;
@@ -52,6 +53,28 @@ struct janas_gpu_tok_layer {
     const float *sh_gate;
     size_t off[3], poff[2];
     struct janas_matvec_task sh_gate_w, sh_up, sh_down;
+    /* qwen4exp (the model's hc): its mixes of the streams in place of the
+       norms, [0] before the token mixer and [1] before the feed-forward:
+       each stream's norm (hc x dm), down (rank x hc dm), up (hc dm x rank)
+       and inject (hc x hc dm), bf16; on its n-gram layer the key product
+       (hc dm x dm), the value (dm x dm, bf16), the key's, query's and
+       conv's norms (hc dm each) and the conv's taps (hc dm x kernel,
+       channel-major) */
+    const float *hc_norm[2];
+    const uint16_t *hc_down[2], *hc_up[2], *hc_inject[2];
+    struct janas_matvec_task ng_key;
+    const uint16_t *ng_value;
+    const float *ng_nk, *ng_nq, *ng_nc, *ng_conv;
+    /* qwen4exp's indexer on an attention layer (the model's ix_heads; or
+       NULL): its query and key products (ix_heads ix_dim x dm and ix_dim x
+       dm, bf16), their norms (ix_dim), the raw keys of every position
+       (cap x ix_dim, half precision) and the pooled keys of every block
+       (cap / ix_ratio x ix_dim), the model's: the CPU reads and writes
+       them too */
+    const uint16_t *ix_q, *ix_k;
+    const float *ix_qn, *ix_kn;
+    uint16_t *ix_raw;
+    float *ix_pool;
 };
 
 struct janas_gpu_tok_model {
@@ -96,9 +119,42 @@ struct janas_gpu_tok_model {
        of them, so none is read for nothing */
     void (*prefetch)(void *ctx, uint32_t layer);
     void *ctx;
+    /* qwen4exp: hc streams of the residual (0: one, the others), the
+       mixes' rank, the output's mix (no inject); ng_layer the n-gram
+       layer (n_layer: none), its conv's kernel and dilation, its ring of
+       inputs (ng_cap positions of hc dm floats, the model's: the CPU's
+       passes read and write it too) and the block's embeddings, which the
+       caller writes before each run (n x dm); att_in each attention
+       layer's input as the GPU made it (n_attn x the block's n x dm), for
+       the CPU's indexer keys (model_qsa.c) after the run, or NULL. The
+       feed-forwards' widths (eff, ff) may end inside a group of 256: then
+       their buffers are padded to whole groups of zeros. */
+    uint32_t hc, hc_rank;
+    /* the mixes' down and up rewritten as Q8_0 (JANAS_HC_MIX=q8: blocks
+       of 32, rows of a whole number of them), their injects still bf16 */
+    int hc_q8;
+    const float *hco_norm;
+    const uint16_t *hco_down, *hco_up;
+    uint32_t ng_layer, ng_kernel, ng_len, ng_cap;
+    float *ng_hist;
+    const float *ng_emb;
+    float *att_in;
+    /* qwen4exp's sparse attention (0 heads: none): the indexer's heads,
+       their width, the positions a token keeps past the dense ones and the
+       blocks' length; ix_rope the cos and sin (n_rot floats a row) of the
+       block's n tokens' positions, then of the first position of each
+       block from pos / ix_ratio on (n / ix_ratio + 2 rows), which the
+       caller writes before each run as model_qsa.c turns them; it needs
+       att_in */
+    uint32_t ix_heads, ix_dim, ix_top, ix_ratio;
+    const float *ix_rope;
 };
 
 struct janas_gpu_tok;
+
+/* The most tokens a run takes (janas_gpu_tok_max_block's), and the rows a
+   layer has in att_in. */
+#define JANAS_GPU_TOK_BLOCK 256
 
 /* The most tokens of the last call a block replays before its own (see
    janas_gpu_tok_run): a chain of drafts is shorter. */

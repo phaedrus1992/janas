@@ -18,6 +18,7 @@
 #define JANAS_LLM_GPU_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "matvec.h"
 
@@ -115,6 +116,21 @@ int janas_gpu_dense_mm(struct janas_gpu *g, int bf16, const void *w,
                        size_t n, float scale);
 
 /*
+ * y = scale w x for bf16 weights (rows x cols, in memory the GPU holds),
+ * with n vectors of cols floats in x and y[v * rows + r], computed as the
+ * CPU computes them with AVX2 and FMA (bf16.h): the same bits, so for any
+ * n the GPU takes (janas_gpu_min_n); x and y in place where the GPU shares
+ * them with the host, else through its stages. Waited for. Not in a pass
+ * the tuner gave the CPU (janas_gpu_set_only_fast). 0, or -1 with nothing
+ * written (the caller computes it). Qwen3.8-Flash-Next's mixes of the
+ * streams, 1.25 GB of weights a token: a reply's tokens on a card with
+ * memory of its own.
+ */
+int janas_gpu_bf16_mv(struct janas_gpu *g, const uint16_t *w, const float *x,
+                      float *y, size_t rows, size_t cols, size_t n,
+                      float scale);
+
+/*
  * Whether the fast prompt is on (unless JANAS_GPU_FAST_PROMPT=0): blocks of
  * JANAS_GPU_FAST_N vectors and more of the types it has shaders for go to
  * the GPU whole, rounded group by group - close to the CPU's results, not
@@ -129,6 +145,21 @@ int janas_gpu_fast_prompt(void);
 /* For the passes that follow: only the fast prompt's products on the GPU,
    the rest on the CPU (a pass the tuner gave the CPU alone). */
 void janas_gpu_set_only_fast(struct janas_gpu *g, int on);
+/* The tokens of the pass that follows. A mixture's experts go to the fast
+   prompt's shaders (experts_id) only in a prompt's blocks, of
+   JANAS_GPU_FAST_N tokens and more: a chain of drafts to verify stays bit
+   for bit with the CPU, so that drafts never change the text. Not said
+   (a probe calling the products itself): any pass. */
+void janas_gpu_set_pass(struct janas_gpu *g, uint32_t n);
+/* JANAS_GPU_REPEATABLE=1: a prompt gives the same results every time - a
+   mixture's experts never on the GPU (janas_m_gpu: an expert's product went
+   to the fast prompt's tiles where the GPU could read its slot, to the CPU
+   where it could not, as the cache filled), and in a prompt's blocks the
+   GPU only the fast prompt's products (janas_m_apply_candidate):
+   products shared with the CPU, begun beside them, made the GPU busy, and
+   the fast ones asked meanwhile went to the CPU, as the tuner tried one
+   configuration or another. */
+int janas_gpu_repeatable(void);
 
 /* Keeps the GPU out of its sleep states (an empty dispatch every 0.5 ms,
    JANAS_GPU_KEEPALIVE_US) while on: for the passes that use it. */

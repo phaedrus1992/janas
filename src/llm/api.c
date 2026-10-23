@@ -95,6 +95,42 @@ static uint64_t file_size(const char *path)
     return stat(path, &st) == 0 ? (uint64_t)st.st_size : 0;
 }
 
+/* The words a template puts at the top of the system message while the
+   model reasons, at the effort it takes when none is asked for, into
+   llm->think_note; empty where it has none. Qwen3.8's:
+     {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+     ...
+     {%- if resolved_reasoning_effort == 'xhigh' %}
+         {%- set reasoning_instructions = 'Reasoning effort is set to ...' %}
+   read from the template rather than written here, so that another
+   model's words, or another default, are its own. */
+static void find_think_note(janas_llm *llm, const char *tmpl)
+{
+    static const char DEF[] = "reasoning_effort|default('",
+                      SET[] = "set reasoning_instructions = '";
+    llm->think_note[0] = 0;
+    const char *d = strstr(tmpl, DEF);
+    if (!d)
+        return;
+    d += sizeof DEF - 1;
+    const char *e = strchr(d, '\'');
+    if (!e || e - d > 32)
+        return;
+    char key[64];
+    snprintf(key, sizeof key, "== '%.*s' %%}", (int)(e - d), d);
+    const char *k = strstr(tmpl, key);
+    const char *s = k ? strstr(k, SET) : NULL;
+    if (!s)
+        return;
+    s += sizeof SET - 1;
+    const char *q = strchr(s, '\'');
+    if (!q || (size_t)(q - s) >= sizeof llm->think_note ||
+        memchr(s, '\\', (size_t)(q - s)))
+        return; /* too long, or escaped: left out rather than cut */
+    memcpy(llm->think_note, s, (size_t)(q - s));
+    llm->think_note[q - s] = 0;
+}
+
 /* Recognizes the chat format from the template in tmpl; returns 0 or an
    error code. */
 static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
@@ -152,6 +188,11 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
         llm->think_close = janas_tokenizer_find(llm->tok, "</think>");
         llm->thinker = strstr(tmpl, "enable_thinking") &&
                        llm->think_open >= 0 && llm->think_close >= 0;
+        if (llm->thinker)
+            find_think_note(llm, tmpl);
+        llm->think_kept =
+            llm->thinker && strstr(tmpl, "preserve_thinking is undefined or "
+                                         "preserve_thinking is true") != NULL;
         /* tools: the template says how calls are written, the vocabulary
            must have the markers as tokens of their own */
         llm->call_open = janas_tokenizer_find(llm->tok, "<tool_call>");
@@ -216,6 +257,8 @@ struct mem_need {
     uint64_t attn_part;  /* attention's partial results beside the cache */
     uint64_t scratch;    /* a pass's scratch */
     uint64_t npu;        /* the NPU's copies of its matrices (model_npu.c) */
+    uint64_t table;      /* the per-layer table, read a row at a time unless the
+                            memory holds it (janas_llm_options ple_ram) */
 };
 
 /*
@@ -226,7 +269,11 @@ struct mem_need {
  * on Meteor Lake, 20 Oct 2026), and 128 MB for the compiler. Taken from the
  * expert cache's share: without it the copies came on top of a cache sized
  * to the memory, and Qwen3-Next-80B ran out of it as the NPU's
- * configurations began.
+ * configurations began. Every type the NPU takes (until 22 Oct 2026 only
+ * Q4_K, Q5_K, Q6_K and Q8_0 were counted, and a model of other types,
+ * Qwen3.8-Flash-Next's Q2_0, Q3_K and IQ4_XS, would have had its copies on
+ * top of the cache), and qwen4exp's bf16 mixes at two bytes a weight
+ * (model_hc.c, in FP16 on the NPU).
  */
 static uint64_t npu_need(const struct janas_jns *j)
 {
@@ -237,12 +284,19 @@ static uint64_t npu_need(const struct janas_jns *j)
     for (uint64_t i = 0; i < j->h.n_tensor; i++) {
         const struct janas_jns_tensor *t = &j->tensors[i];
         int type = (int)t->type;
+        /* not the tables (token_embd, and per_layer_token_embd: read a row
+           at a time) */
         if (t->n_dims != 2 || t->offset < r0 || t->offset >= r1 ||
-            !(type == JANAS_Q4_K || type == JANAS_Q5_K || type == JANAS_Q6_K ||
-              type == JANAS_Q8_0) ||
             strstr(t->name, "token_embd") || !strcmp(t->name, "output.weight"))
             continue;
-        n += t->dims[0] * t->dims[1];
+        /* bf16: the mixes of the streams and the n-gram layer's value */
+        int mix = type == 30 && t->dims[1] >= 64 &&
+                  (strstr(t->name, "hc_down") || strstr(t->name, "hc_up") ||
+                   strstr(t->name, "ple_value") || strstr(t->name, "indexer"));
+        if (mix)
+            n += 2 * t->dims[0] * t->dims[1];
+        else if (janas_llm_npu_type(type))
+            n += t->dims[0] * t->dims[1];
     }
     for (uint32_t l = 0; j->h.n_expert <= 1 && l < j->h.n_layer; l++)
         for (int k = 0; k < 3; k++)
@@ -259,13 +313,16 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
 {
     char arch[32] = "";
     janas_jns_meta_str(j, "general.architecture", arch, sizeof(arch));
-    uint64_t resident = j->h.resident_bytes;
-    /* less Gemma 4's per-layer embeddings, read from the file a row at a
-       time (model_ple.c) */
+    uint64_t resident = j->h.resident_bytes, table = 0;
+    /* less the per-layer table (Gemma 4's embeddings, Qwen3.8-Flash-Next's
+       n-grams), read from the file a row at a time unless the memory holds
+       it (janas_llm_open) */
     const struct janas_jns_tensor *ple =
         janas_jns_tensor(j, "per_layer_token_embd.weight");
-    if (ple && ple->bytes < resident)
+    if (ple && ple->bytes < resident) {
         resident -= ple->bytes;
+        table = ple->bytes;
+    }
     /* what the cache would need to hold every slot at once. Not the size of
        the expert region: the cache's slots are all as big as the largest, so
        where the layers differ (a down matrix in Q6_K in one and Q4_K in the
@@ -362,6 +419,30 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
     }
     if (!kv_token || kv_token > (1 << 20))
         kv_token = 64 << 10; /* unsaid or odd: the old bound */
+    /* qwen4exp's sparse attention: its indexer keeps every position's key
+       at half precision and each block's pooled key at full in every
+       attention layer (model_qsa.c) - 4.5 KB a position on
+       Qwen3.8-Flash-Next, 1.2 GB at 262,144 tokens, uncounted until 22 Oct
+       2026 */
+    uint32_t ix_heads = 0, ix_dim = 0;
+    snprintf(key, sizeof(key), "%.32s.attention.indexer.head_count", arch);
+    if (janas_jns_meta_u32(j, key, &ix_heads) == 0 && ix_heads) {
+        snprintf(key, sizeof(key), "%.32s.attention.indexer.key_length", arch);
+        janas_jns_meta_u32(j, key, &ix_dim);
+        uint64_t ratio = 0;
+        snprintf(key, sizeof(key), "%.32s.attention.compress_ratios", arch);
+        for (uint32_t l = 0; !ratio && l < n_layer; l++)
+            if (janas_jns_meta_uint_at(j, key, l, &ratio, NULL) != 0)
+                break;
+        uint32_t interval = 1;
+        snprintf(key, sizeof(key), "%.32s.full_attention_interval", arch);
+        if (a && a->rec != JANAS_REC_NONE &&
+            (janas_jns_meta_u32(j, key, &interval) != 0 || interval == 0))
+            interval = 4;
+        uint64_t n_attn = n_layer / interval;
+        if (ratio)
+            kv_token += n_attn * ix_dim * 2 + n_attn * ix_dim * 4 / ratio;
+    }
     /* and what attention keeps beside the cache, which grows with the
        context as well: uncounted, 262,144 tokens of Qwen3-Next-80B put
        1.08 GB of partial results in the margin left to other programs */
@@ -405,6 +486,14 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
     uint64_t scratch =
         blk * (((uint64_t)k_used + 1) * (3ull * ff + embd) + 32ull * embd) *
         sizeof(float);
+    /* qwen4exp: a block's residual streams and n-gram rows beside it
+       (model_hc.c janas_m_hc_alloc), some seven rows of hc times the width
+       a token - 81 MB on Qwen3.8-Flash-Next, uncounted until 22 Oct 2026,
+       when the estimate fell 0.27 GiB short of the memory measured */
+    uint32_t hc = 0;
+    snprintf(key, sizeof(key), "%.32s.hyper_connection.count", arch);
+    if (janas_jns_meta_u32(j, key, &hc) == 0 && hc)
+        scratch += blk * (8ull * hc * embd + 4ull * embd) * sizeof(float);
     *e = (struct mem_need){.resident = resident,
                            .experts = experts,
                            .kv_token = kv_token,
@@ -412,12 +501,14 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
                            .ring = ring,
                            .attn_part = attn_part,
                            .scratch = scratch,
-                           .npu = npu_need(j)};
+                           .npu = npu_need(j),
+                           .table = table};
 }
 
 /* What a model needs whatever its expert cache: the resident weights, the
    keys and values of p->n_ctx tokens, the attention's partial results, a
-   pass's scratch and the MTP file (with 256 MiB of its own cache). */
+   pass's scratch and the MTP file, which the engine holds whole (its
+   experts' cache takes every one), with 256 MiB beside it. */
 static uint64_t mem_fixed(const struct mem_need *e,
                           const struct janas_llm_params *p)
 {
@@ -526,6 +617,28 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         if (cache > e.experts)
             cache = e.experts;
     }
+    /*
+     * The per-layer table in memory where the machine holds it beside a
+     * cache of every expert - the experts first: a token reads hundreds of
+     * them and a few rows of the table (Qwen3.8-Flash-Next: 480 experts,
+     * 16 rows of 90 bytes) - read a row at a time from the file where the
+     * memory is short (the development laptop's 30 GB). JANAS_PLE_RAM=1
+     * asks for it, the cache giving it the room; 0 never.
+     */
+    int table_ram = 0;
+    if (e.table) {
+        const char *pr = getenv("JANAS_PLE_RAM");
+        /* the NPU's copies only where it stays on */
+        uint64_t avail = janas_mem_available();
+        uint64_t need =
+            mem_fixed(&e, &p) - (no_npu ? e.npu : 0) + reserve + e.table;
+        table_ram = pr ? atoi(pr) > 0
+                       : p.cache_bytes == 0 &&
+                             avail > need + e.experts + ((uint64_t)1 << 30);
+        if (table_ram && p.cache_bytes == 0 && cache + need > avail)
+            cache = avail > need + ((uint64_t)1 << 30) ? avail - need
+                                                       : (uint64_t)1 << 30;
+    }
     /* compute: every usable core (the tuner picks how many per pass);
        I/O: the efficiency cores, or unpinned */
     int ccpus[256], icpus[256], nc = 0, ni = 0;
@@ -549,7 +662,8 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         .expert_bits = p.expert_bits,
         .attn_scores = p.attn_scores,
         .head_bits = p.head_bits,
-        .no_npu = no_npu};
+        .no_npu = no_npu,
+        .ple_ram = table_ram};
     llm->m = janas_llm_model_load(path, &mo, err, sizeof(err));
     if (!llm->m) {
         janas_tokenizer_destroy(llm->tok);
@@ -620,6 +734,11 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         w += snprintf(bits + w, sizeof(bits) - (size_t)w,
                       ", output head at 4 bits (%.0f -> %.0f MB)", d0 / 1e6,
                       d1 / 1e6);
+    const char *hq = janas_llm_model_hc_quant(llm->m, &d0, &d1);
+    if (hq && w >= 0 && (size_t)w < sizeof(bits))
+        w += snprintf(bits + w, sizeof(bits) - (size_t)w,
+                      ", mixes of the streams %s (%.0f -> %.0f MB)", hq,
+                      d0 / 1e6, d1 / 1e6);
     int h16 = janas_llm_model_head16(llm->m, &d0, &d1);
     if (h16 && w >= 0 && (size_t)w < sizeof(bits))
         snprintf(bits + w, sizeof(bits) - (size_t)w,

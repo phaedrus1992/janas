@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | `tools/gguf2jns` | GGUF → the `.jns` format the engine reads |
-| `tools/hf2jns_mtp` | the multi-token prediction block, from the original checkpoint: its shards, or just the block's tensors from Hugging Face (`hf:<owner>/<repo>`) |
+| `tools/hf2jns_mtp` | the multi-token prediction block, from the original checkpoint: its shards, or just the block's tensors from Hugging Face (`hf:<owner>/<repo>`); or from a GGUF file of the block alone (unsloth's `mtp-*.gguf` of Qwen3.8-Flash-Next), copied as it is |
 | `tools/jns_planes` | rewrites a model with the experts' down matrix in bit planes, so a machine short of memory can read part of it |
 | `jns_check` | checks a model file, with `--verify` every expert's checksum |
 | `tools/openapi_routes` | `janas-server`'s route table, from OpenAI's specification |

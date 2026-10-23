@@ -95,15 +95,18 @@ static const char *check_ffn(const struct janas_gpu *g,
         return NULL;
     }
     int gt = ly->gate.type, dt = ly->down.type;
+    /* Q2_0 (qwen4exp's): b32_mmid.comp, rows of 640 too */
+    int q20 = g->pipe_idb[2] != VK_NULL_HANDLE;
     if (!(gt == JANAS_Q4_K || (gt == JANAS_MXFP4 && g->pipe_idmx) ||
-          (gt == JANAS_Q3_K && g->pipe_id3)) ||
+          (gt == JANAS_Q3_K && g->pipe_id3) || (gt == JANAS_Q2_0 && q20)) ||
         ly->up.type != gt ||
         !(dt == JANAS_Q4_K || dt == JANAS_Q6_K || dt == JANAS_Q6_K_P ||
           (dt == JANAS_MXFP4 && g->pipe_idmx) ||
-          (dt == JANAS_Q3_K && g->pipe_id3)) ||
-        ly->gate.rows != md->eff || ly->up.rows != md->eff ||
-        ly->gate.cols != md->dm || ly->up.cols != md->dm ||
-        ly->down.rows != md->dm || ly->down.cols != md->eff)
+          (dt == JANAS_Q3_K && g->pipe_id3) || (dt == JANAS_Q2_0 && q20)) ||
+        (md->eff % JANAS_QK && dt != JANAS_Q2_0) || ly->gate.rows != md->eff ||
+        ly->up.rows != md->eff || ly->gate.cols != md->dm ||
+        ly->up.cols != md->dm || ly->down.rows != md->dm ||
+        ly->down.cols != md->eff)
         return "experts of a type or shape the GPU's shaders do not take";
     if (!ly->router16)
         return "a mixture's layer without its router";
@@ -120,22 +123,95 @@ static const char *check_ffn(const struct janas_gpu *g,
     return NULL;
 }
 
+/* qwen4exp's streams: every mix's matrices where the GPU reads them, bf16
+   (down and up Q8_0 with JANAS_HC_MIX=q8), the n-gram layer's pieces, the ring
+   of the conv's inputs and the attention's inputs kept for the indexer. */
+static int check_hc(const struct janas_gpu *g,
+                    const struct janas_gpu_tok_model *md, char *err, size_t len)
+{
+    size_t hd = (size_t)md->hc * md->dm, r = md->hc_rank;
+    if (md->hc < 2 || md->hc > 16 || r % 32 || hd % 256 || !g->pipe_dm[1] ||
+        (md->hc_q8 && !g->pipe_dm[2]))
+        return fail(err, len, "streams of a shape the shaders do not take");
+    /* down and up: bf16, or Q8_0 */
+    size_t mb = md->hc_q8 ? r * hd / 32 * 34 : r * hd * 2;
+    for (uint32_t l = 0; l <= md->n_layer; l++)
+        for (int k = 0; k < (l < md->n_layer ? 2 : 1); k++) {
+            const struct janas_gpu_tok_layer *ly =
+                l < md->n_layer ? &md->layers[l] : NULL;
+            const float *nw = ly ? ly->hc_norm[k] : md->hco_norm;
+            const uint16_t *dw = ly ? ly->hc_down[k] : md->hco_down,
+                           *uw = ly ? ly->hc_up[k] : md->hco_up,
+                           *iw = ly ? ly->hc_inject[k] : NULL;
+            if (!janas_gt_addr_of(g, nw, hd * 4) ||
+                !janas_gt_addr_of(g, dw, mb) || !janas_gt_addr_of(g, uw, mb) ||
+                (ly && !janas_gt_addr_of(g, iw, md->hc * hd * 2)))
+                return fail(err, len,
+                            "a mix of the streams not in bf16 where the GPU "
+                            "reads it");
+        }
+    if (md->ng_layer < md->n_layer) {
+        const struct janas_gpu_tok_layer *ly = &md->layers[md->ng_layer];
+        if (!md->ng_emb || md->ng_kernel == 0 || md->ng_kernel > 8 ||
+            !janas_gpu_can(g, &ly->ng_key) ||
+            !janas_gt_addr_of(g, ly->ng_value, (size_t)md->dm * md->dm * 2) ||
+            !janas_gt_addr_of(g, ly->ng_nk, hd * 4) ||
+            !janas_gt_addr_of(g, ly->ng_nq, hd * 4) ||
+            !janas_gt_addr_of(g, ly->ng_nc, hd * 4) || !ly->ng_conv ||
+            !janas_gt_addr_of(g, md->ng_hist, md->ng_cap * hd * 4))
+            return fail(err, len, "n-gram embeddings out of the GPU's reach");
+    }
+    /* the sparse attention's indexer: its queries in the score shader's
+       shared memory, a head's width a workgroup's, the positions of a
+       token within the cache's runs */
+    if (md->ix_heads) {
+        uint32_t d = md->ix_dim, r = md->ix_ratio;
+        if (!md->att_in || !md->ix_rope || d > 256 || d % 8 ||
+            md->ix_heads * d > 2048 || md->n_rot > d || md->n_rot % 2 ||
+            r == 0 || r > 256 || md->ix_top % r || md->ix_top == 0)
+            return fail(err, len,
+                        "a sparse attention of a shape the shaders do not "
+                        "take");
+        for (uint32_t l = 0; l < md->n_layer; l++) {
+            const struct janas_gpu_tok_layer *ly = &md->layers[l];
+            if (ly->rec)
+                continue;
+            if (!ly->ix_q || !ly->ix_k || !ly->ix_qn || !ly->ix_kn ||
+                !janas_gt_addr_of(g, ly->ix_q,
+                                  (size_t)md->ix_heads * d * md->dm * 2) ||
+                !janas_gt_addr_of(g, ly->ix_k, (size_t)d * md->dm * 2) ||
+                !janas_gt_addr_of(g, ly->ix_qn, (size_t)d * 4) ||
+                !janas_gt_addr_of(g, ly->ix_kn, (size_t)d * 4) ||
+                !janas_gt_addr_of(g, ly->ix_raw, (size_t)md->cap * d * 2) ||
+                !janas_gt_addr_of(g, ly->ix_pool,
+                                  (size_t)((md->cap + r - 1) / r) * d * 4))
+                return fail(err, len,
+                            "the sparse attention's indexer out of the GPU's "
+                            "reach");
+        }
+    }
+    return 0;
+}
+
 /* Whether the model's pieces are all where the GPU can read them. */
 static int check_model(const struct janas_gpu *g,
                        const struct janas_gpu_tok_model *md, char *err,
                        size_t len)
 {
     uint32_t qd = md->n_head * md->hd, kvd = md->n_kv * md->hd;
-    if (md->dm % JANAS_QK || qd % JANAS_QK || md->ff % JANAS_QK ||
-        md->dm > 8192 || qd > 8192 || md->hd > 512 || md->hd % 16 ||
-        md->n_rot > md->hd || md->n_kv == 0 || md->n_head % md->n_kv ||
-        md->n_head / md->n_kv * md->hd > ATT_MAXQ ||
-        md->n_head / md->n_kv * ATT_RUN > ATT_MAXS)
+    /* feed-forwards may end inside a group of 256 (qwen4exp's 640): their
+       down matrices in blocks of 32, checked by janas_gpu_can and
+       check_ffn */
+    if (md->dm % JANAS_QK || qd % JANAS_QK || md->ff % 32 || md->dm > 8192 ||
+        qd > 8192 || md->hd > 512 || md->hd % 16 || md->n_rot > md->hd ||
+        md->n_kv == 0 || md->n_head % md->n_kv ||
+        md->n_head / md->n_kv * md->hd > ATT_MAXQ_G(md->n_head / md->n_kv) ||
+        md->n_head / md->n_kv * ATT_RUN > ATT_MAXS_G(md->n_head / md->n_kv))
         return fail(err, len, "a shape the token's shaders do not take");
-    if (md->n_expert && (md->n_expert > 512 || md->k == 0 || md->k > 16 ||
-                         md->k > md->n_expert || md->eff % JANAS_QK ||
-                         !md->fetch || !g->pipe_id4 || !g->pipe_id6 ||
-                         !g->pipe_id6s || !g->pipea || !g->pipe_dm[0]))
+    if (md->n_expert &&
+        (md->n_expert > 512 || md->k == 0 || md->k > 16 ||
+         md->k > md->n_expert || md->eff % 32 || !md->fetch || !g->pipe_id4 ||
+         !g->pipe_id6 || !g->pipe_id6s || !g->pipea || !g->pipe_dm[0]))
         return fail(err, len, "a mixture the token's shaders do not take");
     if (md->n_rec &&
         (md->ds != 128 || md->conv_ch % 256 || md->d_inner % 256 ||
@@ -169,8 +245,8 @@ static int check_model(const struct janas_gpu *g,
                              l, i, r[i]->type);
                     return -1;
                 }
-            if (!janas_gt_addr_of(g, ly->attn_norm, md->dm * 4) ||
-                !janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4))
+            if (!md->hc && (!janas_gt_addr_of(g, ly->attn_norm, md->dm * 4) ||
+                            !janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4)))
                 return fail(err, len, "a norm out of the GPU's reach");
             continue;
         }
@@ -187,8 +263,8 @@ static int check_model(const struct janas_gpu *g,
         if (md->gated_q && (ly->wq.type == JANAS_Q6_K_P || ly->wq.plane[0]))
             return fail(err, len, "a gated query in planes");
         size_t cache = (size_t)md->n_kv * md->cap * md->hd;
-        if (!janas_gt_addr_of(g, ly->attn_norm, md->dm * 4) ||
-            !janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4) ||
+        if ((!md->hc && (!janas_gt_addr_of(g, ly->attn_norm, md->dm * 4) ||
+                         !janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4))) ||
             !janas_gt_addr_of(g, ly->q_norm, md->hd * 4) ||
             !janas_gt_addr_of(g, ly->k_norm, md->hd * 4) ||
             !janas_gt_addr_of(g, ly->kc, cache) ||
@@ -200,8 +276,10 @@ static int check_model(const struct janas_gpu *g,
                         "reach");
     }
     if (!janas_gpu_can(g, &md->output) ||
-        !janas_gt_addr_of(g, md->out_norm, md->dm * 4))
+        (!md->hc && !janas_gt_addr_of(g, md->out_norm, md->dm * 4)))
         return fail(err, len, "the output head out of the GPU's reach");
+    if (md->hc && check_hc(g, md, err, len) != 0)
+        return -1;
     (void)kvd;
     return 0;
 }
@@ -231,19 +309,33 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
        long at any context - sized for the cache, 16384 positions left
        Qwen3-4B 30 tokens a block, too few for the fast prompt's tiles */
     t->nch = (md->cap + ATT_RUN - 1) / ATT_RUN;
+    /* a sparse attention: a token's positions are at most its budget and
+       its own block's, the runs that take them (ix_select.comp) */
+    if (md->ix_heads) {
+        uint32_t r = md->ix_ratio;
+        t->ix_runs = (md->ix_top + r - 1 + ATT_RUN - 1) / ATT_RUN;
+        if (t->ix_runs < t->nch)
+            t->nch = t->ix_runs;
+        t->ix_nbs = (md->cap + r - 1) / r;
+        t->ix_ls = md->ix_top + r;
+    }
     size_t full = (size_t)md->n_head * t->nch * (md->hd + 2);
     t->part_floats = TOK_PART_BUDGET / 4 > full ? TOK_PART_BUDGET / 4 : full;
     t->nb = TOK_MAX_BLOCK;
     t->n_seg = md->n_layer + 1;
     size_t nb = t->nb;
+    /* feed-forward widths ending inside a group of 256 (qwen4exp's 640):
+       their buffers in whole groups, the rest zero */
+    t->ffp = (md->ff + JANAS_QK - 1) / JANAS_QK * JANAS_QK;
+    t->effp = (md->eff + JANAS_QK - 1) / JANAS_QK * JANAS_QK;
     t->o_x = take(&at, nb * md->dm * 4);
     t->o_x1 = take(&at, nb * md->dm * 4); /* the residual's other buffer */
     t->o_q256 = take(&at, nb * big / JANAS_QK * 320);
     t->o_q32 = take(&at, nb * big / JANAS_QK * 320);
     t->o_qkv = take(&at, nb * (qd + 2 * kvd) * 4);
     t->o_ywo = take(&at, nb * md->dm * 4);
-    t->o_gu = take(&at, nb * md->ff * 2 * 4);
-    t->o_h = take(&at, nb * md->ff / JANAS_QK * 320);
+    t->o_gu = take(&at, nb * t->ffp * 2 * 4);
+    t->o_h = take(&at, nb * t->ffp / JANAS_QK * 320);
     t->o_yd = take(&at, nb * md->dm * 4);
     t->o_rope = take(&at, nb * md->n_rot * 4);
     t->o_logits = take(&at, nb * md->n_vocab * 4);
@@ -251,6 +343,33 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
     t->o_part = take(&at, t->part_floats * 4);
     t->o_xnf = take(&at, nb * md->dm * 4);
     t->o_hid = take(&at, nb * md->dm * 4);
+    if (md->hc) {
+        size_t hd = (size_t)md->hc * md->dm, r = md->hc_rank;
+        t->o_res = take(&at, nb * hd * 4);
+        t->o_hxn = take(&at, nb * hd * 4);
+        t->o_hxb = take(&at, nb * hd * 4);
+        t->o_lo = take(&at, nb * r * 4);
+        t->o_lob = take(&at, nb * r * 4);
+        t->o_hg = take(&at, nb * hd * 4);
+        t->o_inj = take(&at, nb * md->hc * 4);
+        t->o_hmean = take(&at, nb * md->dm * 4);
+        if (md->ix_heads) {
+            uint32_t d = md->ix_dim, r = md->ix_ratio;
+            t->o_ixq = take(&at, nb * md->ix_heads * d * 4);
+            t->o_ixk = take(&at, nb * d * 4);
+            t->o_ixrope = take(&at, (nb + nb / r + 2) * md->n_rot * 4);
+            t->o_ixsc = take(&at, nb * t->ix_nbs * 4);
+            t->o_ixlist = take(&at, nb * t->ix_ls * 4);
+        }
+        if (md->ng_layer < md->n_layer) {
+            t->o_ngk = take(&at, nb * hd * 4);
+            t->o_ngv = take(&at, nb * md->dm * 4);
+            t->o_ngeb = take(&at, nb * md->dm * 4);
+            t->o_nggv = take(&at, nb * hd * 4);
+            t->o_ngemb = take(&at, nb * md->dm * 4);
+            t->o_ngw = take(&at, hd * md->ng_kernel * 4);
+        }
+    }
     if (md->gated_q)
         t->o_gate = take(&at, nb * qd * 4);
     if (md->n_rec) {
@@ -275,14 +394,14 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         /* the pairs of a block of nb tokens, k each; at most a tile of 16
            of them per expert more than if they were all whole tiles */
         size_t np = nb * md->k, nbd = md->dm / JANAS_QK,
-               nbf = md->eff / JANAS_QK;
+               nbf = t->effp / JANAS_QK;
         t->o_r = take(&at, nb * (ne + 1) * 4);
         t->o_pe = take(&at, np * 4);
         t->o_pw = take(&at, np * 4);
         t->o_shw = take(&at, nb * 4);
         t->o_sh = take(&at, nb * md->dm * 4);
         t->o_xg = take(&at, np * nbd * 320);
-        t->o_egu = take(&at, np * md->eff * 2 * 4);
+        t->o_egu = take(&at, np * t->effp * 2 * 4);
         t->o_eh = take(&at, np * nbf * 320);
         t->o_dout = take(&at, np * md->dm * 4);
         t->o_gt = take(&at, np * 4);
@@ -305,8 +424,8 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         d32 |= janas_g_x_in_32(ne ? md->layers[l].sh_down.type
                                   : md->layers[l].down.type);
     if (d32) {
-        t->o_hf = take(&at, nb * md->ff * 4);
-        t->o_h32 = take(&at, nb * md->ff / JANAS_QK * 320);
+        t->o_hf = take(&at, nb * t->ffp * 4);
+        t->o_h32 = take(&at, nb * t->ffp / JANAS_QK * 320);
     }
     if (md->n_rec || ne) {
         t->par = calloc((size_t)md->n_layer * PAR_N, sizeof(size_t));
@@ -375,6 +494,19 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
                                       sizeof(janas_spv_silu_mul), &t->sm_sm,
                                       &t->p_sm, 0) != VK_SUCCESS)) {
         fail(err, err_len, "cannot create the token's buffers or shaders");
+        janas_gpu_tok_destroy(g, t);
+        return NULL;
+    }
+    /* zero: the padding of the feed-forwards' widths is never written */
+    memset(t->buf.map, 0, at);
+    janas_gt_sync_range(g, t, 0, at, 1);
+    if (md->hc && janas_gt_hc_create(g, t, md) != 0) {
+        fail(err, err_len, "cannot create the streams' shaders");
+        janas_gpu_tok_destroy(g, t);
+        return NULL;
+    }
+    if (md->ix_heads && janas_gt_qsa_create(g, t) != 0) {
+        fail(err, err_len, "cannot create the sparse attention's shaders");
         janas_gpu_tok_destroy(g, t);
         return NULL;
     }
@@ -458,6 +590,8 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
     VkShaderModule s[15] = {t->sm_nq, t->sm_qk, t->sm_at, t->sm_am, t->sm_gc,
                             t->sm_gs, t->sm_gl, t->sm_gr, t->sm_gg, t->sm_tk,
                             t->sm_ga, t->sm_cb, t->sm_sm, t->sm_gb, t->sm_gx};
+    janas_gt_hc_destroy(g, t);
+    janas_gt_qsa_destroy(g, t);
     free(t->par);
     free(t->cnt);
     free(t->fill);
@@ -507,6 +641,89 @@ static uint32_t runs_for(const struct janas_gpu_tok *t, uint32_t npos)
     return r < t->nch ? r : t->nch;
 }
 
+/* qwen4exp's layers (record's, for a model with hc streams), as
+   model_hc.c's janas_m_hc_layers: the streams set to the embeddings; in
+   each layer the n-gram embeddings where they are, the mix into the token
+   mixer's input, the DeltaNet or the attention (the attention's input at
+   bf16 kept for the CPU's indexer, att_in), its output combined into the
+   streams, the mix into the feed-forward's, the router - the experts and
+   their combine in the next submission - then the output's mix and head.
+   seg as record's. */
+static int record_hc(struct janas_gpu *g, struct janas_gpu_tok *t,
+                     const struct janas_gpu_tok_model *md,
+                     const struct janas_gpu_tok_layer *layers,
+                     const struct janas_matvec_task *output, uint32_t n,
+                     uint32_t first, int hid, int seg, VkPipeline *bound)
+{
+    VkDeviceAddress B = t->buf.addr, XNF = B + t->o_xnf, YWO = B + t->o_ywo,
+                    YD = B + t->o_yd;
+    uint32_t nl = md->n_layer;
+    for (uint32_t l = 0; l < nl; l++) {
+        const struct janas_gpu_tok_layer *ly = &layers[l];
+        if (seg >= 0 && seg != (int)l)
+            continue;
+        if (l == 0) {
+            janas_gt_rec_hc_combine(g, t, md, bound, B + t->o_x, 1, n);
+        } else {
+            janas_gt_rec_experts(g, t, md, &layers[l - 1], bound, YD, n);
+            janas_gt_rec_hc_combine(g, t, md, bound, YD, 0, n);
+        }
+        if (l == md->ng_layer && janas_gt_rec_ng(g, t, md, ly, bound, n) != 0)
+            return -1;
+        janas_gt_rec_hc_mix(g, t, md, ly, 0, bound, XNF, n);
+        janas_gt_stamp(g, t, PH_NORM);
+        if (ly->rec) {
+            if (janas_gt_rec_gdn(g, t, md, ly, l, bound, YWO, n) != 0)
+                return -1;
+        } else {
+            if (md->att_in) {
+                VkDeviceAddress A = janas_gt_addr_of(
+                    g, md->att_in, (size_t)(ly->slot + 1) * t->nb * md->dm * 4);
+                if (!A)
+                    return -1;
+                struct push_ha pa = {.n = n * md->dm, .silu = 0};
+                janas_g_push_addr(pa.x, XNF);
+                janas_g_push_addr(pa.xb, A + (VkDeviceAddress)ly->slot * t->nb *
+                                                 md->dm * 4);
+                janas_gt_bind(g, bound, t->p_ha);
+                janas_gt_push(g, &pa, sizeof(pa));
+                g->vkCmdDispatch(g->cb, (pa.n + 255) / 256, 1, 1);
+                janas_g_compute_barrier(g);
+                /* the sparse attention's positions, from that input */
+                if (md->ix_heads &&
+                    janas_gt_rec_qsa(g, t, md, ly, bound,
+                                     A + (VkDeviceAddress)ly->slot * t->nb *
+                                             md->dm * 4,
+                                     n) != 0)
+                    return -1;
+            }
+            if (janas_gt_rec_attn(g, t, md, ly, bound, n) != 0)
+                return -1;
+        }
+        janas_gt_rec_hc_combine(g, t, md, bound, YWO, 0, n);
+        janas_gt_rec_hc_mix(g, t, md, ly, 1, bound, XNF, n);
+        janas_gt_stamp(g, t, PH_NORM);
+        if (janas_gt_rec_router(g, t, md, ly, l, bound, n) != 0)
+            return -1;
+    }
+    if (seg < 0 || seg == (int)nl) {
+        janas_gt_rec_experts(g, t, md, &layers[nl - 1], bound, YD, n);
+        janas_gt_rec_hc_combine(g, t, md, bound, YD, 0, n);
+        /* the streams themselves are the hidden states (an MTP block's
+           input): run copies them from o_res */
+        (void)hid;
+        if (first < n) {
+            janas_gt_rec_hc_mix(g, t, md, NULL, 2, bound, XNF, n);
+            if (janas_gt_rec_product(g, t, bound, output,
+                                     (size_t)first * (md->dm / JANAS_QK) * 320,
+                                     B + t->o_logits, n - first, 0) != 0)
+                return -1;
+        }
+        janas_gt_stamp(g, t, PH_OUT);
+    }
+    return 0;
+}
+
 /* The commands of a block of n tokens into g->cb (the caller points it at
    the block's buffer): every layer, then the output head for the tokens
    from first on (none if first is n); the position of the first token
@@ -543,6 +760,12 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
         janas_gt_stamp(g, t, PH_N); /* the start */
     }
     uint32_t nl = md->n_layer;
+    if (md->hc) {
+        if (record_hc(g, t, md, layers, output, n, first, hid, seg, &bound) !=
+            0)
+            return -1;
+        nl = 0; /* nothing more of the loops below */
+    }
     for (uint32_t l = 0; l < nl; l++) {
         const struct janas_gpu_tok_layer *ly = &layers[l];
         int on = seg < 0 || seg == (int)l;
@@ -579,7 +802,7 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
     /* the last feed-forward added, the final norm, the output head for
        tokens first .. n - 1 (none: the residual left in X, the next block's
        keys and values already in the cache) */
-    if (seg < 0 || seg == (int)nl) {
+    if (!md->hc && (seg < 0 || seg == (int)nl)) {
         if (md->n_expert)
             janas_gt_rec_experts(g, t, md, &layers[nl - 1], &bound, YD, n);
         if (first < n || hid) {
@@ -692,6 +915,17 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
         return -1;
     uint32_t half = md->n_rot / 2, first = all == 1 ? 0 : all == 2 ? n : n - 1;
     memcpy(t->buf.map + t->o_x, x, (size_t)n * md->dm * sizeof(float));
+    if (md->hc && md->ng_layer < md->n_layer) {
+        memcpy(t->buf.map + t->o_ngemb, md->ng_emb,
+               (size_t)n * md->dm * sizeof(float));
+        janas_gt_sync_range(g, t, t->o_ngemb,
+                            (size_t)n * md->dm * sizeof(float), 1);
+    }
+    if (md->ix_heads) {
+        size_t rb = ((size_t)n + n / md->ix_ratio + 2) * md->n_rot * 4;
+        memcpy(t->buf.map + t->o_ixrope, md->ix_rope, rb);
+        janas_gt_sync_range(g, t, t->o_ixrope, rb, 1);
+    }
     for (uint32_t j = 0; j < n; j++) {
         uint8_t *r = t->buf.map + t->o_rope + (size_t)j * md->n_rot * 4;
         memcpy(r, cs + (size_t)j * half, half * sizeof(float));
@@ -738,9 +972,11 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
         memcpy(logits, t->buf.map + t->o_logits, lb);
     }
     if (hidden) {
-        size_t hb = (size_t)n * md->dm * 4;
-        janas_gt_sync_range(g, t, t->o_hid, hb, 0);
-        memcpy(hidden, t->buf.map + t->o_hid, hb);
+        /* qwen4exp's: the streams after the last layer, hc dm a token */
+        size_t hb = (size_t)n * (md->hc ? md->hc : 1) * md->dm * 4,
+               ho = md->hc ? t->o_res : t->o_hid;
+        janas_gt_sync_range(g, t, ho, hb, 0);
+        memcpy(hidden, t->buf.map + ho, hb);
     }
     struct timespec w2;
     clock_gettime(CLOCK_MONOTONIC, &w2);
