@@ -1,0 +1,37 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's n-gram embeddings, their conv (model_hc.c conv_worker): for
+// channel e of token j at position p = pos + j (pos the position buffer's
+// word 0), the causal conv over the ring hist (cap rows of hc x d), kernel
+// k taps, tap i reading (k - 1 - i) * len positions back (zero before the
+// start), its SiLU, and the stream += the gated value (gv) + that. The
+// taps channel-major: w[e * k + i]. A thread per channel (x) and token (y).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer W { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
+
+layout(push_constant) uniform P { uvec2 res, gv, w, hist, pos; uint hd, cap, k, len; } p;
+
+void main()
+{
+    uint e = gl_GlobalInvocationID.x, j = gl_WorkGroupID.y;
+    if (e >= p.hd)
+        return;
+    uint pp = RP(p.pos).v[0] + j;
+    F H = F(p.hist), Wt = F(p.w);
+    float acc = 0.0;
+    for (uint i = 0u; i < p.k; i++) {
+        uint back = (p.k - 1u - i) * p.len;
+        float term = pp >= back ? Wt.v[e * p.k + i] * H.v[((pp - back) % p.cap) * p.hd + e] : 0.0;
+        acc = i == 0u ? term : acc + term;
+    }
+    float silu = acc / (1.0 + exp(-acc));
+    W S = W(p.res);
+    S.v[j * p.hd + e] += F(p.gv).v[j * p.hd + e] + silu;
+}

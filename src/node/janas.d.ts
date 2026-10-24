@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Maurizio Cammalleri
+/**
+ * janas.node - Janas-LLM in Node.js: a model opened inside the process, its
+ * replies read as they are written. Built by build.sh beside the programs
+ * (bin/x86_64-linux/janas.node), Linux for now. It speaks Node-API version
+ * 8, which Node has had since 12.22; it was tried with Node 20.
+ *
+ * It is a native module: load it with require, in an ES module through
+ * createRequire, and take its types from this file:
+ *
+ *     import { createRequire } from "node:module";
+ *     import type * as Janas from "./janas.js";
+ *     const janas = createRequire(import.meta.url)("./janas.node") as typeof Janas;
+ *
+ *     const model = await janas.open("qwen3-4b-q4km.jns");
+ *     const chat = await model.chat({ thinking: false });
+ *     for await (const piece of chat.send("Hello!"))
+ *         if (piece.type === "text") process.stdout.write(piece.text);
+ *     await model.close();
+ *
+ * Each model runs on a thread of its own, so JavaScript's thread never waits
+ * for it. A model holds one conversation: replies asked for while another is
+ * written wait for it, in the order they were asked. Wrong arguments throw a
+ * TypeError at once; what fails in the engine rejects the promise, or the
+ * reply's iteration, with a JanasError. An idle model does not keep Node
+ * running; one left open is closed when Node leaves.
+ *
+ * The engine's environment variables (JANAS_GPU, JANAS_NPU, JANAS_PROMPT_ON
+ * and the others of docs/chat.md) apply as in the programs, read when a model
+ * opens.
+ */
+
+/** The build of Janas it was made from (`git describe`). */
+export declare const version: string;
+
+/** The version of the library's ABI (JANAS_LLM_ABI_VERSION, 1). */
+export declare function abiVersion(): number;
+
+/**
+ * Opens a model file (.jns): the weights stay on disk, the experts are
+ * streamed from it and the most used kept in memory. Opening takes seconds:
+ * the expert cache is set up, and the engine reads what it learnt of this
+ * machine.
+ */
+export declare function open(path: string, options?: OpenOptions): Promise<Model>;
+
+export interface OpenOptions {
+    /** Context, in tokens (16384). */
+    context?: number;
+    /** Memory for the expert cache, GiB; 0 or absent: the free memory, less a margin. */
+    cacheGiB?: number;
+    /** Memory left to other programs when the cache takes the rest, GiB (a fifth of the machine's, 2 at least). */
+    reserveGiB?: number;
+    /** The model's multi-token prediction block, for faster replies: its path, or true to look beside the model. */
+    mtp?: string | boolean;
+    /** A small model of the same family that guesses the next tokens (Qwen3-0.6B for Qwen3-4B). */
+    draft?: string;
+    /** "auto" (default: max on mains power, eco on battery), "eco" (no GPU where it would only buy speed with power), "max". */
+    mode?: "auto" | "eco" | "max";
+    /** false: never give the GPU work. */
+    gpu?: boolean;
+    /** false: do not fill the expert cache, as the model opens, with the experts this machine used most. */
+    preload?: boolean;
+    /** Bits of the experts' down matrix read, for files that hold it in planes: 2, 4 or 6 (all of it). */
+    expertBits?: 2 | 4 | 6;
+    /** 4: the output head read at four bits (a few per cent faster, answers a little further from the weights). */
+    headBits?: 4 | 6;
+    /** How the attention scores are computed: "exact", "fast" (sixteen-bit integers), "auto". */
+    attention?: "auto" | "exact" | "fast";
+}
+
+/** An open model. */
+export declare class Model {
+    private constructor();
+    readonly path: string;
+    /** The name in its metadata ("Qwen3 4B"), empty if it has none. */
+    readonly name: string;
+    /** How it is made ("qwen3, 36 layers, ..."). */
+    readonly description: string;
+    /** The system message Janas's programs give it: its name is Janas, and it says which model it thinks with. */
+    readonly defaultSystem: string;
+    /** Whether it reasons before replying and can be told not to (ChatOptions.thinking). */
+    readonly reasons: boolean;
+    /** The MTP block opened with it, or false. */
+    readonly mtp: string | false;
+    /** Its conversation: one at a time per model (close it before asking another). */
+    chat(options?: ChatOptions): Promise<Chat>;
+    /** How its preparations go, without waiting for the engine: the expert cache filling, the NPU made ready. */
+    status(): ModelStatus;
+    /** Stops its replies, and closes it; called again, it waits for the same close. */
+    close(): Promise<void>;
+}
+
+export interface ModelStatus {
+    open: boolean;
+    /** a job is posted and not done: opening, a reply, a close */
+    busy: boolean;
+    /** the expert cache filled from this machine's profile: done of total experts */
+    preload: { done: number; total: number };
+    /** the NPU made ready (the first prompts of a session wait for it): graphs done of total, seconds */
+    npu: { preparing: boolean; done: number; total: number; seconds: number };
+}
+
+/** The parameters of a conversation, from the next reply on. */
+export interface ChatOptions {
+    /** The system message; only before the first message (or after reset). */
+    system?: string;
+    /** 0: always the most likely token (0.7). */
+    temperature?: number;
+    /** 0: no limit (20). */
+    topK?: number;
+    /** (0.8) */
+    topP?: number;
+    /** (0) */
+    minP?: number;
+    /** 0: a new one each chat (default). */
+    seed?: number;
+    /** Draft tokens ahead when it pays: the same text, sooner (true). */
+    speculate?: boolean;
+    /** Tokens of a reply, its reasoning included; 0: no limit. */
+    maxReply?: number;
+    /** Tokens of the answer, the reasoning not counted; 0: no limit. */
+    maxAnswer?: number;
+    /** Tokens of the reasoning, closed by the engine past them; 0: no limit. */
+    maxReasoning?: number;
+    /** The longest prompt, in tokens: a longer one fails with ELIMIT, nothing cut; 0: the context. */
+    maxInput?: number;
+    /** Reasoning before the reply, for the models that do it: true, false, or null for the model's own way. */
+    thinking?: boolean | null;
+    /** When the context fills, a recap of the oldest exchanges stays in it (true). */
+    recap?: boolean;
+    presencePenalty?: number;
+    frequencyPenalty?: number;
+    /** Conversations kept computed besides the current one, for load() switching between several (0). */
+    keep?: number;
+}
+
+export type Role = "system" | "user" | "assistant" | "tool";
+
+export interface Message {
+    role: Role;
+    content: string;
+}
+
+/** A model's conversation. */
+export declare class Chat {
+    private constructor();
+    /** A user message, in the conversation kept here; the reply follows. */
+    send(text: string, options?: ReplyOptions): Reply;
+    /**
+     * A whole conversation, as an HTTP client keeps it (only the first may be
+     * the system's; the last is the user's): what it shares with the one
+     * already computed is not read again.
+     */
+    load(messages: readonly Message[], options?: ReplyOptions): Reply;
+    /** New parameters, from the next reply on (and the system message, before the first). */
+    set(options: ChatOptions): Promise<void>;
+    /** Forgets the conversation, and the system message. */
+    reset(): Promise<void>;
+    /** Stops its replies and ends it: the model may have another. */
+    close(): Promise<void>;
+}
+
+export interface ReplyOptions {
+    /** Stops the reply when it aborts (the client of a request gone). */
+    signal?: AbortSignal;
+}
+
+/** A piece of the reply's text: the model's reasoning, or its answer. */
+export interface TextPiece {
+    readonly type: "text";
+    readonly text: string;
+    readonly reasoning: boolean;
+}
+
+/** How much of the prompt is read: one at each block of it. */
+export interface ProgressPiece {
+    readonly type: "progress";
+    readonly read: number;
+    readonly total: number;
+}
+
+export type Piece = TextPiece | ProgressPiece;
+
+/**
+ * A reply, as the model writes it: read it with for await, or whole with
+ * text(). Leaving the loop early (break, return, an exception) stops it.
+ */
+export declare class Reply implements AsyncIterable<Piece> {
+    private constructor();
+    next(): Promise<IteratorResult<Piece, undefined>>;
+    return(value?: unknown): Promise<IteratorResult<Piece, undefined>>;
+    [Symbol.asyncIterator](): Reply;
+    /** Stops it where it is; the pieces already written can still be read. */
+    stop(): void;
+    /** The answer, its reasoning left out, once the reply is over; the pieces go to it from then on. */
+    text(): Promise<string>;
+    /** Its counters, once it is over. */
+    stats(): Promise<ReplyStats>;
+}
+
+export interface ReplyStats {
+    /** why it ended: the model ended it, max tokens, the context full, an error, tool calls, stop() or an abort */
+    finish: "stop" | "length" | "context" | "error" | "tools" | "stopped" | null;
+    /** the whole prompt, of which cachedTokens already computed; inputTokens read for this reply */
+    promptTokens: number;
+    cachedTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+    contextUsed: number;
+    contextSize: number;
+    /** draft tokens guessed, and kept */
+    drafted: number;
+    accepted: number;
+    /** seconds reading the prompt, writing the reply, in all, to the first token */
+    inputSeconds: number;
+    outputSeconds: number;
+    totalSeconds: number;
+    firstTokenSeconds: number;
+    /** the threads the engine chose for reading and for writing */
+    inputThreads: number;
+    outputThreads: number;
+    /** the routed experts used, read from the disk, the bytes read, the time waiting for them */
+    expertsUsed: number;
+    expertsRead: number;
+    bytesRead: number;
+    ioWaitSeconds: number;
+    peakRssBytes: number;
+    /** maxReasoning closed the reasoning, not the model */
+    reasoningCut: boolean;
+}
+
+/** The error a promise or a reply rejects with when the engine fails: its code is
+    the suffix of the library's JANAS_LLM_E... (EOPEN for JANAS_LLM_EOPEN), and
+    ECLOSED for a model or a chat closed. */
+export interface JanasError extends Error {
+    code:
+        | "EINVAL"
+        | "ENOMEM"
+        | "EOPEN"
+        | "EMODEL"
+        | "EFULL"
+        | "EBUSY"
+        | "ESMALL"
+        | "EFAIL"
+        | "ELIMIT"
+        | "ECLOSED";
+}

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/aligned.h"
 #include "expert_cache.h"
 #include "gpu.h"
 #include "gpu_token.h"
@@ -34,10 +35,32 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
     /* qwen3.5: its recurrent layers and gated queries; an MTP block or a
        drafting model gets the final hidden states */
     int q35 = m->a->rec == JANAS_REC_Q35 && m->a->attn_gate;
+    /* qwen4exp: qwen3.5's layers inside its streams (model_hc.c), with its
+       mixes in bf16 as the file has them, or their down and up rewritten
+       as Q8_0 (JANAS_HC_MIX=q8) */
     if ((m->a->rec && !q35) || (m->a->attn_gate && !q35) || m->a->swa ||
         m->a->sandwich || m->a->gelu || m->kv16 || m->softcap > 0.0f ||
         m->ple_dim)
         return "an architecture the token's shaders do not take yet";
+    if (m->a->hc) {
+        int mt = m->hc_quant[0] ? JANAS_Q8_0 : 30; /* down and up's */
+        for (uint32_t l = 0; l <= m->n_layer; l++)
+            for (int k = 0; k < (l < m->n_layer ? 2 : 1); k++) {
+                const struct layer *ly = l < m->n_layer ? &m->layers[l] : NULL;
+                const struct janas_jns_tensor *t[3] = {
+                    ly ? ly->hc_down[k] : m->hco_down,
+                    ly ? ly->hc_up[k] : m->hco_up,
+                    ly ? ly->hc_inject[k] : NULL};
+                for (int i = 0; i < 3; i++)
+                    if ((i < 2 || ly) &&
+                        (!t[i] || (int)t[i]->type != (i < 2 ? mt : 30)))
+                        return "mixes of the streams of a type the GPU does "
+                               "not take";
+            }
+        if (m->ng_layer < m->n_layer &&
+            m->layers[m->ng_layer].ng_value->type != 30)
+            return "n-gram values not in bf16";
+    }
     if (!m->cache)
         return "no feed-forward weights";
     if (m->n_expert > 1) {
@@ -242,14 +265,13 @@ static int repack(struct janas_llm_model *m, int tiles)
 }
 
 /* A mixture's experts for the GPU (gpu_token.h fetch): read into the cache
-   if they are not in it. */
+   if they are not in it - more than 256 too (a block of 256 tokens of prose
+   asked qwen4exp's first layer for 368 of its 512) */
 static int gtok_fetch(void *ctx, uint32_t layer, const uint32_t *ids, size_t n,
                       const uint8_t **slots)
 {
     struct janas_llm_model *m = ctx;
-    if (n > janas_expert_cache_slots(m->cache))
-        return -1;
-    return janas_expert_cache_fetch(m->cache, layer, ids, n, slots);
+    return janas_expert_cache_fetch_many(m->cache, layer, ids, n, slots);
 }
 
 /* ... and the router's choice, for those who watch it and for the counts
@@ -280,6 +302,82 @@ static void gtok_prefetch(void *ctx, uint32_t layer)
     for (uint32_t e = 0; e < m->n_expert; e++)
         ids[e] = e;
     janas_expert_cache_prefetch(m->cache, layer, ids, m->n_expert, m->n_expert);
+}
+
+/* qwen4exp's streams for the GPU: the mixes, the n-gram layer (its ring
+   imported once), the attention's inputs for the indexer (allocated and
+   imported once). 0, or -1. */
+static int hc_build(struct janas_llm_model *m, char *err, size_t len)
+{
+    struct janas_gpu_tok_model *md = &m->gtok_md;
+    size_t hd = (size_t)m->hc_n * m->d_model;
+    md->hc = m->hc_n;
+    md->hc_rank = m->hc_rank;
+    md->hc_q8 = m->hc_quant[0] != 0;
+    md->hco_norm = f32(m, m->hco_norm);
+    md->hco_down = data(m, m->hco_down);
+    md->hco_up = data(m, m->hco_up);
+    if (m->ng_layer < m->n_layer) {
+        size_t hb = ((size_t)m->ng_cap * hd * 4 + 4095) & ~(size_t)4095;
+        if (!m->gtok_ng_in) {
+            if (janas_gpu_import(m->gpu, m->ng_hist, hb) != 0) {
+                snprintf(err, len, "the n-gram ring cannot be imported");
+                return -1;
+            }
+            m->gtok_ng_in = 1;
+        }
+        md->ng_layer = m->ng_layer;
+        md->ng_kernel = m->ng_kernel;
+        md->ng_len = m->ng_len;
+        md->ng_cap = m->ng_cap;
+        md->ng_hist = m->ng_hist;
+        md->ng_emb = m->ng_emb;
+    }
+    if (m->ix_heads && m->n_attn) {
+        size_t ab =
+            ((size_t)m->n_attn * JANAS_GPU_TOK_BLOCK * m->d_model * 4 + 4095) &
+            ~(size_t)4095;
+        if (!m->gtok_att_in) {
+            m->gtok_att_in = janas_aligned_alloc(4096, ab);
+            if (!m->gtok_att_in ||
+                janas_gpu_import(m->gpu, m->gtok_att_in, ab) != 0) {
+                janas_aligned_free(m->gtok_att_in);
+                m->gtok_att_in = NULL;
+                snprintf(err, len, "no room for the indexer's inputs");
+                return -1;
+            }
+        }
+        md->att_in = m->gtok_att_in;
+        /* the sparse attention on the GPU: the indexer's keys where it
+           reads them, the cos and sin of a piece's positions */
+        uint32_t r = m->ix_ratio, d = m->ix_dim;
+        size_t nbk = (m->n_ctx + r - 1) / r,
+               rb = ((size_t)m->n_attn * m->n_ctx * d * 2 + 4095) &
+                    ~(size_t)4095,
+               pb = ((size_t)m->n_attn * nbk * d * 4 + 4095) & ~(size_t)4095;
+        if (!m->gtok_ix_in) {
+            if (janas_gpu_import(m->gpu, m->ix_raw, rb) != 0 ||
+                janas_gpu_import(m->gpu, m->ix_pool, pb) != 0) {
+                snprintf(err, len, "the indexer's keys cannot be imported");
+                return -1;
+            }
+            m->gtok_ix_in = 1;
+        }
+        if (!m->gtok_ix_rope)
+            m->gtok_ix_rope = malloc(
+                ((size_t)JANAS_GPU_TOK_BLOCK + JANAS_GPU_TOK_BLOCK / r + 2) *
+                m->n_rot * sizeof(float));
+        if (!m->gtok_ix_rope) {
+            snprintf(err, len, "out of memory");
+            return -1;
+        }
+        md->ix_heads = m->ix_heads;
+        md->ix_dim = d;
+        md->ix_top = m->ix_top;
+        md->ix_ratio = r;
+        md->ix_rope = m->gtok_ix_rope;
+    }
+    return 0;
 }
 
 /* The layers described for the GPU, the KV cache imported: 0, or -1. */
@@ -316,8 +414,25 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             snprintf(err, len, "the feed-forward of layer %u unreadable", l);
             return -1;
         }
-        g->attn_norm = f32(m, ly->attn_norm);
-        g->ffn_norm = f32(m, ly->ffn_norm);
+        if (!m->a->hc) {
+            g->attn_norm = f32(m, ly->attn_norm);
+            g->ffn_norm = f32(m, ly->ffn_norm);
+        } else {
+            for (int k = 0; k < 2; k++) {
+                g->hc_norm[k] = f32(m, ly->hc_norm[k]);
+                g->hc_down[k] = data(m, ly->hc_down[k]);
+                g->hc_up[k] = data(m, ly->hc_up[k]);
+                g->hc_inject[k] = data(m, ly->hc_inject[k]);
+            }
+            if (l == m->ng_layer) {
+                g->ng_key = task_of(m, ly->ng_key, m->hc_n * dm, dm);
+                g->ng_value = data(m, ly->ng_value);
+                g->ng_nk = f32(m, ly->ng_nkey);
+                g->ng_nq = f32(m, ly->ng_nquery);
+                g->ng_nc = f32(m, ly->ng_nconv);
+                g->ng_conv = ly->ng_conv;
+            }
+        }
         if (ly->rec) {
             g->rec = 1;
             g->slot = ly->slot;
@@ -331,12 +446,22 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             g->ssm_a = f32(m, ly->ssm_a);
             g->ssm_norm = f32(m, ly->ssm_norm);
         } else {
+            g->slot = ly->slot; /* its KV slot: att_in's row (qwen4exp) */
             g->q_norm = f32(m, ly->q_norm);
             g->k_norm = f32(m, ly->k_norm);
             g->wq = task_of(m, ly->wq, m->a->attn_gate ? 2 * qd : qd, dm);
             g->wk = task_of(m, ly->wk, kvd, dm);
             g->wv = task_of(m, ly->wv, kvd, dm);
             g->wo = task_of(m, ly->wo, dm, qd);
+            if (m->ix_heads && ly->ix_q) {
+                size_t nbk = (m->n_ctx + m->ix_ratio - 1) / m->ix_ratio;
+                g->ix_q = data(m, ly->ix_q);
+                g->ix_k = data(m, ly->ix_k);
+                g->ix_qn = f32(m, ly->ix_qn);
+                g->ix_kn = f32(m, ly->ix_kn);
+                g->ix_raw = m->ix_raw + (size_t)ly->slot * m->n_ctx * m->ix_dim;
+                g->ix_pool = m->ix_pool + (size_t)ly->slot * nbk * m->ix_dim;
+            }
         }
         for (int p = 0; p < 3; p++) {
             const struct janas_jns_matrix *mx = &jl->m[p];
@@ -413,7 +538,7 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         .eps = m->eps,
         .attn_scale = 1.0f / sqrtf((float)hd),
         .layers = m->gtok_layers,
-        .out_norm = f32(m, m->out_norm),
+        .out_norm = m->a->hc ? NULL : f32(m, m->out_norm),
         .output = task_of(m, m->output, m->n_vocab, dm),
         .gated_q = m->a->attn_gate,
         .n_rec = m->a->rec ? m->n_rec : 0,
@@ -438,7 +563,10 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         .prefetch = moe && janas_expert_cache_can_prefetch(m->cache)
                         ? gtok_prefetch
                         : NULL,
-        .ctx = m};
+        .ctx = m,
+        .ng_layer = m->n_layer};
+    if (m->a->hc && hc_build(m, err, len) != 0)
+        return -1;
     free(m->gblk_layers);
     m->gblk_layers = NULL;
     if (!moe && getenv("JANAS_GPU_REPACK") &&
@@ -516,8 +644,8 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         tok = e && atoi(e) > 0;
         blocks = b ? atoi(b) > 0 : -1; /* -1: not said */
     }
-    int prompt =
-        janas_gpu_fast_prompt() && n >= JANAS_GPU_FAST_N && blocks != 0;
+    int prompt = janas_gpu_fast_prompt() && !m->prompts_off_gpu &&
+                 n >= JANAS_GPU_FAST_N && blocks != 0;
     /* A short pass (a chain of drafts to verify) where the tuner chose the
        GPU for it: the whole pass in one submission, the CPU idle, rather
        than the products by groups beside the CPU - on the development
@@ -582,11 +710,18 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
     uint32_t src = m->src, dst = 1 - m->src, rows = m->a->rec ? m->d_conv : 1;
     int logged = m->a->rec && n <= JANAS_LLM_MAX_BLOCK;
     float *hid = m->mtp || m->asst ? m->hid : NULL;
+    size_t hw = (size_t)(m->hc_n ? m->hc_n : 1) * m->d_model; /* hidden's */
+    /* qwen4exp's n-gram embeddings: the block's rows of the table */
+    if (m->hc_n && janas_m_hc_ng_begin(m, m->gtok_tokens, n, pos) != 0)
+        return -1;
     for (uint32_t j = 0, k; j < n; j += k) {
         uint32_t nb = janas_gpu_tok_block_at(m->gtok, &m->gtok_md, pos + j);
         k = n - j < nb ? n - j : nb;
         if (n - j - k > 0 && n - j - k + 1 < rows)
             k -= rows; /* the last piece long enough */
+        m->gtok_md.ng_emb = m->ng_emb + (size_t)j * m->d_model;
+        if (m->gtok_md.ix_heads)
+            janas_m_qsa_rope(m, m->gtok_ix_rope, pos + j, k);
         int rc = janas_gpu_tok_run(
             m->gpu, m->gtok, &m->gtok_md, m->x + (size_t)j * m->d_model,
             m->rope_cos + (size_t)j * half, m->rope_sin + (size_t)j * half,
@@ -594,12 +729,31 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
             j + k < n ? 2
             : all     ? 1
                       : 0,
-            logits, hid ? hid + (size_t)j * m->d_model : NULL, j ? dst : src,
-            dst, j ? 0 : m->replay, logged ? j : UINT32_MAX);
+            logits, hid ? hid + (size_t)j * hw : NULL, j ? dst : src, dst,
+            j ? 0 : m->replay, logged ? j : UINT32_MAX);
         /* -2, or any failure after a first piece that replayed: the base
            was updated in place, the CPU cannot replay on it again */
-        if (rc != 0)
+        if (rc != 0) {
+            /* a block back to the CPU (its experts not all in the cache at
+               once, say): said where asked */
+            if (getenv("JANAS_GPU_VERBOSE"))
+                fprintf(stderr,
+                        "janas: the whole token on the GPU failed at position "
+                        "%u (%u tokens), the CPU's\n",
+                        pos + j, k);
             return rc == -2 || (j && m->replay) ? -2 : -1;
+        }
+        /* qwen4exp: the indexer's keys of the piece's positions, from each
+           attention layer's input the GPU kept */
+        for (uint32_t l = 0; m->gtok_att_in && l < m->n_layer; l++)
+            if (!m->layers[l].rec)
+                janas_m_qsa_keys(m, &m->layers[l],
+                                 m->gtok_att_in + (size_t)m->layers[l].slot *
+                                                      JANAS_GPU_TOK_BLOCK *
+                                                      m->d_model,
+                                 k, pos + j);
     }
+    if (m->hc_n)
+        m->ng_hi = pos + n;
     return 0;
 }

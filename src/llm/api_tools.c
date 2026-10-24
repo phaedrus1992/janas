@@ -141,8 +141,16 @@ int32_t janas_llm_chat_tool_choice(janas_llm_chat *c, int32_t choice,
             return janas_api_fail(JANAS_LLM_EINVAL, "no tool is called '%.*s'",
                                   (int)janas_api_text_len(name, len), name);
     }
+    size_t pn = 0;
+    if (choice == JANAS_LLM_TOOLS_REQUIRED && name) {
+        pn = janas_api_text_len(name, len);
+        if (pn >= sizeof c->tool_prefix)
+            return janas_api_fail(JANAS_LLM_EINVAL, "too long a name");
+        memcpy(c->tool_prefix, name, pn);
+    }
     c->tool_choice = choice;
     c->tool_only = only;
+    c->tool_prefix_n = pn;
     c->parallel = parallel != 0;
     return JANAS_LLM_OK;
 }
@@ -266,9 +274,11 @@ int janas_api_reply_setup(janas_llm_chat *c)
     int only = choice == JANAS_LLM_TOOLS_FUNCTION ? c->tool_only : -1;
     if (tools && choice != JANAS_LLM_TOOLS_NONE)
         call = llm->tools == JANAS_TOOLS_GEMMA
-                   ? janas_tools_rule_gemma(b, c->tools, only, llm->call_close,
+                   ? janas_tools_rule_gemma(b, c->tools, only, c->tool_prefix,
+                                            c->tool_prefix_n, llm->call_close,
                                             llm->quote)
                    : janas_tools_rule(b, j, llm->tools, c->tools, only,
+                                      c->tool_prefix, c->tool_prefix_n,
                                       llm->call_close);
     if (must) {
         answer = calls_rule(b, llm, call, c->parallel);

@@ -33,13 +33,17 @@ struct push_at {
     uint32_t n_head, n_kv, hd, cap, nch;
     float scale;
     uint32_t qs, ps;
-    uint32_t pos[2]; /* the position's buffer */
+    uint32_t pos[2];  /* the position's buffer */
+    uint32_t list[2]; /* qwen4exp's positions a token (ix_select.comp) */
+    uint32_t ls, pad;
 };
 struct push_am {
     uint32_t part[2], q256[2], q32[2];
     uint32_t hd, nch, ps, gs;
     uint32_t pos[2]; /* 8-byte aligned, as the GLSL block puts it */
     uint32_t gate[2];
+    uint32_t list[2]; /* as push_at's */
+    uint32_t ls, pad;
 };
 /* the Gated DeltaNet shaders (gdn_*.comp) */
 struct push_gconv {
@@ -73,6 +77,7 @@ struct push_ggate {
     uint32_t att[2], z[2], w[2], q256[2], q32[2], bd[2], lb[2], ld[2], pos[2];
     uint32_t d, nv;
     float eps;
+    uint32_t sig; /* sigmoid(z) in place of SiLU(z) (qwen4exp) */
 };
 struct push_dm { /* gpu.c's dense_mm.comp */
     uint32_t w[2], x[2], y[2];
@@ -95,17 +100,70 @@ struct push_cb {
 struct push_id {
     uint32_t t[2];
     uint32_t rows, nb, tiles;
+    uint32_t ngroups; /* b32_mmid.comp: the groups of 32 a row */
 };
 struct push_sm {
     uint32_t g[2], u[2], h[2];
     uint32_t n;
 };
+/* qwen4exp's mixes and n-gram embeddings (hc_*.comp, ng_*.comp) */
+struct push_hn {
+    uint32_t res[2], w[2], xn[2], xb[2];
+    uint32_t d, hc;
+    float eps;
+};
+struct push_ha {
+    uint32_t x[2], xb[2];
+    uint32_t n, silu;
+};
+struct push_hm {
+    uint32_t xn[2], g[2], out[2];
+    uint32_t d, hc;
+};
+struct push_hcb {
+    uint32_t res[2], out[2], inj[2];
+    uint32_t d, hc, init;
+};
+struct push_ngg {
+    uint32_t kq[2], res[2], val[2], nk[2], nq[2], nc[2], gv[2], hist[2], pos[2];
+    uint32_t d, hc, cap;
+    float eps;
+};
+struct push_ngc {
+    uint32_t res[2], gv[2], w[2], hist[2], pos[2];
+    uint32_t hd, cap, k, len;
+};
+/* qwen4exp's indexer (ix_*.comp, gpu_token_qsa.c) */
+struct push_ixp {
+    uint32_t q[2], k[2], qn[2], rope[2], raw[2], pos[2];
+    uint32_t nh, d, n_rot, qs;
+    float eps;
+};
+struct push_ixl {
+    uint32_t raw[2], kn[2], rope[2], pool[2], pos[2];
+    uint32_t d, r, n, n_rot, rb;
+    float eps;
+};
+struct push_ixs {
+    uint32_t q[2], pool[2], sc[2], pos[2];
+    uint32_t nh, d, r, keep, nbs, qs;
+};
+struct push_ixc {
+    uint32_t sc[2], list[2], pos[2];
+    uint32_t r, keep, nbs, ls;
+};
+_Static_assert(sizeof(struct push_ngg) <= JANAS_G_PUSH_BYTES, "push size");
+_Static_assert(sizeof(struct push_at) <= JANAS_G_PUSH_BYTES, "push size");
 /* The attention's positions a run (attn_decode.comp C), and the shapes its
    shared memory takes: the query heads of a KV head times hd, and times a
    run. */
 #define ATT_RUN 128
 #define ATT_MAXQ 2048
 #define ATT_MAXS 1024
+/* ... larger where a KV head has more than 8 query heads (attn_decode.comp
+   MAXQ, MAXS) */
+#define ATT_MAXQ_G(g) ((g) * 256u > ATT_MAXQ ? (g) * 256u : ATT_MAXQ)
+#define ATT_MAXS_G(g) ((g) * ATT_RUN > ATT_MAXS ? (g) * ATT_RUN : ATT_MAXS)
 
 struct push_ac {
     uint32_t g[2], u[2], x[2];
@@ -127,7 +185,7 @@ _Static_assert(sizeof(struct push_cb) <= JANAS_G_PUSH_BYTES, "push size");
 /* The most tokens a block takes (the model's own blocks: model.h
    JANAS_LLM_MAX_BLOCK), and the memory the attention's runs may take for
    them. */
-#define TOK_MAX_BLOCK 256
+#define TOK_MAX_BLOCK JANAS_GPU_TOK_BLOCK
 #define TOK_PART_BUDGET ((size_t)64 << 20)
 
 /* JANAS_GPU_TOKEN_PROFILE=1: the GPU's own timestamps after each phase of
@@ -219,6 +277,26 @@ struct janas_gpu_tok {
        slots */
     uint32_t *cnt, *fill, *ids;
     const uint8_t **slots;
+    /* the feed-forwards' widths padded to whole groups of 256: the
+       experts' (effp) and the shared expert's or dense one's (ffp) */
+    uint32_t effp, ffp;
+    /* qwen4exp: the streams (hc dm a token), each normalized and at bf16,
+       the mixes' low rank and its bf16, their gates, injects and means;
+       the n-gram layer's key products, values, the embeddings at bf16 and
+       the gated values; their shaders (gpu_token_hc.c) */
+    size_t o_res, o_hxn, o_hxb, o_lo, o_lob, o_hg, o_inj, o_hmean, o_ngk, o_ngv,
+        o_ngeb, o_nggv, o_ngemb, o_ngw;
+    VkShaderModule sm_hn, sm_ha, sm_hm, sm_hcb, sm_ngg, sm_ngc;
+    VkPipeline p_hn, p_ha, p_hm, p_hcb, p_ngg, p_ngc;
+    /* qwen4exp's indexer: the block's queries and keys, the cos and sin of
+       the tokens' positions and the blocks' (the caller's), the scores of
+       every block for each token (nbs a token), the positions each attends
+       to (ls words a token), the runs that take them; its shaders
+       (gpu_token_qsa.c) */
+    size_t o_ixq, o_ixk, o_ixrope, o_ixsc, o_ixlist;
+    uint32_t ix_nbs, ix_ls, ix_runs;
+    VkShaderModule sm_ixp, sm_ixl, sm_ixs, sm_ixc;
+    VkPipeline p_ixp, p_ixl, p_ixs, p_ixc;
 };
 
 /* A recurrent layer's parameters copied into buf: beta then alpha (2 nv x
@@ -268,6 +346,50 @@ int janas_gt_rec_ffn(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_matvec_task *up,
                      const struct janas_matvec_task *down, uint32_t n,
                      VkDeviceAddress out);
+
+/* gpu_token_hc.c: qwen4exp's streams. A mix (k 0 before the token mixer,
+   1 before the feed-forward, 2 the output's) of the streams into the
+   sublayer's input, quantized in q256 / q32 and as floats in xnf, its
+   inject (none for the output's) into o_inj; a combine of the sublayer's
+   output (out) into the streams; the n-gram layer; the streams set to the
+   embeddings at x. */
+void janas_gt_rec_hc_mix(struct janas_gpu *g, struct janas_gpu_tok *t,
+                         const struct janas_gpu_tok_model *md,
+                         const struct janas_gpu_tok_layer *ly, int k,
+                         VkPipeline *bound, VkDeviceAddress xnf, uint32_t n);
+void janas_gt_rec_hc_combine(struct janas_gpu *g, struct janas_gpu_tok *t,
+                             const struct janas_gpu_tok_model *md,
+                             VkPipeline *bound, VkDeviceAddress out, int init,
+                             uint32_t n);
+int janas_gt_rec_ng(struct janas_gpu *g, struct janas_gpu_tok *t,
+                    const struct janas_gpu_tok_model *md,
+                    const struct janas_gpu_tok_layer *ly, VkPipeline *bound,
+                    uint32_t n);
+int janas_gt_hc_create(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md);
+void janas_gt_hc_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
+/* y (n rows of ys) = scale w x (n rows of cols floats): w bf16, rows x
+   cols, in dense_mm.comp's tiles */
+void janas_gt_rec_bf16(struct janas_gpu *g, VkPipeline *bound,
+                       VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
+                       uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
+                       float scale);
+/* the same for w of dense_mm.comp's kind: 1 bf16, 2 Q8_0 */
+void janas_gt_rec_dense(struct janas_gpu *g, VkPipeline *bound, int kind,
+                        VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
+                        uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
+                        float scale);
+
+/* gpu_token_qsa.c: qwen4exp's indexer for an attention layer, on its input
+   at bf16 (xb, n rows of dm): the keys and queries, the blocks the block
+   completes, the scores and the positions each token attends to, which
+   janas_gt_rec_attn's runs then read */
+int janas_gt_rec_qsa(struct janas_gpu *g, struct janas_gpu_tok *t,
+                     const struct janas_gpu_tok_model *md,
+                     const struct janas_gpu_tok_layer *ly, VkPipeline *bound,
+                     VkDeviceAddress xb, uint32_t n);
+int janas_gt_qsa_create(struct janas_gpu *g, struct janas_gpu_tok *t);
+void janas_gt_qsa_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
 
 /* gpu_token_moe.c: a mixture's layers */
 int janas_gt_rec_router(struct janas_gpu *g, struct janas_gpu_tok *t,

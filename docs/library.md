@@ -1,6 +1,6 @@
 # Using it from a program
 
-The library is shaped for foreign-function interfaces from the start: opaque handles, fixed-width types, nothing passed by value that is not a number, parameter blocks that carry their own size, error codes as `int32`, and reply text returned on request as whole UTF-8 characters. It is declared for **C** and for **FreeBASIC**.
+The library is shaped for foreign-function interfaces from the start: opaque handles, fixed-width types, nothing passed by value that is not a number, parameter blocks that carry their own size, error codes as `int32`, and reply text returned on request as whole UTF-8 characters. It is declared for **C** and for **FreeBASIC**, and it is a module for **Node.js** too, with its types for TypeScript.
 
 ## From C
 
@@ -53,15 +53,61 @@ do
 loop
 ```
 
-[`tools/chat.bas`](../tools/chat.bas) is a whole chat in a hundred lines, sampling and counters included:
+[`examples/fb-chat/chat.bas`](../examples/fb-chat/chat.bas) is a whole chat in a hundred lines, sampling and counters included:
 
 ```sh
-fbc tools/chat.bas -i include -p bin/x86_64-linux -x janas-chat-fb
+fbc examples/fb-chat/chat.bas -i include -p bin/x86_64-linux -x janas-chat-fb
 LD_LIBRARY_PATH=bin/x86_64-linux ./janas-chat-fb qwen3-next.jns
 echo "Hello! Introduce yourself." | LD_LIBRARY_PATH=bin/x86_64-linux ./janas-chat-fb qwen3-next.jns
 ```
 
+[`include/janas/janas.bi`](../include/janas/janas.bi) takes the two libraries in one include: `llm.bi`, and `mcp.bi`, the MCP client's.
+
 Two things to know. FreeBASIC does not tell names apart by their case, so the constant the C header calls `JANAS_LLM_ABI_VERSION` is `JANAS_LLM_ABI` there — it would otherwise collide with the function `janas_llm_abi_version()`. And its `line input` reads the terminal, not the standard input: to work in a pipe too, `chat.bas` asks `isatty` and reads a pipe through the `CONS` device.
+
+### With objects, in FreeBASIC
+
+[`include/janas/janas_oop.bi`](../include/janas/janas_oop.bi) builds classes on the two libraries, for FreeBASIC (BASIC MODERN keeps to `llm.bi`): `Janas.Model` and `Janas.Chat`, their options (`Janas.OpenOptions`, `Janas.ChatOptions`), a reply's counters (`Janas.ReplyStats`), a conversation kept by the program (`Janas.Conversation`), a handler that receives a reply as it is written (`Janas.ReplyHandler`, and `Janas.Printer` ready made), and an MCP server's tools (`Janas.McpServer`). The same conversation:
+
+```basic
+#include once "janas/janas_oop.bi"
+
+dim as Janas.Model model = Janas.Model("qwen3-next.jns")
+if model.IsOpen = false then print model.ErrorText : end 1
+dim as Janas.Chat chat = Janas.Chat(model)
+if chat.Send("Hello! Introduce yourself.") then
+    dim as string piece
+    while chat.NextPiece(piece)
+        if chat.Reasoning = false then print piece;
+    wend
+end if
+```
+
+Or the reply whole, `print chat.Ask("Hello!")`, or through a handler: a type that extends `Janas.ReplyHandler` and overrides `OnPiece` (False stops the reply), `OnProgress` while a long prompt is read and `OnEnd` with the counters, which `chat.ReadReply(handler)` calls. The objects close what they hold when they go out of scope, and cannot be copied; a Chat lives on its Model, and closing the Model closes it too. Nothing raises an error: a method returns False, or an empty text, and the object says why in `ErrorCode` and `ErrorText`. The options are the library's own parameter blocks, so their fields have the C names, in any case: `options.Temperature = 0`, `options.max_reply = 400`. The bodies of the methods are in the same file: a program of one module includes it and is done; in a program of several, every module but one defines `JANAS_DECLARE_ONLY` before including it. [`examples/fb-chat/chat_oop.bas`](../examples/fb-chat/chat_oop.bas) is the chat of `chat.bas` with the classes.
+
+What has been run, with FreeBASIC 1.10.1: `tests/test_fb`, among the tests `./build.sh test` runs when it finds the compiler (`FBC`, or `fbc` in the PATH): every class without a model, the fake MCP server's tools listed and called, a program of two modules, and a Model that does not compile when copied; and `tests/fb_check` on Qwen3-0.6B: the replies through the classes the same text, byte for byte, as the library's own in C, read piece by piece, whole, through a handler, after a reset and in a new chat.
+
+## From Node.js
+
+`janas.node` is the library as a module for Node.js, made by `./build.sh` on Linux beside the programs (`bin/x86_64-linux/janas.node`), with its types for TypeScript beside it (`janas.d.ts`); the Linux package carries the two in `node/`. It is written in C against Node-API, version 8, whose functions it declares itself: building it needs nothing of Node's. It was tried with Node 20. Each model runs on a thread of its own, so JavaScript's thread never waits for it, and a reply is read as it is written:
+
+```ts
+import { createRequire } from "node:module";
+import type * as Janas from "./janas.js"; // janas.d.ts
+
+const janas = createRequire(import.meta.url)("./janas.node") as typeof Janas;
+const model = await janas.open("qwen3-next.jns", { context: 8192 });
+const chat = await model.chat({ thinking: false });
+for await (const piece of chat.send("Hello! Introduce yourself."))
+    if (piece.type === "text") process.stdout.write(piece.text);
+await model.close();
+```
+
+A piece is the model's text (`reasoning` says whether it is its reasoning or its answer), or, while a long prompt is read, how much of it is (`type: "progress"`, `read` of `total` tokens). `chat.load(messages)` takes a whole conversation, as a server gets it from its client; what it shares with the conversation already computed is not read again. A reply stops when the loop is left (`break`, `return`, an exception), with `reply.stop()`, or with an `AbortSignal` given as `{ signal }` - the client of a request gone. `reply.text()` gives the whole answer, its reasoning left out, and `reply.stats()` the counters (tokens, seconds, how much of the prompt was already read, why it ended). A model holds one conversation, and one chat: replies asked for while another is written wait for it, in order. `model.status()` says, without waiting for the engine, how the expert cache fills and the NPU is made ready. Wrong arguments throw a `TypeError` that names them; what fails in the engine rejects with an `Error` whose `code` says what (`EOPEN`, `EBUSY`, `EFULL`, ...: the suffixes of the library's `JANAS_LLM_E...`). An idle model does not keep Node running, and a model left open is closed when Node leaves.
+
+What has been run: `tests/test_node`, among the tests `./build.sh test` runs (the module without a model: its classes, its errors, engine threads started and ended), and `tests/node_check` on Qwen3-0.6B: the replies through Node the same text, byte for byte, as the library's own in C, streamed and read whole, after a reset and in a new chat; a reply stopped by leaving the loop, by a signal fired and by one aborted before; two replies asked at once; a prompt of several blocks; reasoning on and off; closing twice; a model left open when Node leaves. Both also under AddressSanitizer and ThreadSanitizer, the sanitizer's runtime preloaded into node. The module is not built for Windows yet.
+
+[`examples/node-chat`](../examples/node-chat/README.md) is a chat in TypeScript on it, server and page: the model inside the server's process, its replies streamed to the browser as they are written, the types of what goes between the two shared by both sides.
 
 ## MCP servers from a program
 
