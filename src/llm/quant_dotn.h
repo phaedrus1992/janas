@@ -68,12 +68,43 @@ DOTN(hsum128_epi32)(__m128i s)
 #ifndef PF_AHEAD
 #define PF_AHEAD 2048
 #endif
+#ifndef PF_GEMM_HINT
+#define PF_GEMM_HINT _MM_HINT_T0
+#endif
 static inline DOTN_TARGET __attribute__((always_inline)) void
 DOTN(prefetch_ahead)(const void *at, size_t size)
 {
     const char *p = (const char *)at + PF_AHEAD;
     for (size_t i = 0; i < size; i += 64)
         _mm_prefetch(p + i, _MM_HINT_T0);
+}
+
+/*
+ * The tiles' weights asked for ahead: after a chunk of eight rows is
+ * transposed, the next chunk's bytes (the same rows' next blocks, or the
+ * next eight rows' first ones) are fetched while this one's tiles compute.
+ * Without it the transposition waited for memory and the tiles left it idle
+ * in turn: 62% of the transposition's time on its loads (perf, Q4_K on 24
+ * vectors). gb is the bytes of a group of 256 weights, chunk the groups
+ * transposed at a time.
+ */
+static inline DOTN_TARGET __attribute__((always_inline)) void
+DOTN(gemm_ahead)(const void *w, size_t row_bytes, size_t gb, size_t g,
+                 size_t rows, size_t nb, size_t b0, size_t chunk)
+{
+    b0 += chunk;
+    if (b0 >= nb) {
+        b0 = 0;
+        g += 8;
+        if (g + 8 > rows)
+            return;
+    }
+    size_t len = (nb - b0 < chunk ? nb - b0 : chunk) * gb;
+    for (int j = 0; j < 8; j++) {
+        const char *p = (const char *)w + (g + j) * row_bytes + b0 * gb;
+        for (size_t i = 0; i < len; i += 64)
+            _mm_prefetch(p + i, PF_GEMM_HINT);
+    }
 }
 
 /*
@@ -796,7 +827,10 @@ K_MULTI_ROWS(q5k, struct janas_block_q5k)
 #ifndef Q4KG_DEFINED
 #define Q4KG_DEFINED
 #define Q4KG_CHUNK 16 /* blocks transposed at a time: 23 KB */
-#define Q4KG_TOK 64   /* tokens whose sums are held at a time */
+/* tokens whose sums are held at a time: a prompt's block of 256 at once,
+   its rows transposed once (with 64 four times: bench_kernels on 256
+   vectors, 12 threads, Q5_K 1.6 to 1.75 GB/s, IQ4_XS 1.25 to 1.45) */
+#define Q4KG_TOK 256
 struct q4kg_blk {
     uint32_t qs[4][8][8]; /* [piece][dword][row] */
     int16_t sc[8][16];    /* [sub-block][2 row + i]: its scale, twice */
@@ -869,20 +903,22 @@ DOTN(q4kg_fill)(const struct janas_block_q4k *const *w, size_t b0, int n,
         struct q4kg_blk *k = bk + i;
         for (int c = 0; c < 4; c++) {
             __m256i r[8], t[8], u[8];
-            for (int j = 0; j < 8; j++)
-                r[j] = _mm256_loadu_si256(
-                    (const __m256i *)(w[j][b0 + i].qs + 32 * c));
-            for (int j = 0; j < 8; j += 2) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++) r[j] =
+                _mm256_loadu_si256((const __m256i *)(w[j][b0 + i].qs + 32 * c));
+            _Pragma("GCC unroll 4") for (int j = 0; j < 8; j += 2)
+            {
                 t[j] = _mm256_unpacklo_epi32(r[j], r[j + 1]);
                 t[j + 1] = _mm256_unpackhi_epi32(r[j], r[j + 1]);
             }
-            for (int j = 0; j < 8; j += 4) {
+            _Pragma("GCC unroll 2") for (int j = 0; j < 8; j += 4)
+            {
                 u[j] = _mm256_unpacklo_epi64(t[j], t[j + 2]);
                 u[j + 1] = _mm256_unpackhi_epi64(t[j], t[j + 2]);
                 u[j + 2] = _mm256_unpacklo_epi64(t[j + 1], t[j + 3]);
                 u[j + 3] = _mm256_unpackhi_epi64(t[j + 1], t[j + 3]);
             }
-            for (int q = 0; q < 4; q++) {
+            _Pragma("GCC unroll 4") for (int q = 0; q < 4; q++)
+            {
                 _mm256_storeu_si256(
                     (__m256i *)k->qs[c][q],
                     _mm256_permute2x128_si256(u[q], u[q + 4], 0x20));
@@ -1028,6 +1064,8 @@ static DOTN_TARGET void DOTN(q4k_gemm)(const void *w, size_t row_bytes,
             for (size_t b0 = 0; b0 < nb; b0 += Q4KG_CHUNK) {
                 int n = nb - b0 < Q4KG_CHUNK ? (int)(nb - b0) : Q4KG_CHUNK;
                 DOTN(q4kg_fill)(wr, b0, n, bk);
+                DOTN(gemm_ahead)(w, row_bytes, sizeof(struct janas_block_q4k),
+                                 g, rows, nb, b0, Q4KG_CHUNK);
                 size_t t0 = 0;
                 for (; t0 + Q4KG_T <= nt; t0 += Q4KG_T)
                     DOTN(q4kg_tile)(bk, n, b0, x + (v0 + t0) * xs, xs,
@@ -1515,17 +1553,20 @@ static inline DOTN_TARGET __attribute__((always_inline)) void
 DOTN(gemm_t8)(__m256i r[8], uint32_t (*qs)[8])
 {
     __m256i t[8], u[8];
-    for (int j = 0; j < 8; j += 2) {
+    _Pragma("GCC unroll 4") for (int j = 0; j < 8; j += 2)
+    {
         t[j] = _mm256_unpacklo_epi32(r[j], r[j + 1]);
         t[j + 1] = _mm256_unpackhi_epi32(r[j], r[j + 1]);
     }
-    for (int j = 0; j < 8; j += 4) {
+    _Pragma("GCC unroll 2") for (int j = 0; j < 8; j += 4)
+    {
         u[j] = _mm256_unpacklo_epi64(t[j], t[j + 2]);
         u[j + 1] = _mm256_unpackhi_epi64(t[j], t[j + 2]);
         u[j + 2] = _mm256_unpacklo_epi64(t[j + 1], t[j + 3]);
         u[j + 3] = _mm256_unpackhi_epi64(t[j + 1], t[j + 3]);
     }
-    for (int q = 0; q < 4; q++) {
+    _Pragma("GCC unroll 4") for (int q = 0; q < 4; q++)
+    {
         _mm256_storeu_si256((__m256i *)qs[q],
                             _mm256_permute2x128_si256(u[q], u[q + 4], 0x20));
         _mm256_storeu_si256((__m256i *)qs[q + 4],
@@ -1603,7 +1644,8 @@ DOTN(q6kg_fill_q6k)(const struct janas_block_q6k *const *w, size_t b0, int n,
         struct q6kg_blk *k = bk + i;
         for (int hn = 0; hn < 2; hn++) {
             __m256i q[4][8];
-            for (int j = 0; j < 8; j++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+            {
                 const struct janas_block_q6k *bl = &w[j][b0 + i];
                 __m256i ql0 =
                     _mm256_loadu_si256((const __m256i *)(bl->ql + 64 * hn));
@@ -1631,7 +1673,8 @@ DOTN(q6kg_fill_q6k)(const struct janas_block_q6k *const *w, size_t b0, int n,
                 DOTN(gemm_t8)(q[part], k->qs + 8 * (4 * hn + part));
         }
         __m128i sc[8];
-        for (int j = 0; j < 8; j++) {
+        _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+        {
             sc[j] = _mm_loadu_si128((const __m128i *)w[j][b0 + i].scales);
             k->d[j] = _cvtsh_ss(w[j][b0 + i].d);
         }
@@ -1652,7 +1695,8 @@ DOTN(q6kg_fill_q6kp)(const struct janas_block_q6kp *const *w,
         size_t b = b0 + (size_t)i;
         for (int hn = 0; hn < 2; hn++) {
             __m256i q[4][8];
-            for (int j = 0; j < 8; j++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+            {
                 __m256i h =
                     _mm256_loadu_si256((const __m256i *)(w[j][b].q + 32 * hn));
                 __m256i m1 =
@@ -1684,7 +1728,8 @@ DOTN(q6kg_fill_q6kp)(const struct janas_block_q6kp *const *w,
                 DOTN(gemm_t8)(q[part], k->qs + 8 * (4 * hn + part));
         }
         __m128i sc[8];
-        for (int j = 0; j < 8; j++) {
+        _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+        {
             sc[j] = _mm_loadu_si128((const __m128i *)w[j][b].scales);
             k->d[j] = _cvtsh_ss(w[j][b].d) * 0.5f;
         }
@@ -1705,7 +1750,8 @@ DOTN(q6kg_fill_q3k)(const struct janas_block_q3k *const *w, size_t b0, int n,
         for (int kk = 0; kk < 8; kk++) {
             const int hn = kk / 4, j = kk % 4;
             __m256i u[8];
-            for (int r = 0; r < 8; r++) {
+            _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+            {
                 __m256i qs =
                     _mm256_loadu_si256((const __m256i *)(w[r][b].qs + 32 * hn));
                 __m256i hm = _mm256_loadu_si256((const __m256i *)w[r][b].hmask);
@@ -1719,7 +1765,8 @@ DOTN(q6kg_fill_q3k)(const struct janas_block_q3k *const *w, size_t b0, int n,
             DOTN(gemm_t8)(u, k->qs + 8 * kk);
         }
         __m128i sc[8];
-        for (int r = 0; r < 8; r++) {
+        _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+        {
             sc[r] = DOTN(q3k_scales16)(w[r][b].scales);
             k->d[r] = _cvtsh_ss(w[r][b].d);
         }
@@ -1905,6 +1952,11 @@ DOTN(q6k_gemm_body)(const void *w, size_t row_bytes, const uint8_t *p1,
                     DOTN(q6kg_fill_q6kp)(
                         (const struct janas_block_q6kp *const *)wr, r1, r0, b0,
                         n, bk, L);
+                DOTN(gemm_ahead)(w, row_bytes,
+                                 L == 0   ? sizeof(struct janas_block_q6k)
+                                 : L == 4 ? sizeof(struct janas_block_q3k)
+                                          : row_bytes / nb,
+                                 g, rows, nb, b0, Q6KG_CHUNK);
                 DOTN(q6kg_tiles)(bk, n, b0, x + v0 * xs, xs, nt, af, af, L);
             }
             for (size_t t = 0; t < nt; t++)
@@ -2073,7 +2125,8 @@ DOTN(iqkg_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
             const __m256i three = _mm256_set1_epi8(3);
             for (int kk = 0; kk < 8; kk++) {
                 __m256i u[8];
-                for (int r = 0; r < 8; r++) {
+                _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+                {
                     const struct janas_block_q2k *bl =
                         (const struct janas_block_q2k *)(w[r] + b * size);
                     __m256i q = _mm256_loadu_si256(
@@ -2084,7 +2137,8 @@ DOTN(iqkg_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
                 DOTN(gemm_t8)(u, k->qs + 8 * kk);
             }
             __m128i sc[8], mn[8];
-            for (int r = 0; r < 8; r++) {
+            _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+            {
                 const struct janas_block_q2k *bl =
                     (const struct janas_block_q2k *)(w[r] + b * size);
                 __m128i m8 = _mm_loadu_si128((const __m128i *)bl->scales);
@@ -2099,7 +2153,8 @@ DOTN(iqkg_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
         int8_t s[8][16];
         for (int kk = 0; kk < 8; kk++) {
             __m256i u[8];
-            for (int r = 0; r < 8; r++) {
+            _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+            {
                 u[r] = DOTN(iqkg_group)(TY, w[r] + b * size, kk, s[r]);
 #ifdef DOTN_HAS_VNNI
                 u[r] = _mm256_xor_si256(u[r], _mm256_set1_epi8((char)0x80));
@@ -2108,7 +2163,8 @@ DOTN(iqkg_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
             DOTN(gemm_t8)(u, k->qs + 8 * kk);
         }
         __m128i sc[8];
-        for (int r = 0; r < 8; r++) {
+        _Pragma("GCC unroll 8") for (int r = 0; r < 8; r++)
+        {
             sc[r] = _mm_loadu_si128((const __m128i *)s[r]);
             k->d[r] = DOTN(iqkg_d)(TY, w[r] + b * size);
         }
@@ -2136,6 +2192,8 @@ DOTN(iqk_gemm_t)(const int TY, const void *w, size_t row_bytes,
             for (size_t b0 = 0; b0 < nb; b0 += Q6KG_CHUNK) {
                 int n = nb - b0 < Q6KG_CHUNK ? (int)(nb - b0) : Q6KG_CHUNK;
                 DOTN(iqkg_fill)(TY, wr, b0, n, bk);
+                DOTN(gemm_ahead)(w, row_bytes, DOTN(iqkg_size)(TY), g, rows, nb,
+                                 b0, Q6KG_CHUNK);
                 DOTN(q6kg_tiles)(bk, n, b0, x + v0 * xs, xs, nt, af, am, L);
             }
             for (size_t t = 0; t < nt; t++)
@@ -2200,7 +2258,8 @@ DOTN(q5kg_fill)(const struct janas_block_q5k *const *w, size_t b0, int n,
         size_t b = b0 + (size_t)i;
         for (int c = 0; c < 4; c++) {
             __m256i lo[8], hi[8];
-            for (int j = 0; j < 8; j++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+            {
                 __m256i q4 =
                     _mm256_loadu_si256((const __m256i *)(w[j][b].qs + 32 * c));
                 __m256i qh = _mm256_loadu_si256((const __m256i *)w[j][b].qh);
@@ -2219,7 +2278,8 @@ DOTN(q5kg_fill)(const struct janas_block_q5k *const *w, size_t b0, int n,
             DOTN(gemm_t8)(hi, k->qs + 8 * (2 * c + 1));
         }
         __m128i sv[8];
-        for (int j = 0; j < 8; j++) {
+        _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+        {
             const struct janas_block_q5k *blk = &w[j][b];
             uint32_t u[4];
             unpack_scales_u32(blk->scales, u);
@@ -2335,6 +2395,8 @@ static DOTN_TARGET void DOTN(q5k_gemm)(const void *w, size_t row_bytes,
             for (size_t b0 = 0; b0 < nb; b0 += Q5KG_CHUNK) {
                 int n = nb - b0 < Q5KG_CHUNK ? (int)(nb - b0) : Q5KG_CHUNK;
                 DOTN(q5kg_fill)(wr, b0, n, bk);
+                DOTN(gemm_ahead)(w, row_bytes, sizeof(struct janas_block_q5k),
+                                 g, rows, nb, b0, Q5KG_CHUNK);
                 const struct janas_block_q8k *xv = x + v0 * xs;
                 size_t t0 = 0;
                 for (; t0 + Q4KG_T <= nt; t0 += Q4KG_T)
@@ -2476,7 +2538,8 @@ DOTN(b32g_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
             /* a block of 64: positions 2 kb2 and 2 kb2 + 1 */
             for (int kb2 = 0; kb2 < 4; kb2++) {
                 __m256i lo[8], hi[8];
-                for (int j = 0; j < 8; j++) {
+                _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+                {
                     const struct janas_block_q2_0 *blk =
                         (const struct janas_block_q2_0 *)w[j] + (b0 + i) * 4 +
                         kb2;
@@ -2490,7 +2553,8 @@ DOTN(b32g_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
         }
         for (int kb = 0; kb < 8; kb++) {
             __m256i r[8];
-            for (int j = 0; j < 8; j++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+            {
                 const uint8_t *blk = w[j] + ((b0 + i) * 8 + kb) * size;
                 r[j] = DOTN(b32g_unpack)(TY, blk);
                 if (TY == JANAS_MXFP4) {
@@ -2632,7 +2696,9 @@ DOTN(b32g_hsum8)(const float *a)
         _mm256_add_ps(_mm256_add_ps(p1, p5), _mm256_add_ps(p3, p7)));
 }
 
-#define B32G_TOK 32 /* tokens whose sums are held at a time: 16 KB */
+/* tokens whose sums are held at a time, as Q4KG_TOK: 64 KB (with 32, Q8_0
+   on 256 vectors 2.0 against 2.3 GB/s) */
+#define B32G_TOK 256
 
 static inline DOTN_TARGET __attribute__((always_inline)) void
 DOTN(b32_gemm_t)(const int TY, const void *w, size_t row_bytes,
@@ -2654,6 +2720,13 @@ DOTN(b32_gemm_t)(const int TY, const void *w, size_t row_bytes,
             for (size_t b0 = 0; b0 < nb; b0 += B32G_CHUNK) {
                 int n = nb - b0 < B32G_CHUNK ? (int)(nb - b0) : B32G_CHUNK;
                 DOTN(b32g_fill)(TY, wr, b0, n, bk);
+                /* not Q8_0's: 3-4% slower on 24-32 vectors */
+                if (TY != JANAS_Q8_0)
+                    DOTN(gemm_ahead)(w, row_bytes,
+                                     TY == JANAS_Q2_0
+                                         ? 4 * sizeof(struct janas_block_q2_0)
+                                         : 8 * DOTN(b32g_size)(TY),
+                                     g, rows, nb, b0, B32G_CHUNK);
                 const struct janas_block_q8k *xv = x + v0 * xs;
                 size_t t0 = 0;
                 for (; t0 + 4 <= nt; t0 += 4)
@@ -2725,7 +2798,8 @@ DOTN(iq4xsg_fill)(const struct janas_block_iq4xs *const *w, size_t b0, int n,
         size_t b = b0 + (size_t)i;
         for (int g = 0; g < 8; g++) {
             __m256i r[8];
-            for (int j = 0; j < 8; j++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+            {
                 r[j] = DOTN(iq4_unpack32)(w[j][b].qs + 16 * g, levels);
 #ifdef DOTN_HAS_VNNI
                 r[j] = _mm256_xor_si256(r[j], _mm256_set1_epi8((char)0x80));
@@ -2734,7 +2808,8 @@ DOTN(iq4xsg_fill)(const struct janas_block_iq4xs *const *w, size_t b0, int n,
             DOTN(gemm_t8)(r, k->qs + 8 * g);
         }
         __m128i sv[8];
-        for (int j = 0; j < 8; j++) {
+        _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++)
+        {
             int8_t ls[16];
             for (int g = 0; g < 8; g++)
                 ls[g] = ls[8 + g] = (int8_t)iq4xs_scale(&w[j][b], g);
@@ -2841,6 +2916,8 @@ static DOTN_TARGET void DOTN(iq4xs_gemm)(const void *w, size_t row_bytes,
             for (size_t b0 = 0; b0 < nb; b0 += Q5KG_CHUNK) {
                 int n = nb - b0 < Q5KG_CHUNK ? (int)(nb - b0) : Q5KG_CHUNK;
                 DOTN(iq4xsg_fill)(wr, b0, n, bk);
+                DOTN(gemm_ahead)(w, row_bytes, sizeof(struct janas_block_iq4xs),
+                                 g, rows, nb, b0, Q5KG_CHUNK);
                 const struct janas_block_q8k *xv = x + v0 * xs;
                 size_t t0 = 0;
                 for (; t0 + Q4KG_T <= nt; t0 += Q4KG_T)

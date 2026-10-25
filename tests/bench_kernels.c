@@ -15,9 +15,9 @@
  * ordinary memory aligned to 2 MB and collapsed into huge pages: the CPU's
  * speed on each, against malloc's (13 Oct 2026).
  * BENCH_TYPES=Q4_K,Q2_0 measures the types named alone; BENCH_NV=8,16,64
- * the vectors a product takes (1,2,4,8 by default, 64 at most): where the
- * prompt's tiles (JANAS_CPU_TILES) pay against the rows' products.
- * Defaults: 256 MiB of weights per type, 12 threads on CPUs 0-11; the
+ * the vectors a product takes (1,2,4,8 by default, 512 at most: a prompt's
+ * block): where the prompt's tiles (JANAS_CPU_TILES) pay against the rows'
+ * products. Defaults: 256 MiB of weights per type, 12 threads on CPUs 0-11; the
  * single core is first_cpu (default 2).
  * The weights are random bytes below 0x7c, so that every fp16 scale is a
  * finite number; the speed of a kernel does not depend on the values.
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "bench_kernels: no thread pool\n");
         return 1;
     }
-    enum { MAX_NV = 64 };
+    enum { MAX_NV = 512 };
     size_t nvs[8] = {1, 2, 4, 8}, n_nv = 4;
     const char *ev = getenv("BENCH_NV");
     if (ev) {
@@ -157,7 +157,7 @@ int main(int argc, char **argv)
                 break;
         }
         if (!n_nv) {
-            fprintf(stderr, "bench_kernels: BENCH_NV lists 1 to 64\n");
+            fprintf(stderr, "bench_kernels: BENCH_NV lists 1 to 512\n");
             return 1;
         }
     }

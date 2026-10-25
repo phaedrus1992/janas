@@ -1140,8 +1140,9 @@ static void random_blocks(int type, unsigned char *w, size_t n)
 static void test_multi_rows_long(void)
 {
     /* 11 rows: Q4_K's tiles take eight (q4k_gemm), the products the
-       rest; 65 vectors: past the tiles' 64 tokens at a time */
-    enum { ROWS = 11, NV = 65 };
+       rest; up to 65 vectors, then 300: past the tiles' 256 tokens at a
+       time */
+    enum { ROWS = 11, NV = 300 };
     static const size_t lens[] = {2, 48, 130};
     static const int types[] = {
         JANAS_Q2_0,    JANAS_Q4_K,    JANAS_Q5_K,   JANAS_Q6_K,  JANAS_Q8_0,
@@ -1211,7 +1212,10 @@ static void test_multi_rows_long(void)
                     xf[i] = rndf(-1.0f, 1.0f);
                 janas_q8k_quantize(xf, x + v * nb, n);
             }
-            for (int nv = 1; nv <= NV; nv += nv < 9 ? 1 : 8) {
+            for (int nv = 1; nv <= NV; nv = nv < 9     ? nv + 1
+                                            : nv < 65  ? nv + 8
+                                            : nv == 65 ? NV
+                                                       : NV + 1) {
                 janas_dot_multi_rows(t, w, rb, x, nb, (size_t)nv, nb, ROWS, out,
                                      ROWS);
                 for (int v = 0; v < nv; v++)
