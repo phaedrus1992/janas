@@ -35,7 +35,9 @@ int janas_pool_size(const struct janas_pool *p);
  * used and how much of that thread time was spent at the end of a run
  * waiting for the slowest. The time between runs - the caller working alone -
  * is not in the table: it is what the wall of the pass has more than the sum
- * of the wall column. Off, it costs one test of a static variable per run.
+ * of the wall column; a second table gives it by the sites of the runs it
+ * falls between, the largest first. Off, it costs one test of a static
+ * variable per run.
  */
 void janas_pool_trace_report(const char *what, double wall);
 void janas_pool_trace_reset(void);

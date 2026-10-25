@@ -133,16 +133,19 @@ one 5476083302 11811160064 8" ;;
 # machine with less memory would compute other numbers, rightly. And so is
 # the prompt: no MCP servers, no saved settings (see level()).
 FP_PROMPT="Write a short paragraph about the island of Sardinia, its history and its landscape."
-# medium's since 27 Sep 2026: its Q8_0 tensors take the activations with a
-# scale per 32 since then (13e2f198c270b826 before), checked again on 14 Oct
+# since 17 Oct 2026 the engine computes exp, log, pow, sin, cos and tanh
+# itself and no compiler fuses a multiply and an add on its own: the C
+# library and the compiler no longer change the answer (issue #38: medium
+# came out otherwise with glibc 2.39 and gcc 13). medium's and gemma's
+# changed with it (e49b0016cedf6c50 and b2c01def5ff6bd5c before), checked
 # with the GPU, without it and with the AVX2 kernels forced
 fp_expected()
 {
     case "$1" in
     quick) echo "c08f0f936eeba5cb" ;;
-    medium) echo "e49b0016cedf6c50" ;;
+    medium) echo "13e2f198c270b826" ;;
     full) echo "4aae064b918a0e75" ;;
-    gemma) echo "b2c01def5ff6bd5c" ;;
+    gemma) echo "bf1626afffa7eeab" ;;
     esac
 }
 

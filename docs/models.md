@@ -87,6 +87,15 @@ bin/x86_64-linux/hf2jns_mtp models/qwen3-next.jns \
 
 For the dense Qwen3.5-9B that is 487 MB instead of 14 GB of shards, in under a minute. It also takes the shards themselves, when you have them on disk (`hf2jns_mtp <model.jns> <shard>... <out.jns>`). Qwen3.6-35B-A3B needs none of this: its GGUF keeps the block.
 
+Qwen3.8-Flash-Next's block comes in a GGUF file of its own, which unsloth publishes beside its quantizations of the model ([`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), folder `MTP`). `hf2jns_mtp` copies the block as it is, in its own types, and leaves out the file's token embeddings and output head - the engine takes the model's own:
+
+```sh
+bin/x86_64-linux/hf2jns_mtp models/qwen3.8-flash-next.jns \
+    mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf models/qwen3.8-flash-next-mtp.jns
+```
+
+From the Q4_K_M file (2.8 GB) that is 1.9 GB, the same bytes on every run. In the chat, on one reply of 64 tokens to a question on bread, 72.5% of its drafts were kept greedy and 80.5% sampled as the chat samples, and the reply was the one written without them.
+
 **Gemma 4** comes from unsloth's GGUF files, converted in one step, and so does its assistant (the `mtp-gemma-4-*.gguf` file beside the model, under 0.5 GB), which serves as the multi-token prediction file:
 
 ```sh

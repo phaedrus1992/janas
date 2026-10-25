@@ -114,11 +114,12 @@ static void group_worker(void *arg, int tid, int n_threads)
             size_t end =
                 job->first_row[t + 1] < g1 ? job->first_row[t + 1] : g1;
             size_t nr = end - g0;
-            size_t nb = k->cols / JANAS_QK;
-            size_t row_bytes = nb * janas_qtype_block_size(k->type);
+            /* a row may end inside a group of 256 (janas_dot_rows_n) */
+            size_t nb = k->cols / JANAS_QK, tail = k->cols % JANAS_QK;
+            size_t row_bytes = janas_qtype_row_bytes(k->type, k->cols);
             const char *w0 = (const char *)k->w + r0 * row_bytes;
             size_t nv = k->n_vec ? k->n_vec : 1;
-            size_t xs = k->x_stride ? k->x_stride : nb;
+            size_t xs = k->x_stride ? k->x_stride : nb + (tail != 0);
             size_t ys = k->y_stride ? k->y_stride : k->rows;
             if (k->type == JANAS_Q6_K_P) {
                 size_t pb = nb * JANAS_Q6KP_PLANE;
@@ -133,6 +134,13 @@ static void group_worker(void *arg, int tid, int n_threads)
                     janas_q6kp_dot_multi(row, p1, p0, k->x, xs, nv, nb,
                                          k->y + r, ys);
                 }
+            } else if (tail && nv == 1) {
+                janas_dot_rows_n(k->type, w0, row_bytes, k->x, k->cols, nr,
+                                 k->y + r0);
+            } else if (tail) {
+                for (size_t i = 0; i < nr; i++)
+                    janas_dot_multi_n(k->type, w0 + i * row_bytes, k->x, xs, nv,
+                                      k->cols, k->y + r0 + i, ys);
             } else if (nv == 1) {
                 janas_dot_rows(k->type, w0, row_bytes, k->x, nb, nr, k->y + r0);
             } else {

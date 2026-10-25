@@ -36,6 +36,13 @@ struct janas_arch {
                      weights, V = K where attn_v is missing, scores not
                      scaled (the q and k norms do it) */
     int kv16;     /* keys and values kept at sixteen bits, not eight */
+    /* Qwen3.8-Flash-Next (qwen4exp, model_hc.c): hyper-connections - the
+       residual in several streams, mixed into each sublayer's input by a
+       gate of low rank, in place of its norm, and each sublayer's output
+       added to every stream with a weight of its own - n-gram embeddings
+       at the layers the file names, the DeltaNet's output gated by a
+       sigmoid instead of SiLU, and the attention's sparse selection */
+    int hc;
 };
 
 /* The architecture called name, or NULL if Janas does not know it. */

@@ -29,6 +29,13 @@ static const struct janas_arch archs[] = {
      .post_attn_norm = 1,
      .vmap_mod = 1,
      .nextn_in_file = 1},
+    /* Qwen3.8-Flash-Next: qwen35moe's layers inside hyper-connections */
+    {.name = "qwen4exp",
+     .rec = JANAS_REC_Q35,
+     .attn_gate = 1,
+     .shared_expert = 1,
+     .vmap_mod = 1,
+     .hc = 1},
     /* its scores are not scaled down, and an eight-bit key moves them: at
        eight bits llama.cpp agrees with its own f16 cache at 169 of 200 most
        likely tokens */

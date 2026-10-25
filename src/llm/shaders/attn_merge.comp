@@ -29,6 +29,8 @@ layout(push_constant) uniform P {
     uint gs;  /* the gate's floats a token */
     uvec2 pos;
     uvec2 gate;
+    uvec2 list; /* attn_decode.comp's, if set: the positions' count */
+    uint ls;
 } p;
 
 shared float m8[32];        /* the block's maxima, eight values each */
@@ -56,7 +58,9 @@ void main()
     U Q = U(p.q256), Q32 = U(p.q32);
     /* token j of a block (workgroup y): positions 0 .. pos + j */
     uint j0 = gl_WorkGroupID.y;
-    uint runs = (RP(p.pos).v[0] + j0 + C) / C; /* npos / C, rounded up */
+    bool lst = set(p.list);
+    uint npos = lst ? RP(p.list).v[j0 * p.ls] : RP(p.pos).v[0] + j0 + 1u;
+    uint runs = (npos + C - 1u) / C; /* rounded up */
     R PR = R(p.part);
     uint e = 256u * b + t, h = e / hd, i = e % hd;
     uint at = j0 * p.ps + h * p.nch * (hd + 2u);

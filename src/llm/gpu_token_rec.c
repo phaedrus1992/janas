@@ -219,7 +219,8 @@ int janas_gt_rec_gdn(struct janas_gpu *g, struct janas_gpu_tok *t,
     g->vkCmdDispatch(g->cb, md->nv * (md->ds / 16), 1, 1);
     janas_g_compute_barrier(g);
     janas_gt_stamp(g, t, PH_SSM_REC);
-    struct push_ggate pq = {.d = md->d_inner, .nv = md->nv, .eps = md->eps};
+    struct push_ggate pq = {
+        .d = md->d_inner, .nv = md->nv, .eps = md->eps, .sig = md->hc != 0};
     janas_g_push_addr(pq.att, ATT);
     janas_g_push_addr(pq.z, Z);
     janas_g_push_addr(pq.w, B + pr[PAR_NORM]);
@@ -312,8 +313,12 @@ int janas_gt_rec_attn(struct janas_gpu *g, struct janas_gpu_tok *t,
                          .nch = t->rec_nch,
                          .scale = md->attn_scale,
                          .qs = (uint32_t)qs,
-                         .ps = (uint32_t)janas_gt_part_tok(t, md, t->rec_nch)};
+                         .ps = (uint32_t)janas_gt_part_tok(t, md, t->rec_nch),
+                         .ls = t->ix_ls};
     janas_g_push_addr(pa.pos, POS);
+    /* qwen4exp's sparse attention: the positions janas_gt_rec_qsa chose */
+    if (md->ix_heads)
+        janas_g_push_addr(pa.list, B + t->o_ixlist);
     janas_g_push_addr(pa.q, QKV);
     janas_g_push_addr(pa.kc, janas_gt_addr_of(g, ly->kc, cache));
     janas_g_push_addr(pa.vc, janas_gt_addr_of(g, ly->vc, cache));
@@ -330,8 +335,11 @@ int janas_gt_rec_attn(struct janas_gpu *g, struct janas_gpu_tok *t,
     struct push_am pm = {.hd = md->hd,
                          .nch = t->rec_nch,
                          .ps = (uint32_t)janas_gt_part_tok(t, md, t->rec_nch),
-                         .gs = qd};
+                         .gs = qd,
+                         .ls = t->ix_ls};
     janas_g_push_addr(pm.gate, md->gated_q ? B + t->o_gate : 0);
+    if (md->ix_heads)
+        janas_g_push_addr(pm.list, B + t->o_ixlist);
     janas_g_push_addr(pm.part, B + t->o_part);
     janas_g_push_addr(pm.q256, B + t->o_q256);
     janas_g_push_addr(pm.q32, B + t->o_q32);
@@ -379,14 +387,17 @@ int janas_gt_rec_ffn(struct janas_gpu *g, struct janas_gpu_tok *t,
                      VkDeviceAddress out)
 {
     VkDeviceAddress B = t->buf.addr, GU = B + t->o_gu, H = B + t->o_h, XA = H;
-    VkDeviceAddress UP = GU + (size_t)n * gate->rows * 4;
-    if (janas_gt_rec_product(g, t, bound, gate, 0, GU, n, 0) != 0 ||
-        janas_gt_rec_product(g, t, bound, up, 0, UP, n, 0) != 0)
+    /* a width ending inside a group of 256 (qwen4exp's 640): each token's
+       rows at whole groups, the rest zero */
+    uint32_t fr = (gate->rows + JANAS_QK - 1) / JANAS_QK * JANAS_QK;
+    VkDeviceAddress UP = GU + (size_t)n * fr * 4;
+    if (janas_gt_rec_product(g, t, bound, gate, 0, GU, n, fr) != 0 ||
+        janas_gt_rec_product(g, t, bound, up, 0, UP, n, fr) != 0)
         return -1;
     janas_g_compute_barrier(g);
     janas_gt_stamp(g, t, PH_GATEUP);
     if (janas_g_x_in_32(down->type)) {
-        struct push_sm ps = {.n = n * gate->rows};
+        struct push_sm ps = {.n = n * fr};
         janas_g_push_addr(ps.g, GU);
         janas_g_push_addr(ps.u, UP);
         janas_g_push_addr(ps.h, B + t->o_hf);
@@ -394,16 +405,16 @@ int janas_gt_rec_ffn(struct janas_gpu *g, struct janas_gpu_tok *t,
         janas_gt_push(g, &ps, sizeof(ps));
         g->vkCmdDispatch(g->cb, (ps.n + 255) / 256, 1, 1);
         janas_g_compute_barrier(g);
-        rec_quant(g, t, bound, B + t->o_hf, H, B + t->o_h32, gate->rows, n);
+        rec_quant(g, t, bound, B + t->o_hf, H, B + t->o_h32, fr, n);
         XA = B + t->o_h32;
     } else {
-        struct push_ac ac = {.blocks = n * gate->rows / JANAS_QK};
+        struct push_ac ac = {.blocks = n * fr / JANAS_QK};
         janas_g_push_addr(ac.g, GU);
         janas_g_push_addr(ac.u, UP);
         janas_g_push_addr(ac.x, H);
         janas_gt_bind(g, bound, g->pipea);
         janas_gt_push(g, &ac, sizeof(ac));
-        g->vkCmdDispatch(g->cb, n * gate->rows / JANAS_QK, 1, 1);
+        g->vkCmdDispatch(g->cb, n * fr / JANAS_QK, 1, 1);
         janas_g_compute_barrier(g);
     }
     janas_gt_stamp(g, t, PH_ACT);

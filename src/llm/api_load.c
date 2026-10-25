@@ -136,7 +136,7 @@ static int add_ids(janas_llm_chat *c, const int32_t *ids, uint32_t n)
  * An assistant's message the model did not write here (or not lately): as
  * the template writes it, with its calls. A Qwen3.5 or 3.6 template gives
  * the turns after the user's last question their reasoning back, empty
- * when there is none to give.
+ * when there is none to give; a Qwen3.8 one every turn (think_kept).
  */
 static int add_assistant(janas_llm_chat *c, const struct cmsg *m, int after_q)
 {
@@ -148,7 +148,7 @@ static int add_assistant(janas_llm_chat *c, const struct cmsg *m, int after_q)
     err |= janas_api_add_text(c, llm->asst_role, strlen(llm->asst_role));
     if (!bare)
         err |= janas_api_add_text(c, "\n", 1);
-    if (d == JANAS_TOOLS_XML && llm->thinker && after_q)
+    if (d == JANAS_TOOLS_XML && llm->thinker && (after_q || llm->think_kept))
         err |= janas_api_add_markup(c, "<think>\n\n</think>\n\n", 19);
     if (m->n_calls && d != JANAS_TOOLS_NONE) {
         struct janas_buf b = {0};
@@ -210,9 +210,10 @@ static int render(janas_llm_chat *c, uint32_t *reply_off)
         if (c->msgs[i].role == JANAS_LLM_ROLE_USER)
             last_q = i;
     int err = janas_api_begin_sequence(c);
-    if (llm->format == FORMAT_GEMMA && !c->tools_sys &&
-        c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM)
-        err |= janas_api_add_system(c, NULL, 0); /* <|think|>, if asked */
+    if ((llm->format == FORMAT_GEMMA || janas_api_think_note(c)) &&
+        !c->tools_sys && c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM)
+        err |= janas_api_add_system(c, NULL, 0); /* <|think|>, or the words
+                                                    on reasoning, if asked */
     if (c->tools_sys && c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM) {
         /* with tools there is a system message whatever the caller says */
         err |= janas_api_add_system(c, NULL, 0);
