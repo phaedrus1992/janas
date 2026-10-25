@@ -245,6 +245,8 @@ struct janas_gpu_tok {
     double wall_ns;       /* submission to the fence, as the CPU sees it */
     double copy_ns;       /* the logits copied out */
     double plan_ns;       /* a mixture's plans, on the CPU */
+    double cpu_ns;        /* of which its experts computed by the CPU */
+    double fetch_ns;      /* and the experts asked of the cache */
     uint64_t tokens;      /* with profiling: passes measured */
     uint64_t pass_tokens; /* ... and their tokens */
     VkShaderModule sm_nq, sm_qk, sm_at, sm_am;
@@ -283,6 +285,13 @@ struct janas_gpu_tok {
        tiles2 on), the two dispatches' sizes */
     VkCommandBuffer *seg_cb[TOK_MAX_BLOCK + 1][3][2];
     uint32_t seg_nch[TOK_MAX_BLOCK + 1][3][2];
+    /* a plan's last copies recorded in g->cb, for the next segment's
+       submission */
+    int cp_pending;
+    /* a plan's experts left to the CPU (gpu_token_moe.c cpu_part), and the
+       command buffer of their rows' copies */
+    uint32_t pend_nc;
+    VkCommandBuffer cb_rows;
     VkShaderModule sm_tk, sm_ga, sm_cb, sm_sm;
     VkPipeline p_tk, p_ga, p_cb, p_sm;
     size_t o_r, o_pe, o_pw, o_shw, o_sh, o_xg, o_egu, o_eh, o_dout, o_gt, o_inv,
@@ -373,8 +382,15 @@ void janas_gt_sync_range(struct janas_gpu *g, struct janas_gpu_tok *t,
    NULL. */
 int janas_gt_make_cb(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_gpu_tok_model *md, VkCommandBuffer *cb,
-                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg);
+                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg,
+                     int part);
 int janas_gt_submit_wait(struct janas_gpu *g, const VkCommandBuffer *cb);
+/* The same with pre (or VK_NULL_HANDLE) submitted before it, together */
+int janas_gt_submit_wait2(struct janas_gpu *g, VkCommandBuffer pre,
+                          const VkCommandBuffer *cb);
+/* cbs[0..n) in one submission, NULL ones left out; waited for if wait */
+int janas_gt_submit_list(struct janas_gpu *g, const VkCommandBuffer *cbs,
+                         uint32_t n, int wait);
 
 /* gpu_token_rec.c: the commands, recorded into g->cb */
 void janas_gt_stamp(struct janas_gpu *g, struct janas_gpu_tok *t, int ph);
@@ -455,10 +471,12 @@ int janas_gt_rec_router(struct janas_gpu *g, struct janas_gpu_tok *t,
                         const struct janas_gpu_tok_model *md,
                         const struct janas_gpu_tok_layer *ly, uint32_t l,
                         VkPipeline *bound, uint32_t n);
+/* part 0 all of it, 1 the products, 2 the experts' sum */
 void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           const struct janas_gpu_tok_model *md,
                           const struct janas_gpu_tok_layer *ly,
-                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n);
+                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n,
+                          int part);
 int janas_gt_tier_create(struct janas_gpu *g, struct janas_gpu_tok *t,
                          const struct janas_gpu_tok_model *md);
 void janas_gt_tier_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);

@@ -655,6 +655,15 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
             if (t->plan_ns > 0)
                 fprintf(stderr, "  (the CPU's plans %.3f ms a pass)\n",
                         t->plan_ns / t->tokens * 1e-6);
+            if (t->n_slot)
+                fprintf(stderr,
+                        "  (a pass's experts: %.1f in the tier, %.1f read into "
+                        "it, %.1f by the CPU in %.3f ms; the cache %.3f ms)\n",
+                        (double)t->tier_hits / t->tokens,
+                        (double)t->tier_loads / t->tokens,
+                        (double)t->cpu_experts / t->tokens,
+                        t->cpu_ns / t->tokens * 1e-6,
+                        t->fetch_ns / t->tokens * 1e-6);
             for (int i = 0; i < PH_N; i++)
                 fprintf(stderr, "  %-14s %7.3f ms %5.1f%%\n", ph_name[i],
                         t->ph_ns[i] / t->tokens * 1e-6,
@@ -790,7 +799,7 @@ static int record_hc(struct janas_gpu *g, struct janas_gpu_tok *t,
         if (l == 0) {
             janas_gt_rec_hc_combine(g, t, md, bound, B + t->o_x, 1, n);
         } else {
-            janas_gt_rec_experts(g, t, md, &layers[l - 1], bound, YD, n);
+            janas_gt_rec_experts(g, t, md, &layers[l - 1], bound, YD, n, 0);
             janas_gt_rec_hc_combine(g, t, md, bound, YD, 0, n);
         }
         if (l == md->ng_layer && janas_gt_rec_ng(g, t, md, ly, bound, n) != 0)
@@ -832,7 +841,7 @@ static int record_hc(struct janas_gpu *g, struct janas_gpu_tok *t,
             return -1;
     }
     if (seg < 0 || seg == (int)nl) {
-        janas_gt_rec_experts(g, t, md, &layers[nl - 1], bound, YD, n);
+        janas_gt_rec_experts(g, t, md, &layers[nl - 1], bound, YD, n, 0);
         janas_gt_rec_hc_combine(g, t, md, bound, YD, 0, n);
         /* the streams themselves are the hidden states (an MTP block's
            input): run copies them from o_res */
@@ -858,10 +867,12 @@ static int record_hc(struct janas_gpu *g, struct janas_gpu_tok *t,
    A mixture's block goes in n_layer + 1 submissions, seg the one recorded
    (-1: a dense model's, all of it): submission s takes layer s - 1's
    experts, then layer s up to its router's choice, the last one the final
-   norm and the output head. */
+   norm and the output head. part 1 records only segment seg's products of
+   the experts, part 2 the rest from their sum on (0 all of it): the CPU
+   computes its experts between the two. */
 static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
                   const struct janas_gpu_tok_model *md, uint32_t n,
-                  uint32_t first, int hid, int seg)
+                  uint32_t first, int hid, int seg, int part)
 {
     const struct janas_gpu_tok_layer *layers =
         n > 1 && md->blayers ? md->blayers : md->layers;
@@ -886,7 +897,7 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
         t->n_ts = 0;
         g->vkCmdResetQueryPool(g->cb, t->qp, 0, MAX_TS);
         janas_gt_stamp(g, t, PH_N); /* the start */
-    } else if (t->qp) {
+    } else if (t->qp && part != 2) {
         janas_gt_stamp(g, t, PH_BETWEEN);
     }
     /* on a card with memory of its own: the pass's inputs from the mirror,
@@ -914,7 +925,7 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ib,
                                 0, NULL, 0, NULL);
     }
-    if (seg > 0 && md->n_expert) {
+    if (seg > 0 && md->n_expert && part != 2) {
         /* the previous layer's plan (gpu_token_moe.c): its rows' tokens, its
            pairs' rows, its tables and dispatches' sizes, laid out one after
            the other; and the experts read into the tier, or the CPU's rows,
@@ -947,8 +958,11 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
         const struct janas_gpu_tok_layer *ly = &layers[l];
         int on = seg < 0 || seg == (int)l;
         /* a mixture: the previous layer's experts first, into YD */
-        if (on && l && md->n_expert)
-            janas_gt_rec_experts(g, t, md, &layers[l - 1], &bound, YD, n);
+        if (on && l && md->n_expert) {
+            janas_gt_rec_experts(g, t, md, &layers[l - 1], &bound, YD, n, part);
+            if (part == 1)
+                goto end;
+        }
         /* the previous layer's feed-forward added, then this one's norm */
         if (on) {
             janas_gt_rec_norm_quant(
@@ -983,8 +997,12 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
        tokens first .. n - 1 (none: the residual left in X, the next block's
        keys and values already in the cache) */
     if (!md->hc && (seg < 0 || seg == (int)nl)) {
-        if (md->n_expert)
-            janas_gt_rec_experts(g, t, md, &layers[nl - 1], &bound, YD, n);
+        if (md->n_expert) {
+            janas_gt_rec_experts(g, t, md, &layers[nl - 1], &bound, YD, n,
+                                 part);
+            if (part == 1)
+                goto end;
+        }
         if (first < n || hid) {
             janas_gt_rec_norm_quant(
                 g, t, &bound, X, YD,
@@ -1044,6 +1062,7 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
     }
     g->vkCmdPipelineBarrier(g->cb, from, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb,
                             0, NULL, 0, NULL);
+end:
     if (g->vkEndCommandBuffer(g->cb) != VK_SUCCESS)
         return -1;
     return 0;
@@ -1069,7 +1088,8 @@ uint32_t janas_gpu_tok_block_at(const struct janas_gpu_tok *t,
    block of n tokens recorded into it: 0, or -1 with *cb NULL. */
 int janas_gt_make_cb(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_gpu_tok_model *md, VkCommandBuffer *cb,
-                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg)
+                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg,
+                     int part)
 {
     VkCommandBufferAllocateInfo ca = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1083,7 +1103,7 @@ int janas_gt_make_cb(struct janas_gpu *g, struct janas_gpu_tok *t,
     VkCommandBuffer keep = g->cb;
     g->cb = *cb; /* the helpers record into g->cb */
     t->rec_nch = nch;
-    int rc = record(g, t, md, n, first, hi, seg);
+    int rc = record(g, t, md, n, first, hi, seg, part);
     g->cb = keep;
     if (rc != 0) {
         g->vkFreeCommandBuffers(g->dev, g->cp, 1, cb);
@@ -1095,9 +1115,42 @@ int janas_gt_make_cb(struct janas_gpu *g, struct janas_gpu_tok *t,
 
 int janas_gt_submit_wait(struct janas_gpu *g, const VkCommandBuffer *cb)
 {
+    return janas_gt_submit_wait2(g, VK_NULL_HANDLE, cb);
+}
+
+int janas_gt_submit_list(struct janas_gpu *g, const VkCommandBuffer *cbs,
+                         uint32_t n, int wait)
+{
+    VkCommandBuffer l[4];
+    uint32_t c = 0;
+    for (uint32_t i = 0; i < n && c < 4; i++)
+        if (cbs[i])
+            l[c++] = cbs[i];
     VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = cb};
+                        .commandBufferCount = c,
+                        .pCommandBuffers = l};
+    pthread_mutex_lock(&g->qlock);
+    VkResult r =
+        g->vkQueueSubmit(g->queue, 1, &sub, wait ? g->fence : VK_NULL_HANDLE);
+    pthread_mutex_unlock(&g->qlock);
+    if (r == VK_SUCCESS && wait)
+        r = g->vkWaitForFences(g->dev, 1, &g->fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        g->broken = 1;
+        return -1;
+    }
+    if (wait)
+        g->vkResetFences(g->dev, 1, &g->fence);
+    return 0;
+}
+
+int janas_gt_submit_wait2(struct janas_gpu *g, VkCommandBuffer pre,
+                          const VkCommandBuffer *cb)
+{
+    VkCommandBuffer two[2] = {pre, *cb};
+    VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = pre ? 2 : 1,
+                        .pCommandBuffers = pre ? two : cb};
     pthread_mutex_lock(&g->qlock);
     VkResult r = g->vkQueueSubmit(g->queue, 1, &sub, g->fence);
     pthread_mutex_unlock(&g->qlock);
@@ -1187,7 +1240,7 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
             *cb = VK_NULL_HANDLE;
         }
         if (!*cb) {
-            if (janas_gt_make_cb(g, t, md, cb, n, first, hi, nch, -1) != 0)
+            if (janas_gt_make_cb(g, t, md, cb, n, first, hi, nch, -1, 0) != 0)
                 return -1;
             t->cb_nch[n][ai][hi] = nch;
         }

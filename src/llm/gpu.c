@@ -1454,14 +1454,12 @@ int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes)
     return 0;
 }
 
-int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n)
+int janas_g_record_copies(struct janas_gpu *g, const struct janas_g_cp *c,
+                          uint32_t n, int barrier)
 {
     VkCommandBufferBeginInfo bb = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = &g->cb};
     int ok = g->vkResetCommandBuffer(g->cb, 0) == VK_SUCCESS &&
              g->vkBeginCommandBuffer(g->cb, &bb) == VK_SUCCESS;
     for (uint32_t i = 0; ok && i < n; i++) {
@@ -1469,7 +1467,31 @@ int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n)
             .srcOffset = c[i].so, .dstOffset = c[i].dof, .size = c[i].bytes};
         g->vkCmdCopyBuffer(g->cb, c[i].src, c[i].dst, 1, &cp);
     }
-    ok = ok && g->vkEndCommandBuffer(g->cb) == VK_SUCCESS;
+    if (ok && barrier) {
+        /* what the commands submitted after it read: shaders, copies and
+           indirect dispatches */
+        VkMemoryBarrier mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+        g->vkCmdPipelineBarrier(g->cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    return ok && g->vkEndCommandBuffer(g->cb) == VK_SUCCESS ? 0 : -1;
+}
+
+int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n)
+{
+    VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &g->cb};
+    int ok = janas_g_record_copies(g, c, n, 0) == 0;
     pthread_mutex_lock(&g->qlock);
     ok = ok && g->vkQueueSubmit(g->queue, 1, &sub, g->fence) == VK_SUCCESS;
     pthread_mutex_unlock(&g->qlock);

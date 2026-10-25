@@ -330,6 +330,10 @@ struct janas_g_cp {
 };
 /* Copies c[0..n) in one submission and waits: 0, or -1. */
 int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n);
+/* The same recorded in g->cb, not submitted: with barrier, followed by a
+   barrier before what reads them in the same submission. 0, or -1. */
+int janas_g_record_copies(struct janas_gpu *g, const struct janas_g_cp *c,
+                          uint32_t n, int barrier);
 /* Forgets the last region imported, at host (the check's own weights). */
 void janas_g_drop_region(struct janas_gpu *g, const void *host);
 

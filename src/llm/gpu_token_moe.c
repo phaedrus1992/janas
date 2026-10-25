@@ -16,14 +16,14 @@
 
 #if defined(JANAS_GPU_SPV) && __has_include(<vulkan/vulkan.h>)
 
-/* A mixture's submissions for one block shape, freed (n_layer + 1 of
-   them, the array too). */
+/* A mixture's submissions for one block shape, freed (two for each of the
+   n_layer + 1 segments, its products and the rest, the array too). */
 void janas_gt_free_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
                             VkCommandBuffer **seg)
 {
     if (!*seg)
         return;
-    for (uint32_t s = 0; s < t->n_seg; s++)
+    for (uint32_t s = 0; s < 2 * t->n_seg; s++)
         if ((*seg)[s])
             g->vkFreeCommandBuffers(g->dev, g->cp, 1, &(*seg)[s]);
     free(*seg);
@@ -117,11 +117,14 @@ static void experts_product(struct janas_gpu *g, struct janas_gpu_tok *t,
 void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           const struct janas_gpu_tok_model *md,
                           const struct janas_gpu_tok_layer *ly,
-                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n)
+                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n,
+                          int part)
 {
     VkDeviceAddress B = t->buf.addr;
     uint32_t np = n * md->k, nbd = md->dm / JANAS_QK, nbf = t->effp / JANAS_QK;
     int dt = ly->down.type, gtp = ly->gate.type;
+    if (part == 2)
+        goto sum;
     struct push_ga pg = {.nb = nbd};
     janas_g_push_addr(
         pg.src, B + (janas_g_x_in_32(ly->gate.type) ? t->o_q32 : t->o_q256));
@@ -160,6 +163,9 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                     md->eff / 32, t->o_ind + 16);
     janas_g_compute_barrier(g);
     janas_gt_stamp(g, t, PH_DOWN);
+    if (part == 1)
+        return;
+sum:;
     struct push_cb pc = {
         .dm = md->dm, .k = md->k, .has_sh = ly->sh_gate_w.type != 0};
     janas_g_push_addr(pc.dout, B + t->o_dout);
@@ -545,8 +551,16 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
                 t->miss[nm++] = e;
             }
         }
+        struct timespec f0, f1;
+        if (t->qp)
+            clock_gettime(CLOCK_MONOTONIC, &f0);
         if (nm && md->fetch(md->ctx, l, t->miss, nm, t->cpu_slots) != 0)
             return -1;
+        if (t->qp) {
+            clock_gettime(CLOCK_MONOTONIC, &f1);
+            t->fetch_ns += (double)(f1.tv_sec - f0.tv_sec) * 1e9 +
+                           (double)(f1.tv_nsec - f0.tv_nsec);
+        }
         /* misses into the tier where it gives up an expert used less;
            the rest to the CPU */
         int32_t *dst = (int32_t *)t->fill; /* free until the sort below */
@@ -643,32 +657,92 @@ static int plan(struct janas_gpu *g, struct janas_gpu_tok *t,
     /* o_gt to o_ind are one range (gpu_token.c's layout), copied by the
        next submission */
     host_side(g, t, t->o_gt, t->o_ind + 32 - t->o_gt, 1);
-    if (nc) {
-        /* the CPU's experts, from the layer's normalized input (copied to
-           the mirror by the last submission), into their rows */
-        for (uint32_t i = 0; i < nc; i++)
-            t->ra[i] = cnt[t->on_cpu[i]], t->rb[i] = cnt[t->on_cpu[i] + 1];
-        host_side(g, t, t->o_xnf, (size_t)n * md->dm * 4, 0);
-        if (md->cpu_rows(md->ctx, l, n, (const float *)(t->buf.map + t->o_xnf),
-                         nc, t->on_cpu, t->cpu_slots, t->ra, t->rb, gt,
-                         (float *)(t->buf.map + t->o_dout)) != 0)
+    /* the last experts read into the tier, in the next segment's
+       submission: a submission of their own, waited for, cost a round trip
+       a layer; the CPU's experts left for cpu_part */
+    if (ncp && janas_g_record_copies(g, t->cps, (uint32_t)ncp, 1) != 0)
+        return -1;
+    t->cp_pending = ncp != 0;
+    t->pend_nc = nc;
+    return 0;
+}
+
+/*
+ * The experts plan left to the CPU (t->pend_nc), from layer l's normalized
+ * input (copied to the mirror by the last submission) into their rows,
+ * while the GPU computes its own; their copies to the card's memory
+ * recorded in t->cb_rows, after a barrier on all that went before, for the
+ * submission of the rest of the segment. 0, or -1.
+ */
+static int cpu_part(struct janas_gpu *g, struct janas_gpu_tok *t,
+                    const struct janas_gpu_tok_model *md, uint32_t l,
+                    uint32_t n)
+{
+    uint32_t nc = t->pend_nc, *cnt = t->cnt,
+             *gt = (uint32_t *)(t->buf.map + t->o_gt), ncp = 0;
+    for (uint32_t i = 0; i < nc; i++)
+        t->ra[i] = cnt[t->on_cpu[i]], t->rb[i] = cnt[t->on_cpu[i] + 1];
+    host_side(g, t, t->o_xnf, (size_t)n * md->dm * 4, 0);
+    struct timespec c0, c1;
+    if (t->qp)
+        clock_gettime(CLOCK_MONOTONIC, &c0);
+    if (md->cpu_rows(md->ctx, l, n, (const float *)(t->buf.map + t->o_xnf), nc,
+                     t->on_cpu, t->cpu_slots, t->ra, t->rb, gt,
+                     (float *)(t->buf.map + t->o_dout)) != 0)
+        return -1;
+    if (t->qp) {
+        clock_gettime(CLOCK_MONOTONIC, &c1);
+        t->cpu_ns += (double)(c1.tv_sec - c0.tv_sec) * 1e9 +
+                     (double)(c1.tv_nsec - c0.tv_nsec);
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        size_t o = t->o_dout + (size_t)t->ra[i] * md->dm * 4,
+               b = (size_t)(t->rb[i] - t->ra[i]) * md->dm * 4;
+        host_side(g, t, o, b, 1);
+        if (t->local)
+            t->cps[ncp++] = (struct janas_g_cp){.src = t->mirror.buf,
+                                                .dst = t->buf.buf,
+                                                .so = o,
+                                                .dof = o,
+                                                .bytes = b};
+    }
+    if (!t->cb_rows) {
+        VkCommandBufferAllocateInfo ca = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = g->cp,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1};
+        if (g->vkAllocateCommandBuffers(g->dev, &ca, &t->cb_rows) !=
+            VK_SUCCESS) {
+            t->cb_rows = VK_NULL_HANDLE;
             return -1;
-        for (uint32_t i = 0; i < nc; i++) {
-            size_t o = t->o_dout + (size_t)t->ra[i] * md->dm * 4,
-                   b = (size_t)(t->rb[i] - t->ra[i]) * md->dm * 4;
-            host_side(g, t, o, b, 1);
-            if (t->local)
-                t->cps[ncp++] = (struct janas_g_cp){.src = t->mirror.buf,
-                                                    .dst = t->buf.buf,
-                                                    .so = o,
-                                                    .dof = o,
-                                                    .bytes = b};
         }
     }
-    /* the last experts read into the tier and the CPU's rows, together */
-    if (ncp && janas_g_copies(g, t->cps, (uint32_t)ncp) != 0)
+    VkCommandBufferBeginInfo bb = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (g->vkResetCommandBuffer(t->cb_rows, 0) != VK_SUCCESS ||
+        g->vkBeginCommandBuffer(t->cb_rows, &bb) != VK_SUCCESS)
         return -1;
-    return 0;
+    /* after the products submitted before, without a wait between */
+    VkMemoryBarrier all = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                            VK_ACCESS_MEMORY_WRITE_BIT};
+    g->vkCmdPipelineBarrier(t->cb_rows, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &all, 0,
+                            NULL, 0, NULL);
+    for (uint32_t i = 0; i < ncp; i++) {
+        VkBufferCopy cp = {.srcOffset = t->cps[i].so,
+                           .dstOffset = t->cps[i].dof,
+                           .size = t->cps[i].bytes};
+        g->vkCmdCopyBuffer(t->cb_rows, t->cps[i].src, t->cps[i].dst, 1, &cp);
+    }
+    if (ncp)
+        g->vkCmdPipelineBarrier(t->cb_rows, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &all,
+                                0, NULL, 0, NULL);
+    return g->vkEndCommandBuffer(t->cb_rows) == VK_SUCCESS ? 0 : -1;
 }
 
 /* A mixture's block: its n_layer + 1 submissions, each recorded once for
@@ -681,7 +755,7 @@ int janas_gt_run_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
     if (*seg && t->seg_nch[n][ai][hi] != nch)
         janas_gt_free_segments(g, t, seg); /* recorded for other runs: again */
     if (!*seg) {
-        *seg = calloc(t->n_seg, sizeof(**seg));
+        *seg = calloc(2 * t->n_seg, sizeof(**seg));
         if (!*seg)
             return -1;
         t->seg_nch[n][ai][hi] = nch;
@@ -689,6 +763,7 @@ int janas_gt_run_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
     /* a block whose tokens choose some 4 times each expert or more: those
        few that no token takes are under 2% (e^-4) */
     int ahead = md->prefetch && (size_t)n * md->k >= 4 * (size_t)md->n_expert;
+    t->cp_pending = 0, t->pend_nc = 0;
     for (uint32_t s = 0; s < t->n_seg; s++) {
         struct timespec p0, p1;
         if (t->qp)
@@ -708,11 +783,35 @@ int janas_gt_run_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
            no faster (10 Oct 2026) */
         if (ahead && s + 1 < t->n_seg)
             md->prefetch(md->ctx, s);
-        if (!(*seg)[s] && janas_gt_make_cb(g, t, md, &(*seg)[s], n, first, hi,
-                                           nch, (int)s) != 0)
+        /* past the first: the segment's products of the experts, then the
+           rest - the CPU computing its experts between the two
+           submissions, the GPU its own (qwen4exp's streams whole) */
+        int split = s && !md->hc;
+        VkCommandBuffer *a = &(*seg)[2 * s], *b = &(*seg)[2 * s + 1];
+        if ((!*a && janas_gt_make_cb(g, t, md, a, n, first, hi, nch, (int)s,
+                                     split) != 0) ||
+            (split && !*b &&
+             janas_gt_make_cb(g, t, md, b, n, first, hi, nch, (int)s, 2) != 0))
             return -1;
-        if (janas_gt_submit_wait(g, &(*seg)[s]) != 0)
-            return -1;
+        VkCommandBuffer pre = t->cp_pending ? g->cb : VK_NULL_HANDLE;
+        t->cp_pending = 0;
+        if (!split) {
+            if (janas_gt_submit_wait2(g, pre, a) != 0)
+                return -1;
+        } else if (!t->pend_nc) {
+            VkCommandBuffer l3[3] = {pre, *a, *b};
+            if (janas_gt_submit_list(g, l3, 3, 1) != 0)
+                return -1;
+        } else {
+            VkCommandBuffer l2[2] = {pre, *a};
+            if (janas_gt_submit_list(g, l2, 2, 0) != 0 ||
+                cpu_part(g, t, md, s - 1, n) != 0)
+                return -1;
+            VkCommandBuffer r2[2] = {t->cb_rows, *b};
+            if (janas_gt_submit_list(g, r2, 2, 1) != 0)
+                return -1;
+        }
+        t->pend_nc = 0;
     }
     return 0;
 }
