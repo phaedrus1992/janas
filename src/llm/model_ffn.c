@@ -366,6 +366,54 @@ static void run_experts(struct janas_llm_model *m,
     }
 }
 
+int janas_m_expert_rows(struct janas_llm_model *m, uint32_t l, uint32_t n,
+                        const float *xn, uint32_t nd, const uint32_t *ids,
+                        const uint8_t *const *slots, const uint32_t *ra,
+                        const uint32_t *rb, const uint32_t *tok, float *out)
+{
+    uint32_t dm = m->d_model, nbd = dm / JANAS_QK;
+    if (n > m->blk)
+        return -1;
+    /* as the GPU quantizes the same values (norm_quant.comp): then an
+       expert computed here gives the GPU's bits */
+    for (uint32_t j = 0; j < n; j++)
+        janas_q8k_quantize_det(xn + (size_t)j * dm, m->xq + j * nbd, dm);
+    const struct janas_jns_layer *jl = &m->j.layers[l];
+    /* the CPU's products only: the GPU waits for these between two of its
+       submissions */
+    int off = m->gpu_off;
+    m->gpu_off = 1;
+    for (uint32_t c0 = 0; c0 < nd; c0 += EXPERT_CHUNK) {
+        struct expert_run runs[EXPERT_CHUNK];
+        uint32_t cn = nd - c0 < EXPERT_CHUNK ? nd - c0 : EXPERT_CHUNK;
+        for (uint32_t c = 0; c < cn; c++) {
+            uint32_t i = c0 + c;
+            if (rb[i] > m->blk * (m->k + 1)) {
+                m->gpu_off = off;
+                return -1;
+            }
+            for (uint32_t r = ra[i]; r < rb[i]; r++)
+                m->pair_tok[r] = tok[r], m->order[r] = r;
+            const uint8_t *pl[2] = {NULL, NULL};
+            for (int q = 0; q < m->exp_level - 1; q++)
+                if (jl->plane[q].type)
+                    pl[q] = slots[i] + jl->plane[q].offset;
+            runs[c] = (struct expert_run){{slots[i], slots[i], slots[i]},
+                                          {pl[0], pl[1]},
+                                          jl->m,
+                                          ra[i],
+                                          rb[i],
+                                          (int)ids[i]};
+        }
+        run_experts(m, runs, cn);
+    }
+    m->gpu_off = off;
+    for (uint32_t i = 0; i < nd; i++)
+        memcpy(out + (size_t)ra[i] * dm, m->dout + (size_t)ra[i] * dm,
+               (size_t)(rb[i] - ra[i]) * dm * sizeof(float));
+    return 0;
+}
+
 int janas_m_route_rank(struct janas_llm_model *m, uint32_t l, uint32_t n,
                        uint32_t k, uint32_t *ids)
 {

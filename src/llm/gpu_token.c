@@ -34,6 +34,7 @@
 #include "moe_topk.h"    /* janas_spv_moe_topk */
 #include "moe_gather.h"  /* janas_spv_moe_gather */
 #include "moe_combine.h" /* janas_spv_moe_combine */
+#include "moe_plan.h"    /* janas_spv_moe_plan */
 #include "silu_mul.h"    /* janas_spv_silu_mul */
 
 /* The attention's first step in subgroups of 16 where the size may be
@@ -52,11 +53,27 @@ static const char *const ph_name[PH_N] = {"norm+quant",    "q k v",
                                           "down",          "output",
                                           "ssm q k v z",   "ssm beta+alpha",
                                           "ssm conv",      "ssm recurrence",
-                                          "ssm gate"};
+                                          "ssm gate",      "router",
+                                          "experts' sum",  "between segs"};
 int janas_gpu_shares_host(const struct janas_gpu *g)
 {
     return g && !g->broken && !g->discrete && g->host_import &&
            !getenv("JANAS_GPU_COPY");
+}
+
+size_t janas_gpu_local_room(const struct janas_gpu *g)
+{
+    if (!g || g->broken || !g->discrete)
+        return 0;
+    /* the largest heap of the card's own memory, 85% of it: the desktop
+       and other programs keep the rest */
+    VkDeviceSize heap = 0;
+    for (uint32_t i = 0; i < g->mp.memoryHeapCount; i++)
+        if ((g->mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            g->mp.memoryHeaps[i].size > heap)
+            heap = g->mp.memoryHeaps[i].size;
+    VkDeviceSize keep = heap / 100 * 85;
+    return keep > g->local_bytes ? (size_t)(keep - g->local_bytes) : 0;
 }
 
 /* The GPU's address of host memory in one of its regions, 0 if none. */
@@ -284,14 +301,45 @@ static int check_model(const struct janas_gpu *g,
     return 0;
 }
 
+/* The token's buffer, bytes long: host-visible where the GPU shares the
+   host's memory; on a card with memory of its own in that memory, where
+   the shaders read and write it at its speed, the host's few writes (the
+   block's inputs, the parameters) and reads (logits, hidden states, a
+   mixture's routing) through a mirror (JANAS_GPU_TOK_HOSTBUF=1: as on an
+   integrated GPU, across the bus; JANAS_GPU_TOK_MIRROR=1: the mirror on an
+   integrated one too, to test it with weights read in place). */
+static int make_buf(struct janas_gpu *g, struct janas_gpu_tok *t, size_t bytes)
+{
+    if ((janas_gpu_shares_host(g) && !getenv("JANAS_GPU_TOK_MIRROR")) ||
+        getenv("JANAS_GPU_TOK_HOSTBUF"))
+        return janas_g_make_stage(g, &t->buf, bytes, 1);
+    struct stage d;
+    if (janas_g_make_local(g, &d, bytes) != 0)
+        return janas_g_make_stage(g, &t->buf, bytes, 1);
+    if (janas_g_make_stage(g, &t->mirror, bytes, 1) != 0) {
+        g->vkDestroyBuffer(g->dev, d.buf, NULL);
+        g->vkFreeMemory(g->dev, d.mem, NULL);
+        return -1;
+    }
+    t->buf = d;
+    t->buf.map = t->mirror.map;
+    t->buf.coherent = 0; /* every range through janas_gt_sync_range */
+    t->local = 1;
+    if (getenv("JANAS_GPU_VERBOSE"))
+        fprintf(stderr,
+                "gpu token buffer: %zu MiB in the GPU's memory, through a "
+                "mirror\n",
+                bytes >> 20);
+    return 0;
+}
+
 struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
                                            const struct janas_gpu_tok_model *md,
                                            char *err, size_t err_len)
 {
-    if (!janas_gpu_shares_host(g)) {
-        fail(err, err_len, "the GPU does not read the host's memory in place");
-        return NULL;
-    }
+    /* on a card with memory of its own the caller keeps the state the
+       same in both places (model_gpu.c sync_state): every buffer named in
+       md needs a region all the same, which check_model sees */
     if (check_model(g, md, err, err_len) != 0)
         return NULL;
     struct janas_gpu_tok *t = calloc(1, sizeof(*t));
@@ -408,8 +456,23 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         t->o_inv = take(&at, np * 4);
         t->tiles1 = 3 * 2 * ne;
         t->tiles2 = 3 * ne;
-        t->o_tab1 = take(&at, (t->tiles1 + 2 * (np / 16 + ne)) * 16);
-        t->o_tab2 = take(&at, (t->tiles2 + np / 16 + ne) * 16);
+        /* blocks of mvid_n tokens or fewer in tiles of MVID_NV vectors: by
+           default all of them, so that an expert's bits are the CPU's in
+           every block - a prompt with a tier of 300 MB went through *_mmid
+           (not the CPU's bits) on the GPU's experts and through the CPU on
+           the others, the split set by what the tier held, and with drafts
+           and without the tokens parted at the 11th; on the laptop's Arc
+           as a card of its own the prompt was 7% faster with every expert
+           in the tier, 3% slower with 300 MB (24 Oct 2026) */
+        const char *mv = getenv("JANAS_GPU_MVID");
+        t->mvid_n = mv ? (uint32_t)atoi(mv) : (uint32_t)nb;
+        if (t->mvid_n > nb)
+            t->mvid_n = (uint32_t)nb;
+        size_t nt = np / 16, nm = (size_t)t->mvid_n * md->k / MVID_NV;
+        if (nm > nt)
+            nt = nm;
+        t->o_tab1 = take(&at, (t->tiles1 + 2 * (nt + ne)) * 16);
+        t->o_tab2 = take(&at, (t->tiles2 + nt + ne) * 16);
         t->o_ind = take(&at, 32);
         t->cnt = calloc(ne + 1, sizeof(uint32_t));
         t->fill = calloc(ne, sizeof(uint32_t));
@@ -450,7 +513,7 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
     /* cached for the host (the logits are read on the CPU: 2.5 ms a token
        from uncached memory on the development laptop), flushed and
        invalidated by hand where it is not coherent */
-    if (janas_g_make_stage(g, &t->buf, at, 1) != 0 ||
+    if (make_buf(g, t, at) != 0 ||
         janas_g_make_pipeline(g, janas_spv_norm_quant,
                               sizeof(janas_spv_norm_quant), &t->sm_nq, &t->p_nq,
                               0) != VK_SUCCESS ||
@@ -497,6 +560,11 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         janas_gpu_tok_destroy(g, t);
         return NULL;
     }
+    /* the plan on the GPU when the tier holds every expert (optional) */
+    if (ne &&
+        janas_g_make_pipeline(g, janas_spv_moe_plan, sizeof(janas_spv_moe_plan),
+                              &t->sm_pl, &t->p_pl, 0) != VK_SUCCESS)
+        t->p_pl = VK_NULL_HANDLE;
     /* zero: the padding of the feed-forwards' widths is never written */
     memset(t->buf.map, 0, at);
     janas_gt_sync_range(g, t, 0, at, 1);
@@ -550,6 +618,20 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         if (g->vkCreateQueryPool(g->dev, &qi, NULL, &t->qp) != VK_SUCCESS)
             t->qp = VK_NULL_HANDLE;
     }
+    /* a mixture larger than the card: its tier of experts */
+    if (ne && md->tier_bytes) {
+        if (!md->fetch || !md->cpu_rows || !md->slot_bytes ||
+            janas_gt_tier_create(g, t, md) != 0) {
+            fail(err, err_len, "no room for a tier of experts on the card");
+            janas_gpu_tok_destroy(g, t);
+            return NULL;
+        }
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr,
+                    "gpu experts: a tier of %u slots (%zu MiB) in the "
+                    "card's memory\n",
+                    t->n_slot, (t->n_slot * t->slot_bytes) >> 20);
+    }
     return t;
 }
 
@@ -570,6 +652,9 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
                     (double)t->pass_tokens / t->tokens, all / t->tokens * 1e-6,
                     t->wall_ns / t->tokens * 1e-6,
                     t->copy_ns / t->tokens * 1e-6);
+            if (t->plan_ns > 0)
+                fprintf(stderr, "  (the CPU's plans %.3f ms a pass)\n",
+                        t->plan_ns / t->tokens * 1e-6);
             for (int i = 0; i < PH_N; i++)
                 fprintf(stderr, "  %-14s %7.3f ms %5.1f%%\n", ph_name[i],
                         t->ph_ns[i] / t->tokens * 1e-6,
@@ -584,20 +669,22 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
                     g->vkFreeCommandBuffers(g->dev, g->cp, 1, &t->cb[n][a][h]);
                 janas_gt_free_segments(g, t, &t->seg_cb[n][a][h]);
             }
-    VkPipeline p[15] = {t->p_nq, t->p_qk, t->p_at, t->p_am, t->p_gc,
-                        t->p_gs, t->p_gl, t->p_gr, t->p_gg, t->p_tk,
-                        t->p_ga, t->p_cb, t->p_sm, t->p_gb, t->p_gx};
-    VkShaderModule s[15] = {t->sm_nq, t->sm_qk, t->sm_at, t->sm_am, t->sm_gc,
-                            t->sm_gs, t->sm_gl, t->sm_gr, t->sm_gg, t->sm_tk,
-                            t->sm_ga, t->sm_cb, t->sm_sm, t->sm_gb, t->sm_gx};
+    VkPipeline p[16] = {t->p_nq, t->p_qk, t->p_at, t->p_am, t->p_gc, t->p_gs,
+                        t->p_gl, t->p_gr, t->p_gg, t->p_tk, t->p_ga, t->p_cb,
+                        t->p_sm, t->p_gb, t->p_gx, t->p_pl};
+    VkShaderModule s[16] = {t->sm_nq, t->sm_qk, t->sm_at, t->sm_am,
+                            t->sm_gc, t->sm_gs, t->sm_gl, t->sm_gr,
+                            t->sm_gg, t->sm_tk, t->sm_ga, t->sm_cb,
+                            t->sm_sm, t->sm_gb, t->sm_gx, t->sm_pl};
     janas_gt_hc_destroy(g, t);
     janas_gt_qsa_destroy(g, t);
+    janas_gt_tier_destroy(g, t);
     free(t->par);
     free(t->cnt);
     free(t->fill);
     free(t->ids);
     free(t->slots);
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < 16; i++) {
         if (p[i])
             g->vkDestroyPipeline(g->dev, p[i], NULL);
         if (s[i])
@@ -607,14 +694,52 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
         g->vkDestroyBuffer(g->dev, t->buf.buf, NULL);
     if (t->buf.mem)
         g->vkFreeMemory(g->dev, t->buf.mem, NULL);
+    if (t->mirror.buf)
+        g->vkDestroyBuffer(g->dev, t->mirror.buf, NULL);
+    if (t->mirror.mem)
+        g->vkFreeMemory(g->dev, t->mirror.mem, NULL);
     free(t);
 }
 
+/* Bytes [off, off + bytes) of the mirror out of the CPU's caches (flush)
+   or reloaded from memory (!flush), where it is not coherent. */
+void janas_gt_mirror_cache(struct janas_gpu *g, struct janas_gpu_tok *t,
+                           size_t off, size_t bytes, int flush)
+{
+    if (t->mirror.coherent)
+        return;
+    VkDeviceSize a = off / g->atom * g->atom,
+                 e = (off + bytes + g->atom - 1) / g->atom * g->atom;
+    VkMappedMemoryRange mr = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                              .memory = t->mirror.mem,
+                              .offset = a,
+                              .size =
+                                  e >= t->mirror.bytes ? VK_WHOLE_SIZE : e - a};
+    if (flush)
+        g->vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+    else
+        g->vkInvalidateMappedMemoryRanges(g->dev, 1, &mr);
+}
+
 /* Bytes [off, off + bytes) of the token's buffer out of the CPU's caches
-   (flush) or reloaded from memory (!flush), where it is not coherent. */
+   (flush) or reloaded from memory (!flush), where it is not coherent; on a
+   card with memory of its own copied too, a submission each. */
 void janas_gt_sync_range(struct janas_gpu *g, struct janas_gpu_tok *t,
                          size_t off, size_t bytes, int flush)
 {
+    if (t->local) {
+        /* the mirror's own cache lines, then the copy; or the other way */
+        if (flush) {
+            janas_gt_mirror_cache(g, t, off, bytes, 1);
+            if (janas_g_copy(g, t->mirror.buf, off, t->buf.buf, off, bytes))
+                g->broken = 1;
+        } else {
+            if (janas_g_copy(g, t->buf.buf, off, t->mirror.buf, off, bytes))
+                g->broken = 1;
+            janas_gt_mirror_cache(g, t, off, bytes, 0);
+        }
+        return;
+    }
     if (t->buf.coherent)
         return;
     VkDeviceSize a = off / g->atom * g->atom;
@@ -753,11 +878,63 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
     if (g->vkBeginCommandBuffer(g->cb, &bb) != VK_SUCCESS)
         return -1;
     VkPipeline bound = VK_NULL_HANDLE;
-    t->prof = seg < 0; /* a pass in one submission, of any length */
-    if (t->qp && t->prof) {
+    /* a pass in one submission, of any length; or a mixture's segments,
+       recorded one after the other the first time a block runs, their
+       timestamps one series */
+    t->prof = 1;
+    if (t->qp && seg <= 0) {
         t->n_ts = 0;
         g->vkCmdResetQueryPool(g->cb, t->qp, 0, MAX_TS);
         janas_gt_stamp(g, t, PH_N); /* the start */
+    } else if (t->qp) {
+        janas_gt_stamp(g, t, PH_BETWEEN);
+    }
+    /* on a card with memory of its own: the pass's inputs from the mirror,
+       in its own commands (the sizes fixed by n, the values read at run
+       time) - a mixture's in its first submission, its outputs in its last,
+       and between the two what the CPU's plan writes and reads */
+    int last = seg < 0 || seg == (int)md->n_layer;
+    if (t->local && seg <= 0) {
+        VkBufferCopy in[3] = {
+            {.srcOffset = t->o_x,
+             .dstOffset = t->o_x,
+             .size = (VkDeviceSize)n * md->dm * sizeof(float)},
+            {.srcOffset = t->o_rope,
+             .dstOffset = t->o_rope,
+             .size = (VkDeviceSize)n * md->n_rot * sizeof(float)},
+            {.srcOffset = t->o_pos,
+             .dstOffset = t->o_pos,
+             .size = JANAS_GT_POS_BYTES}};
+        g->vkCmdCopyBuffer(g->cb, t->mirror.buf, t->buf.buf, 3, in);
+        VkMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                              .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                               VK_ACCESS_SHADER_WRITE_BIT};
+        g->vkCmdPipelineBarrier(g->cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ib,
+                                0, NULL, 0, NULL);
+    }
+    if (seg > 0 && md->n_expert) {
+        /* the previous layer's plan (gpu_token_moe.c): its rows' tokens, its
+           pairs' rows, its tables and dispatches' sizes, laid out one after
+           the other; and the experts read into the tier, or the CPU's rows,
+           copied in a submission of their own before this one */
+        if (t->local) {
+            VkBufferCopy tb = {.srcOffset = t->o_gt,
+                               .dstOffset = t->o_gt,
+                               .size = t->o_ind + 32 - t->o_gt};
+            g->vkCmdCopyBuffer(g->cb, t->mirror.buf, t->buf.buf, 1, &tb);
+        }
+        VkMemoryBarrier pb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                              .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask =
+                                  VK_ACCESS_SHADER_READ_BIT |
+                                  VK_ACCESS_SHADER_WRITE_BIT |
+                                  VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+        g->vkCmdPipelineBarrier(g->cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                0, 1, &pb, 0, NULL, 0, NULL);
     }
     uint32_t nl = md->n_layer;
     if (md->hc) {
@@ -798,6 +975,9 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
                           : janas_gt_rec_ffn(g, t, &bound, &ly->gate, &ly->up,
                                              &ly->down, n, YD)) != 0)
             return -1;
+        /* a mixture's pass in one submission: the plan on the GPU */
+        if (seg < 0 && md->n_expert)
+            janas_gt_rec_plan(g, t, md, l, &bound, n);
     }
     /* the last feed-forward added, the final norm, the output head for
        tokens first .. n - 1 (none: the residual left in X, the next block's
@@ -822,9 +1002,48 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                           .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                           .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
-    g->vkCmdPipelineBarrier(g->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
-                            NULL);
+    VkPipelineStageFlags from = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (t->local) {
+        /* the logits and the hidden states back to the mirror (qwen4exp's:
+           the streams after the last layer); before, layer seg's choice of
+           experts for the plan, and with a tier the experts' input for the
+           CPU's */
+        VkBufferCopy out[2];
+        uint32_t no = 0;
+        size_t ho = md->hc ? t->o_res : t->o_hid,
+               hb = (size_t)n * (md->hc ? md->hc : 1) * md->dm * 4;
+        if (last && first < n)
+            out[no++] = (VkBufferCopy){.srcOffset = t->o_logits,
+                                       .dstOffset = t->o_logits,
+                                       .size = (VkDeviceSize)(n - first) *
+                                               md->n_vocab * 4};
+        if (last && hid)
+            out[no++] =
+                (VkBufferCopy){.srcOffset = ho, .dstOffset = ho, .size = hb};
+        if (!last) {
+            out[no++] = (VkBufferCopy){.srcOffset = t->o_pe,
+                                       .dstOffset = t->o_pe,
+                                       .size = (VkDeviceSize)n * md->k * 4};
+            if (t->n_slot)
+                out[no++] =
+                    (VkBufferCopy){.srcOffset = t->o_xnf,
+                                   .dstOffset = t->o_xnf,
+                                   .size = (VkDeviceSize)n * md->dm * 4};
+        }
+        if (no) {
+            VkMemoryBarrier ob = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                  .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                                  .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+            g->vkCmdPipelineBarrier(g->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ob,
+                                    0, NULL, 0, NULL);
+            g->vkCmdCopyBuffer(g->cb, t->buf.buf, t->mirror.buf, no, out);
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            from = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
+    }
+    g->vkCmdPipelineBarrier(g->cb, from, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb,
+                            0, NULL, 0, NULL);
     if (g->vkEndCommandBuffer(g->cb) != VK_SUCCESS)
         return -1;
     return 0;
@@ -936,18 +1155,28 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
        write, the tokens to replay, the log's row: read by the shaders at
        run time */
     uint32_t pw[5] = {pos, src, dst, replay, log_row};
+    _Static_assert(sizeof(pw) == JANAS_GT_POS_BYTES, "the pass's words");
     memcpy(t->buf.map + t->o_pos, pw, sizeof(pw));
-    janas_gt_sync_range(g, t, t->o_x, (size_t)n * md->dm * sizeof(float), 1);
-    janas_gt_sync_range(g, t, t->o_rope, (size_t)n * md->n_rot * sizeof(float),
-                        1);
-    janas_gt_sync_range(g, t, t->o_pos, sizeof(pw), 1);
+    /* the pass copies them itself (record: a mixture's first and last
+       submissions) */
+    void (*in)(struct janas_gpu *, struct janas_gpu_tok *, size_t, size_t,
+               int) = t->local ? janas_gt_mirror_cache : janas_gt_sync_range;
+    in(g, t, t->o_x, (size_t)n * md->dm * sizeof(float), 1);
+    in(g, t, t->o_rope, (size_t)n * md->n_rot * sizeof(float), 1);
+    in(g, t, t->o_pos, sizeof(pw), 1);
     int ai = all == 1 && n == 1 ? 0 : all, hi = hidden != NULL;
     struct timespec w0, w1;
     clock_gettime(CLOCK_MONOTONIC, &w0);
     /* a failure once the GPU has started: with a replay the base it
        updates in place is no longer the state the CPU would replay on */
     int failed = replay ? -2 : -1;
-    if (md->n_expert) {
+    /* a mixture whose experts the tier holds all: read in at its first
+       pass, then its passes whole, unless the router's choices are
+       watched */
+    if (md->n_expert && t->n_slot && !t->gplan_tried &&
+        janas_gt_tier_fill(g, t, md) != 0 && g->broken)
+        return -1;
+    if (md->n_expert && (!t->gplan || (md->watched && md->watched(md->ctx)))) {
         if (janas_gt_run_segments(g, t, md, n, first, ai, hi, nch) != 0)
             return failed;
     } else {
@@ -968,14 +1197,14 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
     clock_gettime(CLOCK_MONOTONIC, &w1);
     size_t lb = (size_t)(n - first) * md->n_vocab * 4;
     if (lb) {
-        janas_gt_sync_range(g, t, t->o_logits, lb, 0);
+        in(g, t, t->o_logits, lb, 0);
         memcpy(logits, t->buf.map + t->o_logits, lb);
     }
     if (hidden) {
         /* qwen4exp's: the streams after the last layer, hc dm a token */
         size_t hb = (size_t)n * (md->hc ? md->hc : 1) * md->dm * 4,
                ho = md->hc ? t->o_res : t->o_hid;
-        janas_gt_sync_range(g, t, ho, hb, 0);
+        in(g, t, ho, hb, 0);
         memcpy(hidden, t->buf.map + ho, hb);
     }
     struct timespec w2;
@@ -1059,6 +1288,12 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
 }
 
 int janas_gpu_shares_host(const struct janas_gpu *g)
+{
+    (void)g;
+    return 0;
+}
+
+size_t janas_gpu_local_room(const struct janas_gpu *g)
 {
     (void)g;
     return 0;

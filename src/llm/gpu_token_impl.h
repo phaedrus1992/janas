@@ -97,6 +97,11 @@ struct push_cb {
     uint32_t dout[2], pw[2], inv[2], sh[2], shw[2], y[2];
     uint32_t dm, k, has_sh;
 };
+struct push_pl { /* moe_plan.comp; offsets in bytes from b */
+    uint32_t at[2], b[2];
+    uint32_t pe, gt, inv, t1, t2, ind, xg, egu, eh, dout;
+    uint32_t n, k, ne, nbd, nbf, ep, dm, eff, s1, s2, tiles1, tiles2;
+};
 struct push_id {
     uint32_t t[2];
     uint32_t rows, nb, tiles;
@@ -158,6 +163,7 @@ _Static_assert(sizeof(struct push_at) <= JANAS_G_PUSH_BYTES, "push size");
    shared memory takes: the query heads of a KV head times hd, and times a
    run. */
 #define ATT_RUN 128
+#define JANAS_GT_POS_BYTES 20 /* the pass's words at o_pos */
 #define ATT_MAXQ 2048
 #define ATT_MAXS 1024
 /* ... larger where a KV head has more than 8 query heads (attn_decode.comp
@@ -189,7 +195,9 @@ _Static_assert(sizeof(struct push_cb) <= JANAS_G_PUSH_BYTES, "push size");
 #define TOK_PART_BUDGET ((size_t)64 << 20)
 
 /* JANAS_GPU_TOKEN_PROFILE=1: the GPU's own timestamps after each phase of
-   the token, summed per phase and printed when the model is closed */
+   the token, summed per phase and printed when the model is closed; a
+   mixture's segments too, with the time between two of them (the CPU's
+   plan, the submission's round trip) as a phase of its own */
 enum {
     PH_NORM,
     PH_QKV,
@@ -209,6 +217,11 @@ enum {
     PH_SSM_CONV,
     PH_SSM_REC,
     PH_SSM_GATE,
+    /* a mixture's: the router's choice, the experts' weighted sum, the
+       time from a segment's last timestamp to the next one's start */
+    PH_ROUTER,
+    PH_COMBINE,
+    PH_BETWEEN,
     PH_N
 };
 #define MAX_TS 1024
@@ -223,14 +236,15 @@ struct janas_gpu_tok {
     /* [n][all][hidden wanted] */
     VkCommandBuffer cb[TOK_MAX_BLOCK + 1][3][2];
     uint32_t cb_nch[TOK_MAX_BLOCK + 1][3]
-                   [2]; /* the runs each was recorded for */
-    int prof;           /* timestamps in the commands being recorded (n = 1) */
-    VkQueryPool qp;     /* timestamps, if profiling */
-    uint32_t n_ts;      /* written this token */
+                   [2];    /* the runs each was recorded for */
+    int prof;              /* timestamps in the commands being recorded */
+    VkQueryPool qp;        /* timestamps, if profiling */
+    uint32_t n_ts;         /* written this token */
     uint8_t ph_of[MAX_TS]; /* the phase each timestamp closes */
     double ph_ns[PH_N];
     double wall_ns;       /* submission to the fence, as the CPU sees it */
     double copy_ns;       /* the logits copied out */
+    double plan_ns;       /* a mixture's plans, on the CPU */
     uint64_t tokens;      /* with profiling: passes measured */
     uint64_t pass_tokens; /* ... and their tokens */
     VkShaderModule sm_nq, sm_qk, sm_at, sm_am;
@@ -241,6 +255,11 @@ struct janas_gpu_tok {
     VkPipeline p_gc, p_gs, p_gl, p_gr, p_gg, p_gb, p_gx;
     size_t *par;      /* per layer: its parameters' offsets in buf (PAR_*) */
     struct stage buf; /* every intermediate, one allocation */
+    /* on a card with memory of its own buf is in that memory (its map this
+       mirror's, host-visible): janas_gt_sync_range copies the ranges the
+       host writes or reads between the two */
+    struct stage mirror;
+    int local;
     /* offsets into buf, each nb tokens' worth */
     uint32_t nch;       /* the attention's runs of positions, for the cache */
     size_t part_floats; /* room for the runs of a block, floats */
@@ -272,11 +291,44 @@ struct janas_gpu_tok {
        blocks of 32, where a down matrix is in blocks of 32 */
     size_t o_hf, o_h32;
     uint32_t tiles1, tiles2;
+    /* blocks of this many tokens or fewer (by default all): the experts'
+       products whose types have one through the matvec shaders (gpu.c
+       pipe_mvid, bit for bit with the CPU's), not *_mmid's tiles
+       (JANAS_GPU_MVID=<n>, 0 never) */
+    uint32_t mvid_n;
     uint32_t n_seg; /* n_layer + 1 */
     /* the CPU's side: the experts' counts and fill, those chosen, their
        slots */
     uint32_t *cnt, *fill, *ids;
     const uint8_t **slots;
+    /* a card whose memory does not hold the experts (gpu_token_moe.c): a
+       tier of n_slot slots of slot_bytes in it with the experts used most,
+       slot_of[layer * n_expert + e] (or -1), owner (layer * n_expert + e,
+       or UINT32_MAX), uses[layer * n_expert + e] counted at each block,
+       stamp the plan that last counted on a slot (plan_no: that plan's);
+       the experts read into it through up (a stage of UP_SLOTS slots); per
+       block the experts of a layer that the GPU computes (gpu ids, their
+       tier slot), those that the CPU does, the misses asked of fetch */
+#define TIER_PIECES 64
+    struct stage tier[TIER_PIECES], up; /* the tier in pieces of per slots */
+    uint32_t n_slot, n_free, scan, plan_no, per;
+    size_t slot_bytes;
+    int32_t *slot_of;
+    uint32_t *owner, *uses, *stamp, *on_gpu, *gpu_slot, *on_cpu, *miss, *ra,
+        *rb;
+    const uint8_t **cpu_slots;
+    /* a plan's copies in one submission: the last experts read into the
+       tier, the CPU's rows */
+    struct janas_g_cp *cps;
+    uint64_t tier_hits, tier_loads, cpu_experts;
+    /* every expert in the tier (janas_gt_tier_fill, tried once): the plan
+       on the GPU, moe_plan.comp after each router, a mixture's pass in one
+       submission; at: the experts' addresses in the tier, 3 uvec4 each,
+       n_expert a layer */
+    int gplan, gplan_tried;
+    struct stage at;
+    VkShaderModule sm_pl;
+    VkPipeline p_pl;
     /* the feed-forwards' widths padded to whole groups of 256: the
        experts' (effp) and the shared expert's or dense one's (ffp) */
     uint32_t effp, ffp;
@@ -309,6 +361,11 @@ VkDeviceAddress janas_gt_addr_of(const struct janas_gpu *g, const void *p,
                                  size_t bytes);
 /* Bytes [off, off + bytes) of the token's buffer out of the CPU's caches
    (flush) or reloaded from memory (!flush), where it is not coherent. */
+/* Bytes [off, off + bytes) of the mirror out of the CPU's caches (flush)
+   or reloaded from memory (!flush), where it is not coherent: the copies
+   between it and buf are in the pass's own commands. */
+void janas_gt_mirror_cache(struct janas_gpu *g, struct janas_gpu_tok *t,
+                           size_t off, size_t bytes, int flush);
 void janas_gt_sync_range(struct janas_gpu *g, struct janas_gpu_tok *t,
                          size_t off, size_t bytes, int flush);
 /* A command buffer for cb, allocated, and the commands of segment seg of a
@@ -374,7 +431,9 @@ void janas_gt_rec_bf16(struct janas_gpu *g, VkPipeline *bound,
                        VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
                        uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
                        float scale);
-/* the same for w of dense_mm.comp's kind: 1 bf16, 2 Q8_0 */
+/* the same for w of dense_mm.comp's kind: 0 f32, 1 bf16, 2 Q8_0; on
+   DENSE_MV_MAX vectors or fewer a workgroup a row (dense_mv.comp) */
+#define DENSE_MV_MAX 8
 void janas_gt_rec_dense(struct janas_gpu *g, VkPipeline *bound, int kind,
                         VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
                         uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
@@ -400,6 +459,18 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           const struct janas_gpu_tok_model *md,
                           const struct janas_gpu_tok_layer *ly,
                           VkPipeline *bound, VkDeviceAddress YD, uint32_t n);
+int janas_gt_tier_create(struct janas_gpu *g, struct janas_gpu_tok *t,
+                         const struct janas_gpu_tok_model *md);
+void janas_gt_tier_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
+/* Every expert read into a tier that holds them all, their addresses
+   written for moe_plan.comp, t->gplan set: 0, or -1 (the plan stays the
+   CPU's). */
+int janas_gt_tier_fill(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md);
+/* Layer l's plan on the GPU from its router's choice (t->gplan) */
+void janas_gt_rec_plan(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md, uint32_t l,
+                       VkPipeline *bound, uint32_t n);
 void janas_gt_free_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
                             VkCommandBuffer **seg);
 int janas_gt_run_segments(struct janas_gpu *g, struct janas_gpu_tok *t,

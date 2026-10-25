@@ -29,6 +29,9 @@
 // realigned by the byte, the others' by the half word. An E8M0 byte of 0 or
 // 1 is a subnormal scale, which a GPU may flush to zero where the CPU does
 // not: such blocks (weights under 2^-125) differ from the CPU's.
+// With ID (bit 8 of constant 2) a mixture's experts, the table of
+// *_mmid.comp (gpu_token_moe.c) in w, as q4k_matvec.comp reads it: x's
+// vectors nb blocks of 256 apart, one more with a tail.
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
@@ -38,7 +41,9 @@
 layout(local_size_x = 64) in;
 layout(constant_id = 0) const uint NV = 8;
 layout(constant_id = 1) const uint SG = 8;
-layout(constant_id = 2) const uint KIND = 0;
+layout(constant_id = 2) const uint KID = 0;
+const uint KIND = KID & 255u;
+const bool ID = (KID & 256u) != 0u;
 const uint NX = (20u + SG - 1u) / SG;
 /* bytes of a block of 32 weights (Q2_0: half a block), and of a group of
    eight in words */
@@ -104,9 +109,12 @@ uint iq4(uint w)
            (T[(w >> 24) & 15u] << 24);
 }
 
+/* precise, as the accumulators below: no add fused with a product (a
+   tail's blocks are single products from zero, which a compiler may see) */
 float hsum8(float a[8])
 {
-    return ((a[0] + a[4]) + (a[2] + a[6])) + ((a[1] + a[5]) + (a[3] + a[7]));
+    precise float s = ((a[0] + a[4]) + (a[2] + a[6])) + ((a[1] + a[5]) + (a[3] + a[7]));
+    return s;
 }
 
 /* the word of wg at byte b, realigned by the half word */
@@ -121,20 +129,32 @@ void main()
         T[gl_LocalInvocationID.x] =
             uint(KIND == 4u ? MX[gl_LocalInvocationID.x] : IQ4[gl_LocalInvocationID.x]) & 0xffu;
     barrier();
-    U1 W = U1(p.w);
-    U4 X = U4(p.x);
-    F Y = F(p.y);
+    uvec2 pw = p.w, px = p.x, py = p.y;
+    uint nv = p.nv, xs = p.xs, ys = p.ys, v0 = gl_WorkGroupID.x * NV;
+    if (ID) {
+        U4 Tb = U4(p.w);
+        uvec4 tl = Tb.v[p.nv + gl_WorkGroupID.z];
+        uvec4 t0 = Tb.v[3u * tl.x], t1 = Tb.v[3u * tl.x + 1u];
+        pw = t0.xy, px = t0.zw, py = t1.xy;
+        nv = t1.z, xs = p.nb + (p.tail != 0u ? 1u : 0u), ys = t1.w, v0 = tl.y;
+    }
+    U1 W = U1(pw);
+    U4 X = U4(px);
+    F Y = F(py);
     uint lane = gl_SubgroupInvocationID;
     /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
        of the same rows go out together and the weights the first reads
        from memory the others find in the L3 */
     uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
     uint row = min(grow, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
-        xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
-    float acc[NV][8], accm[NV][8], res[NV];
+        xo[v] = min(v0 + v, nv - 1u) * xs * 20u;
+    /* precise: the CPU rounds every product and every sum apart; without
+       it a compiler may fuse a sum with a product before it (the tail's
+       accumulators start from zero in the loop, a known value: AMD's,
+       issue #46) */
+    precise float acc[NV][8], accm[NV][8], res[NV];
     for (uint v = 0; v < NV; v++) {
         res[v] = 0.0;
         for (uint k = 0; k < 8u; k++) {
@@ -238,12 +258,12 @@ void main()
     }
     if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
-            if (v0 + v < p.nv) {
-                float r = hsum8(acc[v]);
+            if (v0 + v < nv) {
+                precise float r = hsum8(acc[v]);
                 if (DM)
                     r = r + hsum8(accm[v]);
                 if (p.tail != 0u)
                     r = res[v] + r;
-                Y.v[(v0 + v) * p.ys + row] = r;
+                Y.v[(v0 + v) * ys + row] = r;
             }
 }

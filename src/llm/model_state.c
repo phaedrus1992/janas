@@ -232,6 +232,7 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
 {
     if (n > m->n_ctx)
         return NULL;
+    janas_m_gtok_host(m, 0); /* what the GPU made newer, read here */
     /* a ring keeps the window before n only while nothing past n + (its
        capacity - the window) has been written over it */
     for (uint32_t sl = 0; sl < m->n_attn; sl++)
@@ -314,6 +315,7 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
 int janas_llm_model_state_load(struct janas_llm_model *m,
                                const struct janas_llm_state *st)
 {
+    janas_m_gtok_host(m, 1); /* the state written here */
     /* the rows copied do not depend on the context opened, only on its
        being long enough */
     if (st->n > m->n_ctx || st->n_slots != m->n_attn + (m->mtp ? 1u : 0u) ||

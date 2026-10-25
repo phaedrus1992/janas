@@ -139,17 +139,8 @@ int janas_gt_rec_gdn(struct janas_gpu *g, struct janas_gpu_tok *t,
         g->vkCmdDispatch(g->cb, (2 * md->nv + GBA_RW - 1) / GBA_RW, (n + 7) / 8,
                          1);
     } else {
-        struct push_dm pd = {.rows = 2 * md->nv,
-                             .cols = md->dm,
-                             .nv = n,
-                             .ys = 2 * md->nv,
-                             .scale = 1.0f};
-        janas_g_push_addr(pd.w, B + pr[PAR_BA]);
-        janas_g_push_addr(pd.x, B + t->o_xnf);
-        janas_g_push_addr(pd.y, BA);
-        janas_gt_bind(g, bound, g->pipe_dm[0]);
-        janas_gt_push(g, &pd, sizeof(pd));
-        g->vkCmdDispatch(g->cb, (2 * md->nv + 63) / 64, (n + 63) / 64, 1);
+        janas_gt_rec_dense(g, bound, 0, B + pr[PAR_BA], B + t->o_xnf, BA,
+                           2 * md->nv, md->dm, 2 * md->nv, n, 1.0f);
         janas_g_compute_barrier(g);
         struct push_gact px = {.nv = md->nv, .n = n};
         janas_g_push_addr(px.ba, BA);

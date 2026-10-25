@@ -118,6 +118,22 @@ struct janas_gpu_tok_model {
        caller goes on (or NULL): a block of many tokens chooses nearly all
        of them, so none is read for nothing */
     void (*prefetch)(void *ctx, uint32_t layer);
+    /* whether routed must see each layer's choice (or NULL): then a layer
+       at a time even when the card holds every expert */
+    int (*watched)(void *ctx);
+    /* a card whose memory does not hold all the experts (tier_bytes > 0):
+       a tier of slots of slot_bytes in its memory keeps those used most,
+       read into it from the slots fetch gives; the others computed by
+       cpu_rows, layer's experts ids[0..nd) of slots[], their rows
+       [ra[i], rb[i]) of out (dm floats each, before their weights), row r
+       a pair of token tok[r], from xn (n tokens of dm floats, the
+       feed-forward's normalized input): 0, or -1 (the block goes to the
+       CPU) */
+    size_t tier_bytes, slot_bytes;
+    int (*cpu_rows)(void *ctx, uint32_t layer, uint32_t n, const float *xn,
+                    uint32_t nd, const uint32_t *ids,
+                    const uint8_t *const *slots, const uint32_t *ra,
+                    const uint32_t *rb, const uint32_t *tok, float *out);
     void *ctx;
     /* qwen4exp: hc streams of the residual (0: one, the others), the
        mixes' rank, the output's mix (no inject); ng_layer the n-gram

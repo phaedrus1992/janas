@@ -168,6 +168,31 @@ void janas_gpu_keep_awake(struct janas_gpu *g, int on);
 /* The device's name, and the subgroup size the shaders run with. */
 const char *janas_gpu_name(const struct janas_gpu *g);
 unsigned janas_gpu_subgroup(const struct janas_gpu *g);
+/* The subgroup sizes the device lets the shaders be given (the running one
+   twice where it cannot be chosen): JANAS_GPU_SG picks one at creation. */
+void janas_gpu_subgroup_range(const struct janas_gpu *g, unsigned *min,
+                              unsigned *max);
+/* One line on the device and its driver for a report: name, kind, driver
+   and its version, Vulkan, subgroups, the float controls that keep its
+   results the CPU's. */
+const char *janas_gpu_about(const struct janas_gpu *g);
+/* What the check of the GPU's products against the CPU's on opening left
+   out on this driver ("" if nothing; gpu_selfcheck.c). */
+const char *janas_gpu_check_note(const struct janas_gpu *g);
+
+/* For diagnosis (gpu_check): the shader that recorded the last product,
+   as "q6k_row NV 1 SG 32" (its name, vectors a workgroup, subgroup size,
+   kind where it serves several types), "" if none; and the products'
+   paths switched on or off, the value before returned. */
+size_t janas_gpu_last_shader(const struct janas_gpu *g, char *buf, size_t len);
+enum janas_gpu_path {
+    JANAS_GPU_PATH_ROW,    /* the subgroup-per-row shaders (*_row.comp) */
+    JANAS_GPU_PATH_ROW_NV, /* ... on up to this many vectors (4) */
+    JANAS_GPU_PATH_MVD,    /* the lanes on the vectors (*_mvd.comp) */
+    JANAS_GPU_PATH_MV      /* q4k_mv.comp (off) */
+};
+int janas_gpu_set_path(struct janas_gpu *g, enum janas_gpu_path path,
+                       int value);
 /* The fewest vectors a product needs to be given to the GPU: 1 on a
    discrete GPU (single tokens too), 2 on an integrated one;
    JANAS_GPU_MIN_N sets it. */
@@ -185,5 +210,14 @@ size_t janas_gpu_few_max(const struct janas_gpu *g);
    whole token needs, and what makes the engine's buffers worth importing.
    On a card with memory of its own an import is a copy. */
 int janas_gpu_shares_host(const struct janas_gpu *g);
+
+/* Bytes of a card's own memory still free for Janas (85% of it, less what
+   it took); 0 on a GPU that shares the host's memory. */
+size_t janas_gpu_local_room(const struct janas_gpu *g);
+/* Bytes of host memory and the GPU's copy of them made the same: to the
+   device (to_device 1) or back to the host (0), for buffers both write on
+   a card with memory of its own; nothing where the GPU shares the host's
+   memory. 0, or -1 (not imported, or the GPU busy or broken). */
+int janas_gpu_sync(struct janas_gpu *g, void *p, size_t bytes, int to_device);
 
 #endif

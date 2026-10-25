@@ -1441,6 +1441,17 @@ void janas_llm_model_free(struct janas_llm_model *m)
 {
     if (janas_m_exp_tracing())
         janas_m_exp_report();
+    if (m && getenv("JANAS_GPU_VERBOSE") &&
+        (m->gtok_runs[0] | m->gtok_runs[1] | m->gtok_runs[2]))
+        fprintf(stderr,
+                "janas: whole on the GPU %llu single tokens, %llu passes of "
+                "2-16, %llu blocks; the state %s (%llu there, %llu back)\n",
+                (unsigned long long)m->gtok_runs[0],
+                (unsigned long long)m->gtok_runs[1],
+                (unsigned long long)m->gtok_runs[2],
+                m->gtok_dev ? "copied to the card's memory" : "shared",
+                (unsigned long long)m->gtok_push,
+                (unsigned long long)m->gtok_pull);
     if (m && m->skip_asked && (getenv("JANAS_MISS_SKIP") || m->trace))
         fprintf(stderr,
                 "janas: experts not in RAM below %.3f left out: %llu of %llu "
@@ -1833,6 +1844,16 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
 {
     if (!m->gpu || m->gpu_off || !m->cache || m->arena_gpu < 0)
         return;
+    /* a mixture on a card with memory of its own: its experts through the
+       tier the whole pass keeps there (gpu_token_moe.c), not a copy of the
+       arena beside it */
+    if (m->arena_gpu == 0 && janas_m_gpu_tier(m)) {
+        m->arena_gpu = -1;
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr, "arena: not copied, the experts through the "
+                            "card's tier\n");
+        return;
+    }
     if (m->arena_gpu == 1) {
         if (!m->arena_stale && !m->arena_in_place &&
             janas_expert_cache_loads(m->cache) != m->arena_loads)

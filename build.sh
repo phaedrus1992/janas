@@ -270,20 +270,33 @@ else
 fi
 echo '#include <vulkan/vulkan.h>' | "$CC" "${VK_INC[@]}" -E -x c - >/dev/null 2>&1 ||
     GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }the Vulkan headers (libvulkan-dev, vulkan-headers)"
+# every fma() of a shader decorated NoContraction, one operation as on the
+# CPU (tools/spv_fma.c: glslang leaves them free to be split), by a tool
+# built with the compiler of the machine that builds (HOSTCC, cc)
+SPV_FMA="$SPV/spv_fma"
+if [ -n "$GLSLANG" ] &&
+    { [ ! -x "$SPV_FMA" ] || [ tools/spv_fma.c -nt "$SPV_FMA" ]; }; then
+    if ! "${HOSTCC:-cc}" -O2 -o "$SPV_FMA" tools/spv_fma.c; then
+        GLSLANG=""
+        GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a C compiler for the build machine (HOSTCC) to build tools/spv_fma.c"
+    fi
+fi
 if [ -n "$GLSLANG" ]; then
     for comp in src/*/shaders/*.comp; do
         [ -f "$comp" ] || continue
         name=$(basename "${comp%.comp}")
         out="$SPV/$name.h"
-        if [ ! -f "$out" ] || [ "$comp" -nt "$out" ]; then
+        if [ ! -f "$out" ] || [ "$comp" -nt "$out" ] || [ "$SPV_FMA" -nt "$out" ]; then
             echo "SPV $comp"
             if ! glslangValidator -V --target-env vulkan1.3 \
-                --vn "janas_spv_$name" "$comp" -o "$out" >/dev/null; then
+                "$comp" -o "$SPV/$name.spv" >/dev/null ||
+                ! "$SPV_FMA" "$SPV/$name.spv" "janas_spv_$name" "$out"; then
                 rm -f "$out"
                 GLSLANG=""
                 GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a glslangValidator that compiles $comp"
                 break
             fi
+            rm -f "$SPV/$name.spv"
         fi
     done
 fi

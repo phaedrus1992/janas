@@ -300,4 +300,28 @@ uint64_t janas_rss_bytes(void)
     return ok && page > 0 ? (uint64_t)resident * (uint64_t)page : 0;
 }
 
+size_t janas_l2_bytes(void)
+{
+    for (int i = 0; i < 8; i++) {
+        char path[96], buf[32];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        if (read_long(path) != 2)
+            continue;
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            return 0;
+        char *ok = fgets(buf, sizeof(buf), f);
+        fclose(f);
+        char *end;
+        unsigned long v = ok ? strtoul(buf, &end, 10) : 0;
+        if (!ok || end == buf)
+            return 0;
+        return *end == 'K' ? v << 10 : *end == 'M' ? v << 20 : v;
+    }
+    return 0;
+}
+
 #endif /* !_WIN32 */

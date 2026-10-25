@@ -1244,14 +1244,19 @@ float janas_iq2_dot_ref(int type, const void *w,
     return acc;
 }
 
-/* IQ1_M: the block's d, from the top nibbles of its four scale words */
-static inline float iq1m_d(const struct janas_block_iq1m *w)
+/* IQ1_M: the block's d as fp16, from the top nibbles of its four scale
+   words (the kernels convert it with F16C: a call in their loop costs) */
+static inline uint16_t iq1m_d16(const struct janas_block_iq1m *w)
 {
     uint16_t sc[4];
     memcpy(sc, w->scales, 8);
-    uint16_t h = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
-                            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
-    return janas_fp16_to_fp32(h);
+    return (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                      ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+}
+
+static inline float iq1m_d(const struct janas_block_iq1m *w)
+{
+    return janas_fp16_to_fp32(iq1m_d16(w));
 }
 
 /* sub-group l (0-31) of an IQ1_M block: its grid entry, whether its shift
@@ -1465,22 +1470,68 @@ static inline void unpack_scales_u32(const uint8_t *q, uint32_t out[4])
    slower than IQ4_NL on 12 threads). Filled before main. */
 static float e8m0_tab[256];
 
+/* The signs of an IQ2 and IQ3 7-bit index (iq_signs) as eight bytes, 1 or
+   -1 (0xff): weight j's multiplier in byte j, for the kernels to read four
+   at a time (the parity and the bits spread to bytes took some thirty
+   instructions a group of 32). */
+static uint64_t iq_sign64[128];
+/* the same for a byte of eight signs as it is (IQ2_S) */
+static uint64_t iq_byte64[256];
+
+/* iq2_sub with the signs as eight bytes of multipliers (iq_sign64) */
+static inline void iq2_sub_mask(int type, const void *blk, int l,
+                                uint64_t *grid, uint64_t *mask, int *scale)
+{
+    int g = l / 4, k = l % 4;
+    if (type == JANAS_IQ2_XXS) {
+        const struct janas_block_iq2xxs *w = blk;
+        uint32_t aux[2];
+        memcpy(aux, w->qs + 4 * g, 8);
+        *grid = iq2xxs_grid[aux[0] >> 8 * k & 255];
+        *mask = iq_sign64[aux[1] >> 7 * k & 127];
+        *scale = 1 + 2 * (int)(aux[1] >> 28);
+    } else if (type == JANAS_IQ2_XS) {
+        const struct janas_block_iq2xs *w = blk;
+        uint32_t q = w->qs[4 * g + k];
+        *grid = iq2xs_grid[q & 511];
+        *mask = iq_sign64[q >> 9];
+        *scale = 1 + 2 * (w->scales[g] >> 4 * (k / 2) & 15);
+    } else { /* IQ2_S: its kernel spreads the sign bytes itself */
+        const struct janas_block_iq2s *w = blk;
+        *grid = iq2s_grid[w->qs[4 * g + k] |
+                          ((uint32_t)w->qh[g] << (8 - 2 * k) & 0x300)];
+        *mask = iq_byte64[w->qs[32 + 4 * g + k]];
+        *scale = 1 + 2 * (w->scales[g] >> 4 * (k / 2) & 15);
+    }
+}
+
 /* The kernels proper: quant_dotn.h, once for AVX2 and once for AVX-VNNI. */
 #define DOTN(name) name##_avx2
 #define DOTN_TARGET __attribute__((target("avx2,fma,f16c")))
 #define DOTN_ACC(acc, p, s) _mm256_add_epi32(acc, _mm256_madd_epi16(p, s))
+#define DOTN_US2(u0, s0, u1, s1)                                               \
+    _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(u0, s0),           \
+                                       _mm256_maddubs_epi16(u1, s1)),          \
+                      _mm256_set1_epi16(1))
 #include "quant_dotn.h"
 #undef DOTN
 #undef DOTN_TARGET
 #undef DOTN_ACC
+#undef DOTN_US2
 
+#define DOTN_HAS_VNNI
 #define DOTN(name) name##_vnni
 #define DOTN_TARGET __attribute__((target("avx2,fma,f16c,avxvnni")))
 #define DOTN_ACC(acc, p, s) _mm256_dpwssd_avx_epi32(acc, p, s)
+#define DOTN_US2(u0, s0, u1, s1)                                               \
+    _mm256_dpbusd_avx_epi32(                                                   \
+        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u0, s0), u1, s1)
 #include "quant_dotn.h"
 #undef DOTN
 #undef DOTN_TARGET
 #undef DOTN_ACC
+#undef DOTN_US2
+#undef DOTN_HAS_VNNI
 #endif
 
 typedef float (*dot_fn)(const struct janas_block_q4k *,
@@ -1547,12 +1598,48 @@ typedef void (*dotn6p_fn)(const struct janas_block_q6kp *, const uint8_t *,
 static dotn6p_fn dot6p_impl; /* NULL: the scalar reference */
 static const char *dot_name = "ref";
 static int use_vnni;
+/* Q3_K, Q4_K, Q5_K, Q6_K and Q6_K_P on many vectors through the tiles
+   (quant_dotn.h q4k_gemm, q5k_gemm, q6k_gemm); JANAS_CPU_TILES=0 the rows'
+   products */
+static int use_tiles = 1;
+/* The vectors from which the tiles pay: their buffer is filled once for
+   the vectors of a call, so on few the rows' products win. bench_kernels
+   (BENCH_NV, 2048 columns, 12 threads, 25 Oct 2026): Q4_K, Q5_K and Q6_K
+   lose at 8 vectors (Q4_K 28.1 against 23.7 GB/s with AVX-VNNI, 21.0
+   against 18.8 with AVX2) and win from 12 (17.5 against 19.8, 13.4
+   against 14.8); Q3_K, whose filling costs more, wins from 24 (5.8
+   against 6.5) and loses at 16 (8.9 against 8.1). */
+#define TILES_MIN_NV 12
+#define TILES_MIN_NV_Q3K 20
+/* the types in blocks of 32 (BENCH_NV, 12 threads): with AVX2 the tiles
+   win from 12 vectors (Q8_0 18.3 against 20.9 GB/s), with AVX-VNNI, whose
+   rows' products have no reduction tree either, from 24 (Q8_0 19.6
+   against 20.4, at 16 29.3 against 27.8) */
+#define TILES_MIN_NV_B32 (use_vnni ? 24 : 12)
+/* Q2_0, against its rows' products on reordered activations (BENCH_NV,
+   12 threads): with AVX-VNNI the tiles win from 24 vectors (4.6 against
+   5.3 GB/s, at 64 1.7 against 2.1), with AVX2 never (at 12 8.0 against
+   6.6, at 32 and 64 even), its two-bit values unpacked as cheaply */
+#define TILES_MIN_NV_Q20 (use_vnni ? (size_t)24 : SIZE_MAX)
+
+/* Q2_K and the IQ types with grids (BENCH_NV, 12 threads): from 12
+   vectors, Q2_K even there (8.6 against 8.2 GB/s with AVX-VNNI), the IQ
+   types ahead (IQ3_S 8.8 against 6.4); on 64 1.6 to 2.6 times as fast */
+#define TILES_MIN_NV_IQK 12
 
 /* Resolved before main: the kernels are first called from pool threads. */
 __attribute__((constructor)) static void dot_kernels_init(void)
 {
     for (int e = 0; e < 256; e++)
         e8m0_tab[e] = janas_e8m0_half((uint8_t)e);
+    for (uint32_t i = 0; i < 256; i++) {
+        uint64_t m = 0;
+        for (int j = 0; j < 8; j++)
+            m |= (uint64_t)(i >> j & 1 ? 0xff : 0x01) << 8 * j;
+        iq_byte64[i] = m;
+    }
+    for (uint32_t i = 0; i < 128; i++)
+        iq_sign64[i] = iq_byte64[iq_signs(i)];
 #if defined(__x86_64__)
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
@@ -1578,6 +1665,8 @@ __attribute__((constructor)) static void dot_kernels_init(void)
         dotis_impl = iq3s_dot_avx2;
         dot6p_impl = q6kp_dotn_avx2;
         dot_name = "avx2";
+        const char *qg = getenv("JANAS_CPU_TILES");
+        use_tiles = !(qg && atoi(qg) == 0);
         const char *k = getenv("JANAS_KERNELS"); /* avx2: no VNNI */
         if (__builtin_cpu_supports("avxvnni") && !(k && !strcmp(k, "avx2"))) {
             use_vnni = 1;
@@ -1741,6 +1830,35 @@ float janas_q6kp_dot(const struct janas_block_q6kp *w, const uint8_t *p1,
         return r;
     }
     return janas_q6kp_dot_ref(w, p1, p0, x, nb);
+}
+
+size_t janas_q6k_tile_rows(int type, const void *w, size_t row_bytes,
+                           const uint8_t *p1, const uint8_t *p0, size_t pb,
+                           const struct janas_block_q8k *x, size_t x_stride,
+                           size_t nv, size_t nb, size_t rows, float *y,
+                           size_t y_stride)
+{
+#if defined(__x86_64__)
+    size_t r8 = rows / 8 * 8;
+    if (!use_tiles || !dot6p_impl ||
+        nv < (type == JANAS_Q3_K ? TILES_MIN_NV_Q3K : TILES_MIN_NV) || !r8 ||
+        (type != JANAS_Q6_K && type != JANAS_Q6_K_P && type != JANAS_Q3_K))
+        return 0;
+    /* q6k_gemm's L: 0 Q6_K, 1-3 Q6_K_P's level, 4 Q3_K */
+    int level = type == JANAS_Q6_K   ? 0
+                : type == JANAS_Q3_K ? 4
+                : p0                 ? 3
+                : p1                 ? 2
+                                     : 1;
+    (use_vnni ? q6k_gemm_vnni : q6k_gemm_avx2)(
+        w, row_bytes, p1, p0, pb, x, x_stride, nv, nb, r8, y, y_stride, level);
+    return r8;
+#else
+    (void)type, (void)w, (void)row_bytes, (void)p1, (void)p0, (void)pb;
+    (void)x, (void)x_stride, (void)nv, (void)nb, (void)rows, (void)y;
+    (void)y_stride;
+    return 0;
+#endif
 }
 
 void janas_q6kp_dot_multi(const struct janas_block_q6kp *w, const uint8_t *p1,
@@ -2095,6 +2213,92 @@ void janas_dot_rows(int type, const void *w, size_t row_bytes,
         y[r] = janas_dot(type, (const char *)w + r * row_bytes, x, nb);
 }
 
+void janas_dot_multi_rows(int type, const void *w, size_t row_bytes,
+                          const struct janas_block_q8k *x, size_t x_stride,
+                          size_t nv, size_t nb, size_t rows, float *y,
+                          size_t y_stride)
+{
+#if defined(__x86_64__)
+    if (type == JANAS_Q2_0 && use_avx2_fma && __builtin_cpu_supports("f16c")) {
+        size_t r8 = use_tiles && nv >= TILES_MIN_NV_Q20 ? rows / 8 * 8 : 0;
+        if (r8)
+            (use_vnni ? b32_gemm_vnni : b32_gemm_avx2)(
+                type, w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride);
+        if (rows > r8)
+            (use_vnni ? q2_0_multi_rows_vnni : q2_0_multi_rows_avx2)(
+                (const char *)w + r8 * row_bytes, row_bytes, x, x_stride, nv,
+                nb, rows - r8, y + r8, y_stride);
+        return;
+    }
+    if (use_tiles && use_avx2_fma && nv >= (size_t)TILES_MIN_NV_B32 &&
+        rows >= 8 && __builtin_cpu_supports("f16c")) {
+        size_t r8 = rows / 8 * 8;
+        if ((use_vnni ? b32_gemm_vnni : b32_gemm_avx2)(
+                type, w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride)) {
+            w = (const char *)w + r8 * row_bytes;
+            y += r8;
+            rows -= r8;
+            if (!rows)
+                return;
+        }
+    }
+    if (use_vnni && b32_multi_rows_vnni(type, w, row_bytes, x, x_stride, nv, nb,
+                                        rows, y, y_stride))
+        return;
+    if (type == JANAS_Q4_K && use_avx2_fma && __builtin_cpu_supports("f16c")) {
+        size_t r8 = use_tiles && nv >= TILES_MIN_NV ? rows / 8 * 8 : 0;
+        if (r8)
+            (use_vnni ? q4k_gemm_vnni : q4k_gemm_avx2)(
+                w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride);
+        if (rows > r8)
+            (use_vnni ? q4k_multi_rows_vnni : q4k_multi_rows_avx2)(
+                (const char *)w + r8 * row_bytes, row_bytes, x, x_stride, nv,
+                nb, rows - r8, y + r8, y_stride);
+        return;
+    }
+    if (type == JANAS_Q5_K && use_avx2_fma && __builtin_cpu_supports("f16c")) {
+        size_t r8 = use_tiles && nv >= TILES_MIN_NV ? rows / 8 * 8 : 0;
+        if (r8)
+            (use_vnni ? q5k_gemm_vnni : q5k_gemm_avx2)(
+                w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride);
+        if (rows > r8)
+            (use_vnni ? q5k_multi_rows_vnni : q5k_multi_rows_avx2)(
+                (const char *)w + r8 * row_bytes, row_bytes, x, x_stride, nv,
+                nb, rows - r8, y + r8, y_stride);
+        return;
+    }
+    if (type == JANAS_IQ4_XS && use_tiles && use_avx2_fma &&
+        nv >= TILES_MIN_NV && rows >= 8 && __builtin_cpu_supports("f16c")) {
+        size_t r8 = rows / 8 * 8;
+        (use_vnni ? iq4xs_gemm_vnni : iq4xs_gemm_avx2)(
+            w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride);
+        w = (const char *)w + r8 * row_bytes;
+        y += r8;
+        rows -= r8;
+    }
+    if (use_tiles && use_avx2_fma && nv >= (size_t)TILES_MIN_NV_IQK &&
+        rows >= 8 && __builtin_cpu_supports("f16c")) {
+        size_t r8 = rows / 8 * 8;
+        if ((use_vnni ? iqk_gemm_vnni : iqk_gemm_avx2)(
+                type, w, row_bytes, x, x_stride, nv, nb, r8, y, y_stride)) {
+            w = (const char *)w + r8 * row_bytes;
+            y += r8;
+            rows -= r8;
+        }
+    }
+    if (type == JANAS_Q6_K || type == JANAS_Q3_K) {
+        size_t r8 = janas_q6k_tile_rows(type, w, row_bytes, NULL, NULL, 0, x,
+                                        x_stride, nv, nb, rows, y, y_stride);
+        w = (const char *)w + r8 * row_bytes;
+        y += r8;
+        rows -= r8;
+    }
+#endif
+    for (size_t r = 0; r < rows; r++)
+        janas_dot_multi(type, (const char *)w + r * row_bytes, x, x_stride, nv,
+                        nb, y + r, y_stride);
+}
+
 void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
                      size_t x_stride, size_t nv, size_t nb, float *out,
                      size_t out_stride)
@@ -2288,6 +2492,44 @@ void janas_dot_rows_n(int type, const void *w, size_t row_bytes,
         janas_dot_rows(type, pad, gb, x + nb, 1, c, t);
         for (size_t i = 0; i < c; i++)
             y[r0 + i] = (nb ? y[r0 + i] : 0.0f) + t[i];
+    }
+}
+
+/* the whole groups of all the rows, then the tails CHUNK rows and VEC
+   vectors at a time: janas_dot_multi_rows gives them the tiles */
+void janas_dot_multi_rows_n(int type, const void *w, size_t row_bytes,
+                            const struct janas_block_q8k *x, size_t x_stride,
+                            size_t nv, size_t n, size_t rows, float *y,
+                            size_t y_stride)
+{
+    size_t nb = n / JANAS_QK;
+    if (n % JANAS_QK == 0) {
+        janas_dot_multi_rows(type, w, row_bytes, x, x_stride, nv, nb, rows, y,
+                             y_stride);
+        return;
+    }
+    enum { CHUNK = 16, VEC = 64 };
+    size_t gb = janas_qtype_block_size(type), full = nb * gb;
+    _Alignas(64) uint8_t pad[CHUNK * TAIL_GROUP];
+    float t[CHUNK * VEC];
+    if (nb)
+        janas_dot_multi_rows(type, w, row_bytes, x, x_stride, nv, nb, rows, y,
+                             y_stride);
+    for (size_t r0 = 0; r0 < rows; r0 += CHUNK) {
+        size_t c = rows - r0 < CHUNK ? rows - r0 : CHUNK;
+        for (size_t i = 0; i < c; i++)
+            tail_group(type, (const uint8_t *)w + (r0 + i) * row_bytes, full,
+                       row_bytes, pad + i * gb);
+        for (size_t v0 = 0; v0 < nv; v0 += VEC) {
+            size_t g = nv - v0 < VEC ? nv - v0 : VEC;
+            janas_dot_multi_rows(type, pad, gb, x + v0 * x_stride + nb,
+                                 x_stride, g, 1, c, t, c);
+            for (size_t v = 0; v < g; v++)
+                for (size_t i = 0; i < c; i++) {
+                    float *o = y + r0 + i + (v0 + v) * y_stride;
+                    *o = (nb ? *o : 0.0f) + t[i + v * c];
+                }
+        }
     }
 }
 

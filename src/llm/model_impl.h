@@ -205,6 +205,14 @@ struct janas_llm_model {
                                                  with a GPU copy */
     int gtok_state, gtok_kv;
     uint64_t gtok_loads;
+    /* on a card with memory of its own (gtok_dev): the token's state - the
+       KV rows of the layers it takes, the recurrent states and their log -
+       is in two places, newer where gtok_where says (JANAS_GT_*), made the
+       same when the passes change hands (janas_m_gtok_host) */
+    int gtok_dev, gtok_where, gtok_rec_in;
+    /* passes whole on the GPU by length (1, 2-16, more), the state's
+       copies there and back (JANAS_GPU_VERBOSE prints them at the end) */
+    uint64_t gtok_runs[3], gtok_push, gtok_pull;
     /* qwen4exp on the GPU: the pass's tokens (its n-gram embeddings), each
        attention layer's input at bf16 as the GPU made it (n_attn x blk x
        d_model, for the indexer's keys), the ring of the n-gram conv
@@ -595,6 +603,13 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m);
 int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits);
 void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv);
+/* The token's state for the CPU, on a card with memory of its own: what
+   the GPU made newer copied back first; write: the CPU is about to change
+   it (the GPU's copy older from then on). Nothing elsewhere. */
+#define JANAS_GT_SAME 0
+#define JANAS_GT_DEV 1
+#define JANAS_GT_HOST 2
+void janas_m_gtok_host(struct janas_llm_model *m, int write);
 /* Whether the whole token is asked of the GPU (JANAS_GPU_TOKEN=1). */
 int janas_m_gpu_token_asked(void);
 /* model_npu.c: the NPU for the products of blocks (JANAS_NPU=1), opened
@@ -796,6 +811,19 @@ int janas_m_route_rank(struct janas_llm_model *m, uint32_t l, uint32_t n,
 void janas_m_prefetch(struct janas_llm_model *m, uint32_t l);
 /* The same for a prefill block of n tokens (JANAS_PREFETCH_PREFILL). */
 void janas_m_prefetch_block(struct janas_llm_model *m, uint32_t l, uint32_t n);
+/* Whether a card with memory of its own runs every pass whole
+   (JANAS_GPU_WHOLE, on unless 0), and whether a mixture's experts go
+   through its tier there (JANAS_GPU_TIER=0: not), model_gpu.c. */
+int janas_m_gpu_whole(void);
+int janas_m_gpu_tier(const struct janas_llm_model *m);
+/* Experts ids[0..nd) of layer l (their slots) on the pairs of rows
+   [ra[i], rb[i]) of out, row r token tok[r] of xn (n tokens of d_model
+   floats, normalized), on the CPU: their down products before the
+   router's weights, for the GPU's tier (gpu_token.h cpu_rows). 0, or -1. */
+int janas_m_expert_rows(struct janas_llm_model *m, uint32_t l, uint32_t n,
+                        const float *xn, uint32_t nd, const uint32_t *ids,
+                        const uint8_t *const *slots, const uint32_t *ra,
+                        const uint32_t *rb, const uint32_t *tok, float *out);
 int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
                       struct janas_expert_cache *cache,
                       const struct janas_jns_layer *jl, uint32_t l, uint32_t n,

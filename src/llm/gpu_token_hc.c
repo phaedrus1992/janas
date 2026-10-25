@@ -40,9 +40,14 @@ void janas_gt_rec_dense(struct janas_gpu *g, VkPipeline *bound, int kind,
     janas_g_push_addr(pd.w, w);
     janas_g_push_addr(pd.x, x);
     janas_g_push_addr(pd.y, y);
-    janas_gt_bind(g, bound, g->pipe_dm[kind]);
+    /* a workgroup a row on a few vectors (dense_mv.comp), tiles else */
+    int mv = n <= DENSE_MV_MAX && g->pipe_dv[kind];
+    janas_gt_bind(g, bound, mv ? g->pipe_dv[kind] : g->pipe_dm[kind]);
     janas_gt_push(g, &pd, sizeof(pd));
-    g->vkCmdDispatch(g->cb, (rows + 63) / 64, (n + 63) / 64, 1);
+    if (mv)
+        g->vkCmdDispatch(g->cb, rows, (n + 3) / 4, 1);
+    else
+        g->vkCmdDispatch(g->cb, (rows + 63) / 64, (n + 63) / 64, 1);
 }
 
 /* x rounded to bf16 into xb (silu 0), or SiLU(x) in place and that into

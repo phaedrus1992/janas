@@ -17,7 +17,7 @@
 
 | Model | reading 1,024 tokens: Janas-LLM | how | llama.cpp | writing: Janas-LLM | how | llama.cpp |
 |---|---:|---|---:|---:|---|---:|
-| Qwen3.8-Flash-Next (66.5 GB, 177B, more than the memory) | 32.7 tok/s | GPU, 12 threads | 4.82 tok/s‡ | 10.95 tok/s | CPU, 12 threads | 3.12 tok/s‡ |
+| Qwen3.8-Flash-Next (66.5 GB, 177B, more than the memory) | 33.0 tok/s | GPU, 12 threads | 4.82 tok/s‡ | 10.95 tok/s | CPU, 12 threads | 3.12 tok/s‡ |
 | Qwen3-Next-80B-A3B (48.4 GB, more than the memory) | 68.4 tok/s | GPU, 20 threads | 17.7 tok/s | 26.4 tok/s | CPU, 20 threads | 3.0 tok/s |
 | Qwen3-Coder-Next (48.4 GB, more than the memory) | 71.4 tok/s | GPU, 12 threads | 14.0 tok/s | 26.5 tok/s | CPU, 20 threads | 2.9 tok/s |
 | Qwen3.6-35B-A3B | 136 tok/s | GPU, 12 threads | 81.8 tok/s | 28.0 tok/s | CPU, 20 threads | 12.1 tok/s |

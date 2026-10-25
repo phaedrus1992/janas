@@ -56,7 +56,11 @@ void main()
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
         xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
-    float acc[NV][8], res[NV];
+    /* precise: the CPU rounds every product and every sum apart; without
+       it a compiler may fuse a sum with a product before it (the tail's
+       accumulators start from zero in the loop, a known value: AMD's,
+       issue #46) */
+    precise float acc[NV][8], res[NV];
     for (uint v = 0; v < NV; v++) {
         res[v] = 0.0;
         for (uint k = 0; k < 8u; k++)
@@ -117,7 +121,7 @@ void main()
     if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
             if (v0 + v < p.nv) {
-                float r = ((acc[v][0] + acc[v][4]) + (acc[v][2] + acc[v][6])) +
+                precise float r = ((acc[v][0] + acc[v][4]) + (acc[v][2] + acc[v][6])) +
                           ((acc[v][1] + acc[v][5]) + (acc[v][3] + acc[v][7]));
                 if (p.tail != 0u)
                     r = res[v] + r;

@@ -300,4 +300,16 @@ uint64_t janas_rss_bytes(void)
                : 0;
 }
 
+size_t janas_l2_bytes(void)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD len = sizeof(info);
+    if (!GetLogicalProcessorInformation(info, &len))
+        return 0;
+    for (DWORD i = 0; i < len / sizeof(info[0]); i++)
+        if (info[i].Relationship == RelationCache && info[i].Cache.Level == 2)
+            return info[i].Cache.Size;
+    return 0;
+}
+
 #endif /* _WIN32 */

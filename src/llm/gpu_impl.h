@@ -57,6 +57,7 @@
 #define GPU_BLOCK 320     /* a Q8_K block in the shader's layout */
 #define SHARE_SLOTS 64
 #define MAX_GROUP 64
+#define MAX_MADE 384 /* pipelines a device gets (some 200) */
 
 /* instance-level functions, then device-level ones */
 #define VK_INSTANCE_FUNCS(X)                                                   \
@@ -144,6 +145,9 @@ struct pending {
     size_t off;      /* in the Y stage */
 };
 
+/* The vectors a workgroup of pipe_mvid takes */
+#define MVID_NV 4
+
 /* The push constants of the shaders (level and the bare planes: Q6_K_P
    only). */
 struct push {
@@ -181,13 +185,19 @@ struct janas_gpu {
     VkPipeline pipex4, pipe3, pipei3; /* IQ4_XS, Q3_K, IQ3_S */
     /* Q4_K on many vectors in tiles (q4k_mm.comp), MM_ROWS x MM_VECS */
     VkShaderModule sm_mm, sm_mm6, sm_mm6s, sm_mm80, sm_mm5, sm_mm3, sm_mmx4,
-        sm_mmi3, sm_mmn4, sm_mmmx, sm_mm50, sm_mm20,
-        sm_dm[3]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL, mmmx MXFP4,
-                     mm50 Q5_0, mm20 Q2_0; dm f32, bf16 and Q8_0 weights on
-                     float vectors */
+        sm_mmi3, sm_mmn4, sm_mmmx, sm_mm50, sm_mm20, sm_dm[3],
+        sm_dv[3]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL,
+                     mmmx MXFP4, mm50 Q5_0, mm20 Q2_0; dm f32,
+                     bf16 and Q8_0 weights on float vectors, dv
+                     the same on a few (optional) */
     VkPipeline pipe_mm, pipe_mm6, pipe_mm6s, pipe_mm80, pipe_mm5, pipe_mm3,
         pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_mmmx, pipe_mm50, pipe_mm20,
-        pipe_dm[3];
+        pipe_dm[3], pipe_dv[3];
+    /* q3k, q4k, q6k, q6kp_matvec and b32_matvec's MXFP4 and Q2_0 with ID:
+       a mixture's experts on a few vectors, MVID_NV a workgroup, from
+       *_mmid.comp's table (optional) */
+    VkShaderModule sm_mvid[6];
+    VkPipeline pipe_mvid[6];
     int only_fast;   /* janas_gpu_set_only_fast */
     uint32_t pass_n; /* janas_gpu_set_pass; UINT32_MAX until said */
     uint32_t nvg;    /* vectors a product's workgroup takes (NV_PER_GROUP) */
@@ -244,10 +254,11 @@ struct janas_gpu {
     size_t n_pend;
     int busy, broken;
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    uint32_t sg;     /* subgroup size the shader runs with */
-    int discrete;    /* weights copied to its memory, not shared */
-    int host_import; /* VK_EXT_external_memory_host available */
-    int sg_control;  /* the size is required (else the device's fixed one) */
+    uint32_t sg;              /* subgroup size the shader runs with */
+    int discrete;             /* weights copied to its memory, not shared */
+    VkDeviceSize local_bytes; /* taken of its own memory, never given back */
+    int host_import;          /* VK_EXT_external_memory_host available */
+    int sg_control; /* the size is required (else the device's fixed one) */
     uint32_t sg_min, sg_max; /* the sizes it may be given (sg_control) */
     /* the GPU's share of the rows, per product shape */
     struct share {
@@ -281,7 +292,46 @@ struct janas_gpu {
     unsigned keep_us;
     VkCommandBuffer ka_cb;
     VkFence ka_fence;
+    /* every pipeline made, for janas_gpu_last_shader: its SPIR-V, vectors
+       a workgroup, subgroup size and kind */
+    struct made {
+        VkPipeline p;
+        const uint32_t *code;
+        uint32_t nv, sg, kind;
+    } made[MAX_MADE];
+    int n_made;
+    VkPipeline last_pipe; /* the last product janas_g_record_task recorded */
+    /* the paths a product may take (janas_gpu_set_path; at creation from
+       JANAS_GPU_NO_ROW, JANAS_GPU_ROW_NV, JANAS_GPU_MVD, JANAS_GPU_MV) */
+    int row_on, row_nv, mvd_on, mv_on;
+    char about[768]; /* janas_gpu_about */
+    uint32_t vendor_id, device_id, driver_version;
+    /* what the check on opening left out (gpu_selfcheck.c): types the GPU
+       got wrong whatever the shader, and a line for the user */
+    int off_types[16], n_off;
+    char check_note[256];
 };
+
+/* The products checked against the CPU's when the GPU opens, and the
+   shaders or types this driver gets wrong left out (gpu_selfcheck.c). */
+void janas_g_selfcheck(struct janas_gpu *g);
+/* Whether the check left the type out. */
+int janas_g_type_off(const struct janas_gpu *g, int type);
+/* A buffer in the device's own memory (no host mapping), for shaders and
+   copies; 0, or -1. */
+int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes);
+/* Copies bytes between two buffers and waits: 0, or -1. */
+int janas_g_copy(struct janas_gpu *g, VkBuffer src, VkDeviceSize so,
+                 VkBuffer dst, VkDeviceSize dof, VkDeviceSize bytes);
+/* A copy of janas_g_copies'. */
+struct janas_g_cp {
+    VkBuffer src, dst;
+    VkDeviceSize so, dof, bytes;
+};
+/* Copies c[0..n) in one submission and waits: 0, or -1. */
+int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n);
+/* Forgets the last region imported, at host (the check's own weights). */
+void janas_g_drop_region(struct janas_gpu *g, const void *host);
 
 /* Helpers shared by gpu.c and gpu_token.c (defined in gpu.c). */
 int janas_g_mem_type(const struct janas_gpu *g, uint32_t bits,

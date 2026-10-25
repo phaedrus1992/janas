@@ -394,6 +394,7 @@ int janas_m_assist_draft(struct janas_llm_model *m, int32_t token,
     uint32_t dm = m->d_model, d = a->d;
     if (p + 1 >= m->n_ctx || token < 0 || (uint32_t)token >= m->n_vocab)
         return -1;
+    janas_m_gtok_host(m, 0); /* it reads the model's KV cache */
     double t0 = now();
     /* [embedding of the token, as the main model scales it; h] */
     janas_m_embed(m, token, a->cat);

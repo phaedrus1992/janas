@@ -27,6 +27,7 @@
 #include "llm/attention.h"
 #include "llm/expert_cache.h"
 #include "llm/generate.h"
+#include "llm/gpu.h"
 #include "llm/jns.h"
 #include "llm/model.h"
 #include "llm/quant.h"
@@ -962,7 +963,7 @@ int32_t janas_llm_describe(const janas_llm *llm, char *buf, int32_t cap,
      * runs. The same goes for the attention, which the context decides.
      */
     janas_llm *w = (janas_llm *)llm;
-    char gpubuf[224];
+    char gpubuf[448];
     snprintf(gpubuf, sizeof(gpubuf), ", no GPU (%s)",
              janas_llm_model_gpu_why(llm->m));
     const char *gpu = gpubuf;
@@ -984,6 +985,12 @@ int32_t janas_llm_describe(const janas_llm *llm, char *buf, int32_t cap,
             snprintf(gpubuf, sizeof(gpubuf), ", GPU present (active, on %s)",
                      list);
             gpu = gpubuf;
+        }
+        /* what the check on opening left out on this driver */
+        const char *note = janas_gpu_check_note(janas_llm_model_gpu(llm->m));
+        if (note[0] && gpu == gpubuf) {
+            size_t n = strlen(gpubuf);
+            snprintf(gpubuf + n - 1, sizeof(gpubuf) - n + 1, "; %s)", note);
         }
     }
     char attn[64] = "";

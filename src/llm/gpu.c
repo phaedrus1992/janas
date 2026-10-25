@@ -45,6 +45,7 @@
 #include "q80_mmq.h"       /* janas_spv_q80_mmq */
 #include "q5k_mmq.h"       /* janas_spv_q5k_mmq */
 #include "dense_mm.h"      /* janas_spv_dense_mm */
+#include "dense_mv.h"      /* janas_spv_dense_mv */
 #include "q3k_mmid.h"      /* janas_spv_q3k_mmid */
 #include "q4k_mmid.h"      /* janas_spv_q4k_mmid */
 #include "q6kp_mmid.h"     /* janas_spv_q6kp_mmid */
@@ -111,7 +112,9 @@ int janas_g_make_stage(struct janas_gpu *g, struct stage *s, size_t bytes,
                              .usage =
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+                                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     if (g->vkCreateBuffer(g->dev, &bi, NULL, &s->buf) != VK_SUCCESS)
         return -1;
     VkMemoryRequirements req;
@@ -200,9 +203,13 @@ static int pick_device(struct janas_gpu *g, uint32_t *family, char *err,
                 continue;
             if (pp.apiVersion < VK_API_VERSION_1_3)
                 REJECT("its driver offers Vulkan below 1.3")
+            VkPhysicalDeviceVulkan12Properties p12 = {
+                .sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
             VkPhysicalDeviceVulkan13Properties p13 = {
                 .sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES,
+                .pNext = &p12};
             VkPhysicalDeviceVulkan11Properties p11 = {
                 .sType =
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
@@ -286,6 +293,32 @@ static int pick_device(struct janas_gpu *g, uint32_t *family, char *err,
                 if (qf[f].queueFlags & VK_QUEUE_COMPUTE_BIT) {
                     *family = f;
                     snprintf(g->name, sizeof(g->name), "%s", pp.deviceName);
+                    g->vendor_id = pp.vendorID;
+                    g->device_id = pp.deviceID;
+                    g->driver_version = pp.driverVersion;
+                    /* what a report needs to tell one device and driver
+                       from another, and whether its float operations can
+                       be the CPU's */
+                    snprintf(
+                        g->about, sizeof(g->about),
+                        "%.96s, %s; driver %.64s %.64s (%#x), Vulkan %u.%u.%u; "
+                        "vendor %#x device %#x; subgroups %u-%u%s, "
+                        "running %u; float32 round to nearest even %s, "
+                        "denormals preserved %s, signed zero/inf/nan "
+                        "preserved %s",
+                        pp.deviceName, g->discrete ? "discrete" : "integrated",
+                        p12.driverName, p12.driverInfo,
+                        (unsigned)pp.driverVersion,
+                        VK_API_VERSION_MAJOR(pp.apiVersion),
+                        VK_API_VERSION_MINOR(pp.apiVersion),
+                        VK_API_VERSION_PATCH(pp.apiVersion),
+                        (unsigned)pp.vendorID, (unsigned)pp.deviceID,
+                        p13.minSubgroupSize, p13.maxSubgroupSize,
+                        control ? " (chosen)" : "", sg,
+                        p12.shaderRoundingModeRTEFloat32 ? "yes" : "no",
+                        p12.shaderDenormPreserveFloat32 ? "yes" : "no",
+                        p12.shaderSignedZeroInfNanPreserveFloat32 ? "yes"
+                                                                  : "no");
                     return 0;
                 }
             REJECT("no compute queue")
@@ -408,8 +441,12 @@ static VkResult make_pipeline(struct janas_gpu *g, const uint32_t *code,
              .pName = "main",
              .pSpecializationInfo = &si},
         .layout = g->pl};
-    return g->vkCreateComputePipelines(g->dev, VK_NULL_HANDLE, 1, &cpi, NULL,
-                                       pipe);
+    r = g->vkCreateComputePipelines(g->dev, VK_NULL_HANDLE, 1, &cpi, NULL,
+                                    pipe);
+    if (r == VK_SUCCESS && g->n_made < MAX_MADE)
+        g->made[g->n_made++] = (struct made){
+            .p = *pipe, .code = code, .nv = nv, .sg = sg, .kind = kind};
+    return r;
 }
 
 VkResult janas_g_make_pipeline_nv(struct janas_gpu *g, const uint32_t *code,
@@ -443,6 +480,16 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
         const char *nve = getenv("JANAS_GPU_NV");
         g->nvg = nve && atoi(nve) > 0 && atoi(nve) <= 16 ? (uint32_t)atoi(nve)
                                                          : NV_PER_GROUP;
+        /* the products' paths (janas_gpu_set_path): JANAS_GPU_NO_ROW
+           leaves out the subgroup-per-row shaders, JANAS_GPU_ROW_NV (0 to
+           8, 4 by default) the vectors they take at most, JANAS_GPU_MVD=0
+           the shaders with the lanes on the vectors, JANAS_GPU_MV=1 takes
+           q4k_mv (being measured) */
+        const char *e;
+        g->row_on = !getenv("JANAS_GPU_NO_ROW");
+        g->row_nv = (e = getenv("JANAS_GPU_ROW_NV")) ? atoi(e) : 4;
+        g->mvd_on = !(e = getenv("JANAS_GPU_MVD")) || atoi(e) > 0;
+        g->mv_on = (e = getenv("JANAS_GPU_MV")) && atoi(e) > 0;
     }
     if (!g) {
         snprintf(err, err_len, "out of memory");
@@ -668,6 +715,27 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                                          iqk[i].kind, 1) != VK_SUCCESS)
                 g->pp1_iqk[i] = VK_NULL_HANDLE;
         }
+        /* dense_mm's products on a few vectors: without, dense_mm's */
+        for (int i = 0; i < 3; i++)
+            if (janas_g_make_pipeline(g, janas_spv_dense_mv,
+                                      sizeof(janas_spv_dense_mv), &g->sm_dv[i],
+                                      &g->pipe_dv[i], i) != VK_SUCCESS)
+                g->pipe_dv[i] = VK_NULL_HANDLE;
+        /* the experts' products on a few vectors (gpu_token_moe.c) */
+        const uint32_t *mc[6] = {janas_spv_q3k_matvec, janas_spv_q4k_matvec,
+                                 janas_spv_q6k_matvec, janas_spv_q6kp_matvec,
+                                 janas_spv_b32_matvec, janas_spv_b32_matvec};
+        size_t mb[6] = {
+            sizeof(janas_spv_q3k_matvec), sizeof(janas_spv_q4k_matvec),
+            sizeof(janas_spv_q6k_matvec), sizeof(janas_spv_q6kp_matvec),
+            sizeof(janas_spv_b32_matvec), sizeof(janas_spv_b32_matvec)};
+        /* constant 2: ID, b32_matvec's in bit 8 beside its KIND */
+        uint32_t mk[6] = {1, 1, 1, 1, 256 | 4, 256 | 6};
+        for (int i = 0; i < 6; i++)
+            if (janas_g_make_pipeline_nv(g, mc[i], mb[i], &g->sm_mvid[i],
+                                         &g->pipe_mvid[i], mk[i],
+                                         MVID_NV) != VK_SUCCESS)
+                g->pipe_mvid[i] = VK_NULL_HANDLE;
         /* their tiles for the fast prompt */
         for (int i = 0; i < N_IQK; i++)
             if (make_pipeline(g, janas_spv_iqk_mmq, sizeof(janas_spv_iqk_mmq),
@@ -849,6 +917,7 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                *bw = getenv("JANAS_GPU_BLOCKWAIT");
     g->nospin = ns ? atoi(ns) != 0 : janas_gpu_fast_prompt();
     g->block_wait = bw ? atoi(bw) != 0 : janas_gpu_fast_prompt();
+    janas_g_selfcheck(g);
     return g;
 
 missing:
@@ -1047,11 +1116,21 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyPipeline(g->dev, g->pipe_mm5, NULL);
         if (g->sm_mm5)
             g->vkDestroyShaderModule(g->dev, g->sm_mm5, NULL);
+        for (int i = 0; i < 6; i++) {
+            if (g->pipe_mvid[i])
+                g->vkDestroyPipeline(g->dev, g->pipe_mvid[i], NULL);
+            if (g->sm_mvid[i])
+                g->vkDestroyShaderModule(g->dev, g->sm_mvid[i], NULL);
+        }
         for (int i = 0; i < 3; i++) {
             if (g->pipe_dm[i])
                 g->vkDestroyPipeline(g->dev, g->pipe_dm[i], NULL);
             if (g->sm_dm[i])
                 g->vkDestroyShaderModule(g->dev, g->sm_dm[i], NULL);
+            if (g->pipe_dv[i])
+                g->vkDestroyPipeline(g->dev, g->pipe_dv[i], NULL);
+            if (g->sm_dv[i])
+                g->vkDestroyShaderModule(g->dev, g->sm_dv[i], NULL);
         }
         for (int i = 0; i < 5; i++) {
             VkPipeline pp = i == 4   ? g->pipe_id3
@@ -1140,6 +1219,68 @@ unsigned janas_gpu_subgroup(const struct janas_gpu *g)
     return g->sg;
 }
 
+/* The product shaders' names, for janas_gpu_last_shader. */
+static const struct {
+    const uint32_t *code;
+    const char *name;
+} spv_names[] = {
+#define N(x) {janas_spv_##x, #x}
+    N(q4k_matvec),    N(q6k_matvec),  N(q6kp_matvec),  N(q5k_matvec),
+    N(q8_0_matvec),   N(b32_matvec),  N(iq4xs_matvec), N(q3k_matvec),
+    N(q4k_mmq),       N(q6kp_mmq),    N(q6k_mmq),      N(q3k_mmq),
+    N(iq4xs_mmq),     N(iq3s_mmq),    N(iq4nl_mmq),    N(mxfp4_mmid),
+    N(b32_mmid),      N(bf16_matvec), N(iq1_matvec),   N(iq2_matvec),
+    N(iq3xxs_matvec), N(iqk_mmid),    N(iqk_mmq),      N(q2k_matvec),
+    N(q80_mmq),       N(q5k_mmq),     N(dense_mm),     N(q3k_mmid),
+    N(q4k_mmid),      N(q6kp_mmid),   N(q6k_mmid),     N(iq3s_matvec),
+    N(expert_act),    N(q4k_row),     N(q6k_row),      N(q6kp_row),
+    N(q6ka_row),      N(q4k_mv),      N(q4k_mvd),      N(q6k_mvd),
+    N(q5k_mvd),       N(iq4xs_mvd)
+#undef N
+};
+
+size_t janas_gpu_last_shader(const struct janas_gpu *g, char *buf, size_t len)
+{
+    buf[0] = 0;
+    for (int i = 0; i < g->n_made; i++)
+        if (g->made[i].p == g->last_pipe) {
+            const char *name = "a shader";
+            for (size_t k = 0; k < sizeof(spv_names) / sizeof(*spv_names); k++)
+                if (spv_names[k].code == g->made[i].code)
+                    name = spv_names[k].name;
+            int n = snprintf(buf, len, "%s NV %u SG %u", name, g->made[i].nv,
+                             g->made[i].sg);
+            if (g->made[i].kind && n > 0 && (size_t)n < len)
+                n += snprintf(buf + n, len - (size_t)n, " kind %u",
+                              g->made[i].kind);
+            return n > 0 ? (size_t)n : 0;
+        }
+    return 0;
+}
+
+int janas_gpu_set_path(struct janas_gpu *g, enum janas_gpu_path path, int value)
+{
+    int *f = path == JANAS_GPU_PATH_ROW      ? &g->row_on
+             : path == JANAS_GPU_PATH_ROW_NV ? &g->row_nv
+             : path == JANAS_GPU_PATH_MVD    ? &g->mvd_on
+                                             : &g->mv_on;
+    int was = *f;
+    *f = value;
+    return was;
+}
+
+void janas_gpu_subgroup_range(const struct janas_gpu *g, unsigned *min,
+                              unsigned *max)
+{
+    *min = g->sg_control ? g->sg_min : g->sg;
+    *max = g->sg_control ? g->sg_max : g->sg;
+}
+
+const char *janas_gpu_about(const struct janas_gpu *g)
+{
+    return g->about;
+}
+
 size_t janas_gpu_min_n(const struct janas_gpu *g)
 {
     return g->min_n;
@@ -1186,6 +1327,7 @@ static int copy_to_device(struct janas_gpu *g, const void *p, size_t bytes)
                              .usage =
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     if (g->vkCreateBuffer(g->dev, &bi, NULL, &rg->buf) != VK_SUCCESS)
         return -1;
@@ -1211,6 +1353,7 @@ static int copy_to_device(struct janas_gpu *g, const void *p, size_t bytes)
     }
     if (g->vkBindBufferMemory(g->dev, rg->buf, rg->mem, 0) != VK_SUCCESS)
         goto fail;
+    g->local_bytes += req.size;
     /* staging: 64 MiB of host memory, one chunk at a time */
     struct stage st = {0};
     size_t chunk = (size_t)64 << 20;
@@ -1271,6 +1414,136 @@ fail:
     g->vkDestroyBuffer(g->dev, rg->buf, NULL);
     g->vkFreeMemory(g->dev, rg->mem, NULL);
     return -1;
+}
+
+int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes)
+{
+    memset(s, 0, sizeof(*s));
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                             .size = bytes,
+                             .usage =
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (g->vkCreateBuffer(g->dev, &bi, NULL, &s->buf) != VK_SUCCESS)
+        return -1;
+    VkMemoryRequirements req;
+    g->vkGetBufferMemoryRequirements(g->dev, s->buf, &req);
+    int t = local_type(g, req.memoryTypeBits);
+    VkMemoryAllocateFlagsInfo fl = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = &fl,
+                               .allocationSize = req.size,
+                               .memoryTypeIndex = (uint32_t)t};
+    if (t < 0 ||
+        g->vkAllocateMemory(g->dev, &ai, NULL, &s->mem) != VK_SUCCESS ||
+        g->vkBindBufferMemory(g->dev, s->buf, s->mem, 0) != VK_SUCCESS) {
+        g->vkDestroyBuffer(g->dev, s->buf, NULL);
+        if (s->mem)
+            g->vkFreeMemory(g->dev, s->mem, NULL);
+        memset(s, 0, sizeof(*s));
+        return -1;
+    }
+    g->local_bytes += req.size;
+    s->addr = janas_g_buffer_address(g, s->buf);
+    s->bytes = bytes;
+    return 0;
+}
+
+int janas_g_copies(struct janas_gpu *g, const struct janas_g_cp *c, uint32_t n)
+{
+    VkCommandBufferBeginInfo bb = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &g->cb};
+    int ok = g->vkResetCommandBuffer(g->cb, 0) == VK_SUCCESS &&
+             g->vkBeginCommandBuffer(g->cb, &bb) == VK_SUCCESS;
+    for (uint32_t i = 0; ok && i < n; i++) {
+        VkBufferCopy cp = {
+            .srcOffset = c[i].so, .dstOffset = c[i].dof, .size = c[i].bytes};
+        g->vkCmdCopyBuffer(g->cb, c[i].src, c[i].dst, 1, &cp);
+    }
+    ok = ok && g->vkEndCommandBuffer(g->cb) == VK_SUCCESS;
+    pthread_mutex_lock(&g->qlock);
+    ok = ok && g->vkQueueSubmit(g->queue, 1, &sub, g->fence) == VK_SUCCESS;
+    pthread_mutex_unlock(&g->qlock);
+    ok = ok && g->vkWaitForFences(g->dev, 1, &g->fence, VK_TRUE, UINT64_MAX) ==
+                   VK_SUCCESS;
+    g->vkResetFences(g->dev, 1, &g->fence);
+    return ok ? 0 : -1;
+}
+
+int janas_g_copy(struct janas_gpu *g, VkBuffer src, VkDeviceSize so,
+                 VkBuffer dst, VkDeviceSize dof, VkDeviceSize bytes)
+{
+    struct janas_g_cp c = {
+        .src = src, .dst = dst, .so = so, .dof = dof, .bytes = bytes};
+    return janas_g_copies(g, &c, 1);
+}
+
+int janas_gpu_sync(struct janas_gpu *g, void *p, size_t bytes, int to_device)
+{
+    if (bytes == 0)
+        return 0;
+    const struct region *rg = janas_g_find_region(g, p, bytes);
+    if (!rg || g->broken || g->busy)
+        return -1;
+    if (rg->host_shared)
+        return 0; /* the GPU reads and writes the host's memory itself */
+    VkDeviceSize at = (VkDeviceSize)((const uint8_t *)p - rg->host);
+    /* through the Y stage, idle between passes, a piece at a time */
+    for (size_t done = 0; done < bytes;) {
+        size_t n = bytes - done < g->ys.bytes ? bytes - done : g->ys.bytes;
+        /* the stage may be cached, not coherent: written bytes flushed
+           before the copy, read ones invalidated after it */
+        VkMappedMemoryRange mr = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = g->ys.mem,
+            .size = (n + g->atom - 1) / g->atom * g->atom < g->ys.bytes
+                        ? (n + g->atom - 1) / g->atom * g->atom
+                        : VK_WHOLE_SIZE};
+        if (to_device) {
+            memcpy(g->ys.map, (const uint8_t *)p + done, n);
+            if (!g->ys.coherent)
+                g->vkFlushMappedMemoryRanges(g->dev, 1, &mr);
+        }
+        VkCommandBufferBeginInfo bb = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VkBufferCopy cp = {.srcOffset = to_device ? 0 : at + done,
+                           .dstOffset = to_device ? at + done : 0,
+                           .size = n};
+        VkSubmitInfo sub = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1,
+                            .pCommandBuffers = &g->cb};
+        int ok = g->vkResetCommandBuffer(g->cb, 0) == VK_SUCCESS &&
+                 g->vkBeginCommandBuffer(g->cb, &bb) == VK_SUCCESS;
+        if (ok)
+            g->vkCmdCopyBuffer(g->cb, to_device ? g->ys.buf : rg->buf,
+                               to_device ? rg->buf : g->ys.buf, 1, &cp);
+        ok = ok && g->vkEndCommandBuffer(g->cb) == VK_SUCCESS;
+        pthread_mutex_lock(&g->qlock);
+        ok = ok && g->vkQueueSubmit(g->queue, 1, &sub, g->fence) == VK_SUCCESS;
+        pthread_mutex_unlock(&g->qlock);
+        ok = ok && g->vkWaitForFences(g->dev, 1, &g->fence, VK_TRUE,
+                                      UINT64_MAX) == VK_SUCCESS;
+        g->vkResetFences(g->dev, 1, &g->fence);
+        if (!ok)
+            return -1;
+        if (!to_device) {
+            if (!g->ys.coherent)
+                g->vkInvalidateMappedMemoryRanges(g->dev, 1, &mr);
+            memcpy((uint8_t *)p + done, g->ys.map, n);
+        }
+        done += n;
+    }
+    return 0;
 }
 
 /* an import refused, and where, with JANAS_GPU_VERBOSE */
@@ -1348,6 +1621,16 @@ int janas_gpu_import(struct janas_gpu *g, const void *p, size_t bytes)
     rg->host_shared = 1;
     g->n_reg++;
     return 0;
+}
+
+void janas_g_drop_region(struct janas_gpu *g, const void *host)
+{
+    if (g->n_reg == 0 || g->reg[g->n_reg - 1].host != host)
+        return;
+    struct region *rg = &g->reg[--g->n_reg];
+    g->vkDestroyBuffer(g->dev, rg->buf, NULL);
+    g->vkFreeMemory(g->dev, rg->mem, NULL);
+    memset(rg, 0, sizeof(*rg));
 }
 
 void *janas_gpu_alloc(struct janas_gpu *g, size_t bytes)
@@ -1529,7 +1812,7 @@ int janas_gpu_can(const struct janas_gpu *g, const struct janas_matvec_task *t)
          (plane_level(t) < 3 || plane_region(g, t->plane[1], t->rows, nb)));
     int ik = iqk_index(t->type);
     typed |= ik >= 0 && g->pipe_iqk[ik] && (uintptr_t)t->w % 4 == 0;
-    return !g->broken && typed && tail_ok(t) &&
+    return !g->broken && typed && tail_ok(t) && !janas_g_type_off(g, t->type) &&
            nv * nb * GPU_BLOCK <= X_STAGE_BYTES &&
            t->rows * nv * sizeof(float) <= Y_STAGE_BYTES &&
            janas_g_find_region(g, t->w, read_bytes(t, t->rows));
@@ -1767,22 +2050,16 @@ static int mm_on(void)
 
 /* q4k_mv for Q4_K on 2 to JANAS_GPU_FAST_N - 1 vectors (JANAS_GPU_MV=1;
    off by default while it is measured) */
-static int mv_on(void)
+static int mv_on(const struct janas_gpu *g)
 {
-    static int on = -1;
-    if (on < 0)
-        on = getenv("JANAS_GPU_MV") && atoi(getenv("JANAS_GPU_MV")) > 0;
-    return on;
+    return g->mv_on;
 }
 
 /* q4k_mvd, q6k_mvd, q5k_mvd and iq4xs_mvd for Q4_K, Q6_K, Q5_K and IQ4_XS
    on 2 to 8 vectors (JANAS_GPU_MVD=0 leaves them out) */
-static int mvd_on(void)
+static int mvd_on(const struct janas_gpu *g)
 {
-    static int on = -1;
-    if (on < 0)
-        on = !getenv("JANAS_GPU_MVD") || atoi(getenv("JANAS_GPU_MVD")) > 0;
-    return on;
+    return g->mvd_on;
 }
 
 /* The shader of a type with the lanes on the vectors (2 to 8 vectors), or
@@ -1798,7 +2075,7 @@ static VkPipeline mvd_pipe(const struct janas_gpu *g, int type)
 
 size_t janas_gpu_few_max(const struct janas_gpu *g)
 {
-    return g->pipe_mvd && mvd_on() ? 8 : 0;
+    return g->pipe_mvd && mvd_on(g) ? 8 : 0;
 }
 
 /* Whether bytes from a lie within one 4 GB of the address space (the high
@@ -1879,10 +2156,7 @@ int janas_g_record_task(struct janas_gpu *g, VkPipeline *bound,
     /* up to row_nv vectors (JANAS_GPU_ROW_NV, 0 to 8; 4 by default) a row
        shader takes them, its variant for 2, 4 or 8 (kv), where the
        shaders reading a row per invocation are slower; more, those */
-    static int row_nv = -1;
-    if (row_nv < 0)
-        row_nv =
-            getenv("JANAS_GPU_ROW_NV") ? atoi(getenv("JANAS_GPU_ROW_NV")) : 4;
+    int row_nv = g->row_nv;
     int kv = nv <= 2 ? 0 : nv <= 4 ? 1 : 2;
     const struct region *rg = janas_g_find_region(g, t->w, read_bytes(t, rows));
     if (!rg)
@@ -1926,24 +2200,23 @@ int janas_g_record_task(struct janas_gpu *g, VkPipeline *bound,
         want = rp;
         nvg = nv == 1 ? 1 : 2u << kv;
         rows_wg = 64 / g->sg;
-    } else if (nv > 1 && nv <= 8 && mvd_pipe(g, t->type) && mvd_on() &&
+    } else if (nv > 1 && nv <= 8 && mvd_pipe(g, t->type) && mvd_on(g) &&
                in_4g(wa, read_bytes(t, rows)) &&
                in_4g(xa, nv * nb * GPU_BLOCK)) {
         want = mvd_pipe(g, t->type);
         nvg = 8;
         rows_wg = MVD_ROWS;
     } else if (t->type == JANAS_Q4_K && nv > 1 && nv < JANAS_GPU_FAST_N &&
-               g->pipe_mv && mv_on() && in_4g(wa, read_bytes(t, rows)) &&
+               g->pipe_mv && mv_on(g) && in_4g(wa, read_bytes(t, rows)) &&
                in_4g(xa, nv * nb * GPU_BLOCK)) {
         want = g->pipe_mv;
         nvg = MV_NV;
-    } else if (nv == 1 && pk >= 0 && g->rp[pk] && nb <= 128 &&
-               !getenv("JANAS_GPU_NO_ROW")) {
+    } else if (nv == 1 && pk >= 0 && g->rp[pk] && nb <= 128 && g->row_on) {
         want = g->rp[pk];
         nvg = 1;
         rows_wg = 64 / g->sg; /* a subgroup per row */
     } else if (nv > 1 && (int)nv <= row_nv && pk >= 0 && pk < 3 &&
-               g->rpv[kv][pk] && nb <= 128 && !getenv("JANAS_GPU_NO_ROW")) {
+               g->rpv[kv][pk] && nb <= 128 && g->row_on) {
         want = g->rpv[kv][pk];
         nvg = 2u << kv;
         rows_wg = 64 / g->sg;
@@ -2006,6 +2279,7 @@ int janas_g_record_task(struct janas_gpu *g, VkPipeline *bound,
         g->vkCmdBindPipeline(g->cb, VK_PIPELINE_BIND_POINT_COMPUTE, want);
         *bound = want;
     }
+    g->last_pipe = want;
     struct push pc = {.rows = (uint32_t)rows,
                       .nb = (uint32_t)nb,
                       .nv = (uint32_t)nv,
@@ -2964,6 +3238,44 @@ unsigned janas_gpu_subgroup(const struct janas_gpu *g)
 {
     (void)g;
     return 0;
+}
+
+size_t janas_gpu_last_shader(const struct janas_gpu *g, char *buf, size_t len)
+{
+    (void)g;
+    if (len)
+        buf[0] = 0;
+    return 0;
+}
+
+int janas_gpu_set_path(struct janas_gpu *g, enum janas_gpu_path path, int value)
+{
+    (void)g;
+    (void)path;
+    (void)value;
+    return 0;
+}
+
+void janas_gpu_subgroup_range(const struct janas_gpu *g, unsigned *min,
+                              unsigned *max)
+{
+    (void)g;
+    *min = *max = 0;
+}
+
+const char *janas_gpu_about(const struct janas_gpu *g)
+{
+    (void)g;
+    return "";
+}
+
+int janas_gpu_sync(struct janas_gpu *g, void *p, size_t bytes, int to_device)
+{
+    (void)g;
+    (void)p;
+    (void)bytes;
+    (void)to_device;
+    return -1;
 }
 
 size_t janas_gpu_min_n(const struct janas_gpu *g)

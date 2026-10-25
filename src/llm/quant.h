@@ -368,6 +368,12 @@ void janas_dot_rows_n(int type, const void *w, size_t row_bytes,
 void janas_dot_multi_n(int type, const void *w, const struct janas_block_q8k *x,
                        size_t x_stride, size_t nv, size_t n, float *out,
                        size_t out_stride);
+/* janas_dot_multi_n on rows rows of row_bytes: y[r + v * y_stride], the
+   same bits */
+void janas_dot_multi_rows_n(int type, const void *w, size_t row_bytes,
+                            const struct janas_block_q8k *x, size_t x_stride,
+                            size_t nv, size_t n, size_t rows, float *y,
+                            size_t y_stride);
 
 /*
  * Dot product of nb blocks of a supported type with nb Q8_K blocks. Aborts on
@@ -402,6 +408,14 @@ void janas_dot_rows(int type, const void *w, size_t row_bytes,
 void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
                      size_t x_stride, size_t nv, size_t nb, float *out,
                      size_t out_stride);
+
+/* janas_dot_multi on rows rows of row_bytes from w: y[r + v * y_stride].
+   The same bits; Q2_0 reorders the vectors' activations once for all the
+   rows. */
+void janas_dot_multi_rows(int type, const void *w, size_t row_bytes,
+                          const struct janas_block_q8k *x, size_t x_stride,
+                          size_t nv, size_t nb, size_t rows, float *y,
+                          size_t y_stride);
 
 /* Float helpers, AVX2 when available: dot product and y += a * x. */
 float janas_dot_f32(const float *a, const float *b, size_t n);
@@ -528,6 +542,16 @@ float janas_q6kp_dot(const struct janas_block_q6kp *w, const uint8_t *p1,
 float janas_q6kp_dot_ref(const struct janas_block_q6kp *w, const uint8_t *p1,
                          const uint8_t *p0, const struct janas_block_q8k *x,
                          size_t nb);
+/* Q6_K or Q3_K (p1, p0 NULL) or Q6_K_P (each row's planes pb bytes apart from
+   p1 and p0, NULL past its level) rows against nv vectors, y[r + v ys], eight
+   rows at a time as tiles (quant_dotn.h q6k_gemm): the rows done, a
+   multiple of eight (0 where the tiles do not serve: few vectors, no
+   AVX2, JANAS_CPU_TILES=0). The same bits as janas_dot_multi. */
+size_t janas_q6k_tile_rows(int type, const void *w, size_t row_bytes,
+                           const uint8_t *p1, const uint8_t *p0, size_t pb,
+                           const struct janas_block_q8k *x, size_t x_stride,
+                           size_t nv, size_t nb, size_t rows, float *y,
+                           size_t y_stride);
 /* As janas_dot_multi, for the plane form: one row against nv vectors. */
 void janas_q6kp_dot_multi(const struct janas_block_q6kp *w, const uint8_t *p1,
                           const uint8_t *p0, const struct janas_block_q8k *x,

@@ -254,6 +254,70 @@ static void test_q6k_planes(void)
     free(pf);
 }
 
+/*
+ * Q6_K and Q6_K_P as tiles of eight rows (janas_q6k_tile_rows): 11 rows, 9
+ * blocks (past the eight transposed at a time), 1 to 65 vectors (past the
+ * 64 tokens at a time), Q6_K_P at every level; each result janas_q6k_dot's
+ * or janas_q6kp_dot's to the bit, and the rows done a multiple of eight.
+ */
+static void test_q6k_tiles(void)
+{
+    enum { ROWS = 11, NB = 9, NV = 65, N = NB * JANAS_QK };
+    size_t pb = NB * JANAS_Q6KP_PLANE;
+    struct janas_block_q6k *w = malloc(ROWS * NB * sizeof(*w));
+    struct janas_block_q6kp *base = malloc(ROWS * NB * sizeof(*base));
+    uint8_t *p1 = malloc(ROWS * pb), *p0 = malloc(ROWS * pb);
+    struct janas_block_q8k *x = malloc(NV * NB * sizeof(*x));
+    float *xf = malloc(N * sizeof(float));
+    float *out = malloc(ROWS * NV * sizeof(float));
+    unsigned char *p = (unsigned char *)w;
+    for (size_t i = 0; i < ROWS * NB * sizeof(*w); i++)
+        p[i] = (unsigned char)rnd();
+    for (int b = 0; b < ROWS * NB; b++)
+        w[b].d = janas_fp32_to_fp16(rndf(0.0001f, 0.01f));
+    for (int r = 0; r < ROWS; r++)
+        janas_q6k_to_planes(w + r * NB, NB, base + r * NB, p1 + r * pb,
+                            p0 + r * pb);
+    for (int v = 0; v < NV; v++) {
+        for (int i = 0; i < N; i++)
+            xf[i] = rndf(-1.0f, 1.0f);
+        janas_q8k_quantize(xf, x + v * NB, N);
+    }
+    for (int level = 0; level <= 3; level++) {
+        const uint8_t *a1 = level >= 2 ? p1 : NULL;
+        const uint8_t *a0 = level >= 3 ? p0 : NULL;
+        int t = level ? JANAS_Q6_K_P : JANAS_Q6_K;
+        const void *wr = level ? (const void *)base : (const void *)w;
+        size_t rb = level ? NB * sizeof(*base) : NB * sizeof(*w);
+        for (int nv = 1; nv <= NV; nv += nv < 9 ? 1 : 8) {
+            for (int i = 0; i < ROWS * NV; i++)
+                out[i] = -12345.0f;
+            size_t done = janas_q6k_tile_rows(t, wr, rb, a1, a0, pb, x, NB,
+                                              (size_t)nv, NB, ROWS, out, ROWS);
+            CHECK(done == (nv >= 12 ? 8u : 0u), "q6k tiles: %zu rows", done);
+            for (size_t r = 0; r < done; r++)
+                for (int v = 0; v < nv; v++) {
+                    float one = level
+                                    ? janas_q6kp_dot(base + r * NB,
+                                                     a1 ? a1 + r * pb : NULL,
+                                                     a0 ? a0 + r * pb : NULL,
+                                                     x + v * NB, NB)
+                                    : janas_q6k_dot(w + r * NB, x + v * NB, NB);
+                    CHECK(out[r + ROWS * v] == one,
+                          "q6k tiles level %d nv %d r %zu v %d: %g vs %g",
+                          level, nv, r, v, out[r + ROWS * v], one);
+                }
+        }
+    }
+    free(w);
+    free(base);
+    free(p1);
+    free(p0);
+    free(x);
+    free(xf);
+    free(out);
+}
+
 /* janas_q6kpn_axpy at every level: with h = 1 on zeros the very floats
    janas_q6kp_dequantize gives, whatever planes lie below the level; with
    any h on any y, y plus h times them. */
@@ -1067,6 +1131,115 @@ static void random_blocks(int type, unsigned char *w, size_t n)
 }
 
 /*
+ * janas_dot_multi_rows on Q2_0 and the K types, on long rows: the vectors
+ * reordered (Q2_0) or their scales and sums made ready (Q4_K, Q5_K, Q6_K) a few
+ * at a time, or not at all where the rows are too long (130 groups), 1-65
+ * vectors; each result equal to janas_dot's to the bit, and Q2_0's to the
+ * reference.
+ */
+static void test_multi_rows_long(void)
+{
+    /* 11 rows: Q4_K's tiles take eight (q4k_gemm), the products the
+       rest; 65 vectors: past the tiles' 64 tokens at a time */
+    enum { ROWS = 11, NV = 65 };
+    static const size_t lens[] = {2, 48, 130};
+    static const int types[] = {
+        JANAS_Q2_0,    JANAS_Q4_K,    JANAS_Q5_K,   JANAS_Q6_K,  JANAS_Q8_0,
+        JANAS_Q4_0,    JANAS_Q5_0,    JANAS_IQ4_NL, JANAS_MXFP4, JANAS_Q4_1,
+        JANAS_Q5_1,    JANAS_Q3_K,    JANAS_IQ4_XS, JANAS_Q2_K,  JANAS_IQ3_S,
+        JANAS_IQ3_XXS, JANAS_IQ2_XXS, JANAS_IQ2_XS, JANAS_IQ2_S, JANAS_IQ1_S,
+        JANAS_IQ1_M};
+    for (unsigned ti = 0; ti < sizeof(types) / sizeof(*types); ti++)
+        for (unsigned li = 0; li < sizeof(lens) / sizeof(*lens); li++) {
+            int t = types[ti];
+            size_t nb = lens[li], n = nb * JANAS_QK;
+            size_t rb = janas_qtype_row_bytes(t, n);
+            unsigned char *w = malloc(ROWS * rb);
+            struct janas_block_q8k *x = malloc(NV * nb * sizeof(*x));
+            float *xf = malloc(n * sizeof(float)), out[ROWS * NV];
+            for (int r = 0; r < ROWS; r++) {
+                if (t == JANAS_Q2_0 || t == JANAS_Q8_0 || t == JANAS_Q4_0 ||
+                    t == JANAS_Q5_0 || t == JANAS_IQ4_NL)
+                    random_blocks(t, w + r * rb, n);
+                else if (t == JANAS_MXFP4 || t == JANAS_Q4_1 ||
+                         t == JANAS_Q5_1) {
+                    /* blocks of 32: MXFP4's power of two, Q4_1's and
+                       Q5_1's d and m, finite */
+                    size_t bs = janas_qtype_row_bytes(t, 32);
+                    unsigned char *q = w + r * rb;
+                    for (size_t i = 0; i < rb; i++)
+                        q[i] = (unsigned char)rnd();
+                    for (size_t i = 0; i < rb; i += bs) {
+                        if (t == JANAS_MXFP4) {
+                            q[i] = (unsigned char)(118 + rnd() % 12);
+                            continue;
+                        }
+                        uint16_t d[2] = {
+                            janas_fp32_to_fp16(rndf(-0.01f, 0.01f)),
+                            janas_fp32_to_fp16(rndf(-0.01f, 0.01f))};
+                        memcpy(q + i, d, 4);
+                    }
+                } else
+                    for (size_t b = 0; b < nb; b++) {
+                        /* Q4_K and Q5_K: d and dmin first, the IQ types d;
+                           Q6_K and Q3_K: d last, Q2_K d and dmin; IQ1_M: d
+                           in the top nibbles of its four scale words */
+                        size_t bs = janas_qtype_block_size(t);
+                        unsigned char *q = w + r * rb + b * bs;
+                        for (size_t i = 0; i < bs; i++)
+                            q[i] = (unsigned char)rnd();
+                        uint16_t d[2] = {
+                            janas_fp32_to_fp16(rndf(-0.01f, 0.01f)),
+                            janas_fp32_to_fp16(rndf(-0.01f, 0.01f))};
+                        if (t == JANAS_Q6_K || t == JANAS_Q3_K)
+                            memcpy(q + bs - 2, d, 2);
+                        else if (t == JANAS_Q2_K)
+                            memcpy(q + bs - 4, d, 4);
+                        else if (t == JANAS_IQ1_M) {
+                            uint16_t sc[4];
+                            memcpy(sc, q + bs - 8, 8);
+                            for (int k = 0; k < 4; k++)
+                                sc[k] = (uint16_t)((sc[k] & 0x0fff) |
+                                                   (d[0] >> 4 * k & 15) << 12);
+                            memcpy(q + bs - 8, sc, 8);
+                        } else
+                            memcpy(q, d, 4);
+                    }
+            }
+            for (int v = 0; v < NV; v++) {
+                for (size_t i = 0; i < n; i++)
+                    xf[i] = rndf(-1.0f, 1.0f);
+                janas_q8k_quantize(xf, x + v * nb, n);
+            }
+            for (int nv = 1; nv <= NV; nv += nv < 9 ? 1 : 8) {
+                janas_dot_multi_rows(t, w, rb, x, nb, (size_t)nv, nb, ROWS, out,
+                                     ROWS);
+                for (int v = 0; v < nv; v++)
+                    for (int r = 0; r < ROWS; r++) {
+                        float one = janas_dot(t, w + r * rb, x + v * nb, nb);
+                        CHECK(out[r + ROWS * v] == one,
+                              "type %d %zu groups nv %d r %d v %d: %g vs %g", t,
+                              nb, nv, r, v, out[r + ROWS * v], one);
+                        if (t == JANAS_Q2_0) {
+                            float ref = janas_q2_0_dot_ref(
+                                (const void *)(w + r * rb), x + v * nb, nb);
+                            CHECK(one == ref, "q2_0 %zu groups: %g vs %g", nb,
+                                  one, ref);
+                        }
+                    }
+            }
+            float one[ROWS];
+            janas_dot_rows(t, w, rb, x, nb, ROWS, one);
+            for (int r = 0; r < ROWS; r++)
+                CHECK(one[r] == janas_dot(t, w + r * rb, x, nb),
+                      "type %d %zu groups rows %d", t, nb, r);
+            free(w);
+            free(x);
+            free(xf);
+        }
+}
+
+/*
  * Q5_0 and Q2_0: the reference against a float product over the
  * dequantized weights, the kernels (single, 1-17 vectors, rows) equal to it
  * to the bit; the values by hand as ggml's dequantize_row_q5_0 and
@@ -1126,6 +1299,20 @@ static void test_dot_q5_0_q2_0(void)
                 CHECK(rows[r] == one, "%s rows %d: %g vs %g", name, r, rows[r],
                       one);
             }
+            /* the same four rows on 1-17 vectors at once */
+            for (int nv = 1; nv <= NV; nv++) {
+                float out[4 * NV];
+                janas_dot_multi_rows(t, w, 2 * gb, x, NB, (size_t)nv, 2, 4, out,
+                                     4);
+                for (int r = 0; r < 4; r++)
+                    for (int v = 0; v < nv; v++) {
+                        float one =
+                            janas_dot(t, w + 2 * gb * (size_t)r, x + v * NB, 2);
+                        CHECK(out[r + 4 * v] == one,
+                              "%s multi rows nv %d r %d v %d: %g vs %g", name,
+                              nv, r, v, out[r + 4 * v], one);
+                    }
+            }
         }
     /* by hand. Q5_0: weight 17 takes bit 17 of qh and the high nibble of
        byte 1, weight 1 the low nibble alone, less 16 */
@@ -1163,7 +1350,9 @@ static void test_dot_q5_0_q2_0(void)
  */
 static void test_row_tails(void)
 {
-    enum { NMAX = 768, NBX = NMAX / JANAS_QK, NV = 17, ROWS = 37 };
+    /* 33 vectors and 37 rows: the tiles take 32 of them (from 24 vectors),
+       the tails 16 rows at a time */
+    enum { NMAX = 768, NBX = NMAX / JANAS_QK, NV = 33, ROWS = 37 };
     static const int types[] = {JANAS_Q2_0, JANAS_Q5_0, JANAS_IQ4_NL,
                                 JANAS_Q4_0, JANAS_Q8_0};
     static const size_t ns[] = {640, 64, 320, 576, 704};
@@ -1229,8 +1418,23 @@ static void test_row_tails(void)
                           n, v, nv, out[v], e);
                 }
             }
-            /* the grouped products: one vector and five */
-            for (int nv = 1; pool && nv <= 5; nv += 4) {
+            for (int nv = 1; nv <= NV; nv += 8) {
+                janas_dot_multi_rows_n(t, w, rb, x, nbx, (size_t)nv, n, ROWS, y,
+                                       ROWS);
+                for (int v = 0; v < nv; v++)
+                    for (int r = 0; r < ROWS; r++) {
+                        float e =
+                            janas_dot_n(t, w + (size_t)r * rb, x + v * nbx, n);
+                        CHECK(y[v * ROWS + r] == e,
+                              "type %d n %zu multi rows nv %d v %d row %d: %g "
+                              "vs %g",
+                              t, n, nv, v, r, y[v * ROWS + r], e);
+                    }
+            }
+            /* the grouped products: one vector, five and NV */
+            for (int nv = 1; pool && nv <= NV; nv = nv == 1   ? 5
+                                                    : nv == 5 ? NV
+                                                              : NV + 1) {
                 struct janas_matvec_task task = {.type = t,
                                                  .w = w,
                                                  .x = x,
@@ -2008,6 +2212,8 @@ int main(void)
     test_dot_mxfp4();
     test_dot_q4_0_q5_1();
     test_dot_q5_0_q2_0();
+    test_multi_rows_long();
+    test_q6k_tiles();
     test_row_tails();
     test_dot_q3k();
     test_dot_iq3s();

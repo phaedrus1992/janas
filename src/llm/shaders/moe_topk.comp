@@ -5,7 +5,10 @@
 // model_ffn.c route_tok: per token, the softmax of its ne router logits,
 // the k largest (the first of equals), each weight divided by the sum of
 // the k; logit ne, the shared expert's gate (if sh), through a sigmoid, 1
-// without one. One invocation a token. NOT bit for bit with the CPU: the
+// without one. A workgroup a token, its logits in shared memory, each
+// search a reduction over the 64 invocations (one invocation a token read
+// some 1300 logits one after the other: 0.5 ms a layer on a single token
+// on the laptop's Arc, 24 Oct 2026). NOT bit for bit with the CPU: the
 // GPU's exp, the router's sums in another order.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -20,45 +23,91 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer UO
 // j k + i; shw: the shared expert's weight of each token
 layout(push_constant) uniform P { uvec2 r, pe, pw, shw; uint ne, rs, k, n, sh; } p;
 
-const uint MAXK = 16u, MAXW = 16u; // k <= 16, ne <= 512
+const uint MAXK = 16u, MAXE = 512u; // k <= 16, ne <= 512
+const uint NONE = 0xffffffffu;
+
+shared float sv[MAXE];
+shared float rv[64];
+shared uint ri[64];
+shared uint taken[MAXE / 32u];
+shared uint ids[MAXK];
+shared float w[MAXK];
 
 void main()
 {
-    uint j = gl_GlobalInvocationID.x;
-    if (j >= p.n)
-        return;
+    uint j = gl_WorkGroupID.x, id = gl_LocalInvocationID.x;
     F R = F(p.r);
     uint base = j * p.rs;
     float mx = R.v[base];
-    for (uint e = 1u; e < p.ne; e++)
-        mx = max(mx, R.v[base + e]);
+    for (uint e = id; e < p.ne; e += 64u) {
+        float v = R.v[base + e];
+        sv[e] = v;
+        mx = max(mx, v);
+    }
+    if (id < MAXE / 32u)
+        taken[id] = 0u;
+    rv[id] = mx;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (id < s)
+            rv[id] = max(rv[id], rv[id + s]);
+        barrier();
+    }
+    mx = rv[0];
+    barrier();
     float sum = 0.0;
-    for (uint e = 0u; e < p.ne; e++)
-        sum += exp(R.v[base + e] - mx);
-    uint taken[MAXW];
-    for (uint i = 0u; i < MAXW; i++)
-        taken[i] = 0u;
-    uint ids[MAXK];
-    float w[MAXK], wsum = 0.0;
+    for (uint e = id; e < p.ne; e += 64u)
+        sum += exp(sv[e] - mx);
+    rv[id] = sum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (id < s)
+            rv[id] += rv[id + s];
+        barrier();
+    }
+    sum = rv[0];
+    barrier();
     for (uint i = 0u; i < p.k; i++) {
-        uint best = 0u;
+        /* each invocation's largest not taken (the first of equals: e
+           grows), then the largest of those, the lower index of equals */
         float bv = 0.0;
-        bool any = false;
-        for (uint e = 0u; e < p.ne; e++) {
+        uint be = NONE;
+        for (uint e = id; e < p.ne; e += 64u) {
             if ((taken[e / 32u] & (1u << (e % 32u))) != 0u)
                 continue;
-            float v = R.v[base + e];
-            if (!any || v > bv) {
-                bv = v;
-                best = e;
-                any = true;
+            if (be == NONE || sv[e] > bv) {
+                bv = sv[e];
+                be = e;
             }
         }
-        taken[best / 32u] |= 1u << (best % 32u);
-        ids[i] = best;
-        w[i] = exp(bv - mx) / sum;
-        wsum += w[i];
+        rv[id] = bv;
+        ri[id] = be;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (id < s) {
+                uint oe = ri[id + s], me = ri[id];
+                float ov = rv[id + s], mv = rv[id];
+                if (oe != NONE &&
+                    (me == NONE || ov > mv || (ov == mv && oe < me))) {
+                    rv[id] = ov;
+                    ri[id] = oe;
+                }
+            }
+            barrier();
+        }
+        if (id == 0u) {
+            uint best = ri[0];
+            taken[best / 32u] |= 1u << (best % 32u);
+            ids[i] = best;
+            w[i] = exp(rv[0] - mx) / sum;
+        }
+        barrier();
     }
+    if (id != 0u)
+        return;
+    float wsum = 0.0;
+    for (uint i = 0u; i < p.k; i++)
+        wsum += w[i];
     UO PE = UO(p.pe);
     FO PW = FO(p.pw);
     for (uint i = 0u; i < p.k; i++) {

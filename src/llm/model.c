@@ -434,6 +434,10 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     for (uint32_t j = 0; j < n; j++)
         if (tokens[j] < 0 || (uint32_t)tokens[j] >= m->n_vocab)
             return -1;
+    /* from the start: nothing of the GPU's copy of the state matters, the
+       host's (the recurrent states zeroed below) is the one */
+    if (m->gtok_dev && pos0 == 0)
+        m->gtok_where = JANAS_GT_HOST;
     if (m->a->rec) {
         if (pos0 == 0) {
             m->src = 0;
@@ -482,6 +486,8 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     if (gpu == -2)
         return -1; /* the GPU failed after replaying on the base in place:
                       no state to go on from (base_pos stays invalid) */
+    if (gpu != 0)  /* the CPU's pass: the state the GPU made newer back */
+        janas_m_gtok_host(m, 1);
     if (gpu == 0) {
         m->ring_hi = pos0 + n;
         if (m->a->rec && n <= JANAS_LLM_MAX_BLOCK) {
