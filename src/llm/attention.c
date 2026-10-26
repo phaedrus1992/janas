@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -45,6 +46,14 @@ struct janas_attn {
     int ring;          /* position p in row p mod n_ctx (with a window) */
     uint32_t window;   /* a token sees the last window positions; 0: all */
     atomic_uint *done; /* chunks finished, per (KV head, subgroup) */
+    /* the engine's choice (scores_auto): the two ways measured on the
+       calls themselves, a token's and a block's apart, every TUNE_BAND
+       positions (attn_tune_*) */
+    struct {
+        uint32_t band, calls;
+        double t[2]; /* seconds over the calls each way: float, int16 */
+        int pick;
+    } tune[2];
 };
 
 struct attn_job {
@@ -919,13 +928,10 @@ static void attn_worker(void *arg, int tid, int n_threads)
 }
 
 /*
- * Which way the scores go, when the caller leaves it open: the sixteen-bit
- * query where the arithmetic for it is there and the caller asked for more
- * context than the usual sixteen thousand tokens. A context is a ceiling,
- * not a promise: a conversation that stays short pays the query's
- * quantization for a gain it never sees, so the engine waits to be asked for
- * a long one - there attention is the greater part of a token, and the
- * sixteen-bit query takes a fifth to a quarter off it.
+ * Which way the scores go: asked by the caller (or JANAS_ATTN), else the
+ * engine's, measured on the calls (attn_tune_pick) - this, the way until
+ * the first measures: the sixteen-bit query where the arithmetic for it is
+ * there and the context is long.
  */
 static int scores_choice(int asked, uint32_t head_dim, uint32_t n_ctx,
                          int *chosen_here)
@@ -979,13 +985,18 @@ struct janas_attn *janas_attn_create(uint32_t n_head, uint32_t n_head_kv,
     A->scr = malloc((size_t)n_threads * (JANAS_ATTN_MAX_BLOCK * group + 2) *
                     ATT_CHUNK * sizeof(float));
     A->done = malloc(n_head * sizeof(*A->done));
-    if (A->scores == JANAS_ATTN_INT16) {
+    /* the sixteen-bit query's room wherever it may be used: chosen by the
+       engine, it can change from call to call */
+    int i16 =
+        A->scores == JANAS_ATTN_INT16 || (A->scores_auto && head_dim % 16 == 0);
+    if (i16) {
         A->qi = malloc((size_t)JANAS_ATTN_MAX_BLOCK * n_head * head_dim *
                        sizeof(int16_t));
         A->qs = malloc((size_t)JANAS_ATTN_MAX_BLOCK * n_head * sizeof(float));
     }
-    if (!A->part || !A->scr || !A->done ||
-        (A->scores == JANAS_ATTN_INT16 && (!A->qi || !A->qs))) {
+    for (int c = 0; c < 2; c++)
+        A->tune[c].band = UINT32_MAX;
+    if (!A->part || !A->scr || !A->done || (i16 && (!A->qi || !A->qs))) {
         janas_attn_destroy(A);
         return NULL;
     }
@@ -1044,11 +1055,66 @@ void janas_attn_destroy(struct janas_attn *A)
     free(A);
 }
 
+/*
+ * The engine's choice of the scores' way, made on this machine: in float
+ * over the query as it is, or over the query at sixteen bits (an integer
+ * sum, a relative 3e-5 of error where the eight-bit keys carry 4e-3: the
+ * most likely token the same at 2,961 of 3,200 positions against llama.cpp
+ * as at 2,963 in float, Qwen3 0.6B and 4B, Qwen3.5 0.8B and 2B, two texts
+ * each, 26 Oct 2026). Which is faster depends on the processor (AVX-VNNI
+ * or not, its cores) and grows with the position, so every TUNE_BAND
+ * positions TUNE_TRY calls each way, a token's calls and a block's apart
+ * (the first way of a band alternating), and the faster for the rest of
+ * the band. JANAS_ATTN=float or int16 fixes it.
+ */
+#define TUNE_BAND (16 * ATT_CHUNK)
+#define TUNE_TRY 8
+
+static double attn_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* this call's way (JANAS_ATTN_FLOAT or _INT16) */
+static int attn_tune_pick(struct janas_attn *A, int c, uint32_t pos0)
+{
+    uint32_t band = pos0 / TUNE_BAND;
+    if (band != A->tune[c].band) {
+        A->tune[c].band = band;
+        A->tune[c].calls = 0;
+        A->tune[c].t[0] = A->tune[c].t[1] = 0.0;
+    }
+    uint32_t k = A->tune[c].calls;
+    if (k >= 2 * TUNE_TRY)
+        return A->tune[c].pick;
+    int first = (int)(band & 1u), way = k < TUNE_TRY ? first : !first;
+    return way ? JANAS_ATTN_INT16 : JANAS_ATTN_FLOAT;
+}
+
+static void attn_tune_seen(struct janas_attn *A, int c, int mode, double s)
+{
+    if (A->tune[c].calls >= 2 * TUNE_TRY)
+        return;
+    A->tune[c].t[mode == JANAS_ATTN_INT16] += s;
+    if (++A->tune[c].calls == 2 * TUNE_TRY)
+        A->tune[c].pick = A->tune[c].t[1] < A->tune[c].t[0] ? JANAS_ATTN_INT16
+                                                            : JANAS_ATTN_FLOAT;
+}
+
 void janas_attn_run(struct janas_attn *A, struct janas_pool *pool,
                     const float *q, const int8_t *k, const float *ks,
                     const int8_t *v, const float *vs, uint32_t n, uint32_t pos0,
                     float *out)
 {
+    /* the engine's choice: measured (attn_tune_pick) */
+    int tc = n > 1, tuned = A->scores_auto && A->qi && !A->kv16;
+    double t0 = 0.0;
+    if (tuned) {
+        A->scores = attn_tune_pick(A, tc, pos0);
+        t0 = attn_now();
+    }
     /* enough items for every thread: split the query heads of a group */
     uint32_t n_chunks = (pos0 + n + ATT_CHUNK - 1) / ATT_CHUNK, split = 1;
     uint32_t group = A->n_head / A->n_kv;
@@ -1106,4 +1172,6 @@ void janas_attn_run(struct janas_attn *A, struct janas_pool *pool,
     janas_pool_run(pool, attn_worker, &job);
     if (!job.fuse)
         janas_pool_run(pool, merge_worker, &job);
+    if (tuned)
+        attn_tune_seen(A, tc, A->scores, attn_now() - t0);
 }

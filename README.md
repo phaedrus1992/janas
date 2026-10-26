@@ -40,6 +40,18 @@ Janas-LLM's figures are the best of the configurations `janas-bench` measures, a
 
 **New: Intel's NPU reads the prompts.** On the same laptop's NPU Janas-LLM reads 1,024 tokens of Qwen3.5-2B at 729 tok/s, of Gemma-4-E2B at 508 and of Qwen3-4B at 333, 1.5 to 2.6 times as fast as without it, with answers as close to llama.cpp's as the CPU's. It takes the NPU by itself where it measures faster, and three options choose by hand: [Intel's NPU](#intels-npu), [Choosing what runs where](#choosing-what-runs-where).
 
+**Long contexts: at 16,384 tokens Janas-LLM writes a reply at 15.0 tok/s, where llama.cpp manages 2.2, and reads the prompt at 56 tok/s, against 31.** Qwen3-4B Q4_K_M on the same laptop, the CPU alone on both sides (12 threads), the same file, 26 October 2026; a prompt read from the start, then 64 tokens written after it:
+
+| Context | reading the prompt: Janas-LLM | llama.cpp | writing after it: Janas-LLM | llama.cpp |
+|---|---|---|---|---|
+| 1,024 tokens | 118 tok/s | 67 | 27.6 tok/s | 12.5 |
+| 4,096 | 96 | 55 | 22.0 | 7.7 |
+| 8,192 | 74 | 44 | 18.2 | 4.6 |
+| 16,384 | 56 | 31 | 15.0 | 2.2 |
+| 32,000 | 35 | - | 10.7 | - |
+
+The longer the context, the wider the gap: 2.2 times as fast writing at 1,024 tokens, 6.9 times at 16,384. Both slow down as the context grows, and on both the attention is what grows: at 32,000 tokens it takes 59 of the 93 ms Janas-LLM spends on a token written, and the 32,000 tokens of prompt take 15 minutes to read. Janas-LLM's peak memory went from 2.6 GiB at 1,024 tokens to 4.9 at 32,000. The conditions are the same wherever possible; where not: Janas-LLM keeps the keys and values at eight bits, llama.cpp at sixteen (its default); llama.cpp was not run at 32,000 tokens (almost another hour). How it was measured: [below](#how-the-figures-were-measured).
+
 **Try it** on Linux x86-64 (Ubuntu 22.04, Debian 12 and later):
 
 ```sh
@@ -146,6 +158,8 @@ Everything the engine does is chosen from what it measures, so another machine w
 What Janas-LLM runs today, model by model and feature by feature: [docs/features.md](docs/features.md).
 
 The table at the top, on 21 October 2026: `janas-bench --prompt 1024 --gen 16 --rounds 2 --no-mtp --settle 300`, which measures each configuration the engine may choose (6, 12 and 20 threads, with the GPU in the shorter passes or not, with the NPU or not), the best of each column taken, against llama.cpp (build `2b18470` of 18 September 2026) with its Vulkan backend on the same integrated GPU, everything on it (`llama-bench -p 1024 -n 16 -r 2 -t 12 -ngl 99`), on the same files the same day. The writing columns are without drafts on both sides. The two tools do not measure in quite the same way (`llama-bench` writes without a prompt before it, `janas-bench` after the 1,024 tokens), and it is one machine. The conditions are the same wherever the two engines allow it, and where they are not, it is said.
+
+The long contexts, on 26 October 2026: Janas-LLM through `tests/bench_long` (`JANAS_GPU=0`, 12 threads on CPUs 0-11, a 4 GiB expert cache), a prompt of n tokens read in blocks from position 0, then 64 written greedily one at a time; llama.cpp (build `2b18470`, CPU backend, `-t 12 -ngl 0`) with `llama-bench -p n -n 0` for reading and `-p 0 -n 64 -d n` for writing after n tokens; the same Qwen3-4B Q4_K_M file (Qwen's own GGUF), the same tokens (English Wikipedia articles, C sources and Italian prose, mixed), one run each, ten seconds apart, the machine otherwise idle.
 
 Qwen3-Next-80B-A3B and Qwen3-Coder-Next are larger than the laptop's memory. llama.cpp with its usual build ran out of memory as soon as the GPU took part, even with the experts left on the CPU (`-ngl 99 -ncmoe 48`): its CPU backend copies the weights into memory of its own to repack them, and the Vulkan backend copies those it leaves to the CPU into buffers the system cannot reclaim. It ran with a build without repacking (`GGML_CPU_REPACK=OFF`) and `--no-host 1 -lm mmap`, which leave the experts in the file, read through the page cache: 17.7 tok/s reading with the GPU, 3.0 writing on the CPU alone (1.8 with the GPU; its CPU backend read at 12.6). Janas-LLM ran them with no option of its own, the experts it uses most in a cache of 21 GiB and the rest read from the disk.
 

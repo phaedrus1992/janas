@@ -140,7 +140,7 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
     llm->im_start = janas_tokenizer_find(llm->tok, "<|im_start|>");
     llm->im_end = janas_tokenizer_find(llm->tok, "<|im_end|>");
     llm->asst_role = "assistant";
-    llm->bos = llm->think_on = -1;
+    llm->bos = llm->think_on = llm->hdr_end = -1;
     llm->quote = llm->decl_open = llm->decl_close = -1;
     int32_t turn_open = janas_tokenizer_find(llm->tok, "<|turn>");
     int32_t turn_close = janas_tokenizer_find(llm->tok, "<turn|>");
@@ -181,6 +181,25 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
             llm->tools = JANAS_TOOLS_NONE;
         if (llm->tools != JANAS_TOOLS_NONE)
             llm->stop[llm->n_stop++] = llm->resp_open;
+    } else if (janas_tokenizer_find(llm->tok, "<|start_header_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|end_header_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|eot_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|begin_of_text|>") >= 0 &&
+               (tmpl[0] == 0 || strstr(tmpl, "<|start_header_id|>"))) {
+        /* Llama 3, a base model too: no reasoning, no tools yet */
+        llm->format = FORMAT_LLAMA3;
+        llm->im_start = janas_tokenizer_find(llm->tok, "<|start_header_id|>");
+        llm->hdr_end = janas_tokenizer_find(llm->tok, "<|end_header_id|>");
+        llm->im_end = janas_tokenizer_find(llm->tok, "<|eot_id|>");
+        llm->bos = janas_tokenizer_find(llm->tok, "<|begin_of_text|>");
+        llm->stop[llm->n_stop++] = llm->im_end;
+        int32_t eom = janas_tokenizer_find(llm->tok, "<|eom_id|>");
+        if (eom >= 0)
+            llm->stop[llm->n_stop++] = eom;
+        llm->think_open = llm->think_close = -1;
+        llm->call_open = llm->call_close = -1;
+        llm->resp_open = llm->resp_close = -1;
+        llm->tools = JANAS_TOOLS_NONE;
     } else if (llm->im_start >= 0 && llm->im_end >= 0 &&
                (tmpl[0] == 0 || strstr(tmpl, "<|im_start|>"))) {
         llm->format = FORMAT_CHATML;
@@ -555,9 +574,10 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     janas_jns_meta_str(&j, "general.name", name, sizeof(name));
     janas_jns_meta_str(&j, "general.architecture", arch, sizeof(arch));
     int32_t rc = 0;
-    /* byte-level BPE with Qwen's pre-tokenizers, or Gemma 4's */
+    /* byte-level BPE with Qwen's or Llama 3's pre-tokenizers, or Gemma 4's */
     int known = (strcmp(kind, "gpt2") == 0 &&
-                 (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0)) ||
+                 (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0 ||
+                  strcmp(pre, "llama-bpe") == 0)) ||
                 strcmp(kind, "gemma4") == 0;
     if (!known)
         rc = janas_api_fail(JANAS_LLM_EMODEL, "tokenizer %s/%s not supported",

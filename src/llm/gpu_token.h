@@ -31,6 +31,28 @@
 struct janas_gpu_tok_layer {
     const float *attn_norm, *q_norm, *k_norm, *ffn_norm;
     struct janas_matvec_task wq, wk, wv, wo, gate, up, down;
+    /* the attention's geometry, the model's or the layer's kind's (Gemma
+       4: sliding-window layers and full ones): head size, KV heads, RoPE
+       dimensions, the positions its cache holds (a ring of them where
+       ring: position p in row p mod cap), the window a token sees (0: all
+       of them); wv's type 0: V is K before its norm (Gemma 4's full
+       layers). Gemma 4's sandwich norms of the attention's and the
+       feed-forward's outputs (NULL: none) and the layer's output scale */
+    uint32_t hd, n_kv, n_rot, cap, window;
+    int ring, swa;
+    const float *post_attn, *post_ffn;
+    float out_scale;
+    /* Gemma 4's per-layer embeddings (E2B, E4B; NULL: none): the branch's
+       gate (ple_dim x dm) and projection (dm x ple_dim), f32, its norm; the
+       layer's keys and values another's (n_kv_layers on: wk's type 0) */
+    const float *ple_gate, *ple_proj, *ple_post;
+    /* Gemma 4's mixture (26B; pre_norm2 NULL: none): its dense branch (the
+       shared expert, weight 1, no gate: sh_gate_w's type 0), normalized by
+       post_norm1; the experts' input by pre_norm2, the router's the
+       residual without weights times rscale / sqrt(dm), each expert's
+       output scale, the experts' sum normalized by post_norm2 */
+    struct janas_matvec_task dn_gate, dn_up, dn_down;
+    const float *pre_norm2, *post_norm1, *post_norm2, *rscale, *exp_scale;
     int8_t *kc, *vc; /* the layer's KV cache: n_kv x cap x hd bytes */
     float *ks, *vs;  /* its scales: n_kv x cap */
     /* a Gated DeltaNet layer (qwen3.5) in place of the attention: q|k|v and
@@ -78,8 +100,23 @@ struct janas_gpu_tok_layer {
 };
 
 struct janas_gpu_tok_model {
+    /* n_kv, hd and n_rot the largest of any layer's, cap the full
+       layers' */
     uint32_t n_layer, dm, n_head, n_kv, hd, n_rot, ff, n_vocab, cap;
     float eps, attn_scale;
+    /* Gemma 4: GELU in place of SiLU, keys and values at sixteen bits (q
+       left in float for them), V normalized without weights; the
+       sliding-window layers' RoPE dimensions and their tables (n_rot_swa
+       / 2 cos and sin a token, set before each run), the most tokens a
+       block the rings leave room for (0: no ring) */
+    int gelu, kv16, vnorm;
+    uint32_t n_rot_swa, ring_room;
+    const float *cs_swa, *sn_swa;
+    /* Gemma 4's per-layer embeddings: ple_dim numbers a layer and token
+       (0: none), the block's from the CPU (janas_m_ple_inputs, n_layer
+       ple_dim a token), set before each run */
+    uint32_t ple_dim;
+    const float *ple_in;
     const struct janas_gpu_tok_layer *layers;
     const float *out_norm;
     struct janas_matvec_task output;

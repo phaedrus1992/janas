@@ -198,6 +198,32 @@ int32_t janas_llm_chat_logit_bias(janas_llm_chat *c, int32_t n,
     return JANAS_LLM_OK;
 }
 
+int32_t janas_llm_chat_vocab(janas_llm_chat *c, int32_t n, const int32_t *ids)
+{
+    if (!c || n < 0 || (n > 0 && !ids))
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid argument");
+    const janas_llm *llm = c->llm;
+    if (n == 0) {
+        janas_llm_model_set_vocab(llm->m, NULL, 0);
+        return JANAS_LLM_OK;
+    }
+    /* the format's ends of a reply too, or none could end */
+    int32_t *all = malloc(((size_t)n + JANAS_GEN_MAX_STOP) * sizeof(int32_t));
+    if (!all)
+        return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
+    memcpy(all, ids, (size_t)n * sizeof(int32_t));
+    for (int i = 0; i < llm->n_stop; i++)
+        all[n + i] = llm->stop[i];
+    int rc =
+        janas_llm_model_set_vocab(llm->m, all, (uint32_t)(n + llm->n_stop));
+    free(all);
+    if (rc != 0)
+        return janas_api_fail(JANAS_LLM_EMODEL,
+                              "this model's output head cannot be restricted "
+                              "(its weights in bit planes), or out of memory");
+    return JANAS_LLM_OK;
+}
+
 /* ---- what holds a reply ---- */
 
 /*

@@ -196,8 +196,8 @@ struct janas_gpu {
     /* q3k, q4k, q6k, q6kp_matvec and b32_matvec's MXFP4 and Q2_0 with ID:
        a mixture's experts on a few vectors, MVID_NV a workgroup, from
        *_mmid.comp's table (optional) */
-    VkShaderModule sm_mvid[6];
-    VkPipeline pipe_mvid[6];
+    VkShaderModule sm_mvid[8];
+    VkPipeline pipe_mvid[8];
     int only_fast;   /* janas_gpu_set_only_fast */
     uint32_t pass_n; /* janas_gpu_set_pass; UINT32_MAX until said */
     uint32_t nvg;    /* vectors a product's workgroup takes (NV_PER_GROUP) */
@@ -361,6 +361,7 @@ const struct region *janas_g_find_region(const struct janas_gpu *g,
 void janas_g_push_addr(uint32_t out[2], VkDeviceAddress a);
 void janas_g_compute_barrier(struct janas_gpu *g);
 int janas_g_x_in_32(int type);
+int janas_g_copy_asked(void); /* JANAS_GPU_COPY=1 */
 /*
  * Records the product of rows of a task (its weights in a region the GPU
  * holds) with nv = t->n_vec vectors at xa (the shader's layout, blocks of

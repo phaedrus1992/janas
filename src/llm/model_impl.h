@@ -117,6 +117,16 @@ struct janas_llm_model {
     /* the user keeps prompts off the GPU (--prompt-on cpu, npu): its fast
        prompt, which reads them whatever the tuner chose, does not */
     int prompts_off_gpu;
+    /* a long prompt's blocks: the GPU's whole pass against the path
+       without it, measured in turn every LP_BLOCKS blocks (model.c
+       long_prompt_*); lp_cpu: this block without it */
+    struct {
+        uint32_t band;
+        int state;       /* 0: none measured, 1: one, 2: both */
+        int first;       /* which went first: 0 the GPU's */
+        double gpu, cpu; /* seconds a token */
+    } lp;
+    int lp_cpu;
     /* the user's devices for prompts, drafts, replies (common/devices.h:
        janas_devices_vars' order), as this machine has them; 0 as the
        engine chooses */
@@ -309,6 +319,14 @@ struct janas_llm_model {
     uint32_t dh_n, dh_cap;
     size_t dh_row;
     float *dh_logits;
+    /* The vocabulary of the replies (janas_llm_model_set_vocab): the head's
+       rows of those tokens alone, copied as the draft head's, computed in
+       place of the whole head, the other logits -inf; vs_n 0: the whole */
+    uint8_t *vs_w;
+    int32_t *vs_ids;
+    uint32_t vs_n;
+    float *vs_y; /* their logits, vs_cap vectors */
+    uint32_t vs_cap;
     float *big, *qgate, *ba, *mixed, *conv_out, *beta, *decay;
     struct janas_block_q8k *xq, *attq;
     /* routed experts: one pair per (token, chosen expert), sorted by expert,

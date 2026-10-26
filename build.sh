@@ -59,7 +59,8 @@ Output
   src/services/<tool>/main.c becomes janas-<tool>, with
   the other .c files of its directory; the libraries of others in
   src/third_party/ go into the programs that use them; every other .c
-  under src/ goes into the library. The release build
+  under src/ goes into the library. Janet (src/janet/, Linux x86-64)
+  gives janet, janet-check, janet-mnist and janet-mnist-deep. The release build
   also links libjanas_llm.so and libjanas_mcp.so, which export the public
   APIs of include/janas/llm.h and include/janas/mcp.h and nothing else.
   On Linux src/node/ becomes janas.node, the module for Node.js, with the

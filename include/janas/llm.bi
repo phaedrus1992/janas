@@ -393,6 +393,11 @@ declare function janas_llm_chat_logit_bias(byval c as janas_llm_chat ptr, _
                                            byval n as long, _
                                            byval ids as const long ptr, _
                                            byval bias as const single ptr) as long
+'' The tokens the replies may have (n 0: all of them again); the model
+'' computes their logits alone.
+declare function janas_llm_chat_vocab(byval c as janas_llm_chat ptr, _
+                                      byval n as long, _
+                                      byval ids as const long ptr) as long
 '' The tokens of the reply: id, part (JANAS_LLM_PART_*), log-probability,
 '' bytes; and the most likely alternatives in each one's place.
 declare function janas_llm_chat_tokens(byval c as const janas_llm_chat ptr) as long

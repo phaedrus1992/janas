@@ -9,6 +9,9 @@
 
 static const struct janas_arch archs[] = {
     {.name = "qwen3", .rec = JANAS_REC_NONE},
+    /* Llama 3: Qwen3's dense layers without the heads' norms; its RoPE
+       factors (rope_freqs, rope_scaling of type llama3) as Gemma 4's */
+    {.name = "llama", .rec = JANAS_REC_NONE, .no_qk_norm = 1},
     {.name = "qwen3moe", .rec = JANAS_REC_NONE},
     {.name = "qwen3next",
      .rec = JANAS_REC_NEXT,

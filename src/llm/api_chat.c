@@ -246,12 +246,25 @@ int janas_api_add_special(janas_llm_chat *c, int32_t id)
     return 0;
 }
 
+/* The newline after a turn's end: ChatML's and Gemma's, none in Llama 3. */
+int janas_api_end_turn_nl(janas_llm_chat *c)
+{
+    return c->llm->format == FORMAT_LLAMA3 ? 0 : janas_api_add_text(c, "\n", 1);
+}
+
 /* One message of the conversation, in the model's format. */
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n)
 {
     const janas_llm *llm = c->llm;
     switch (llm->format) {
+    case FORMAT_LLAMA3:
+        return janas_api_add_special(c, llm->im_start) ||
+               janas_api_add_text(c, role, strlen(role)) ||
+               janas_api_add_special(c, llm->hdr_end) ||
+               janas_api_add_text(c, "\n\n", 2) ||
+               janas_api_add_text(c, text, n) ||
+               janas_api_add_special(c, llm->im_end);
     case FORMAT_CHATML:
     default:
         return janas_api_add_special(c, llm->im_start) ||
@@ -259,11 +272,12 @@ int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                janas_api_add_text(c, "\n", 1) ||
                janas_api_add_text(c, text, n) ||
                janas_api_add_special(c, llm->im_end) ||
-               janas_api_add_text(c, "\n", 1);
+               janas_api_end_turn_nl(c);
     }
 }
 
-/* The start of the sequence: Gemma's <bos>, nothing for ChatML. */
+/* The start of the sequence: Gemma's <bos>, Llama 3's <|begin_of_text|>,
+   nothing for ChatML. */
 int janas_api_begin_sequence(janas_llm_chat *c)
 {
     return c->llm->bos >= 0 ? janas_api_add_special(c, c->llm->bos) : 0;
@@ -292,6 +306,12 @@ int janas_api_start_reply(janas_llm_chat *c)
                janas_api_add_text(c, "thought\n", 8) ||
                janas_api_add_special(c, llm->think_close) ||
                janas_api_flush_text(c);
+    case FORMAT_LLAMA3:
+        c->in_think = 0;
+        return janas_api_add_special(c, llm->im_start) ||
+               janas_api_add_text(c, "assistant", 9) ||
+               janas_api_add_special(c, llm->hdr_end) ||
+               janas_api_add_text(c, "\n\n", 2) || janas_api_flush_text(c);
     case FORMAT_CHATML:
     default:
         if (janas_api_add_special(c, llm->im_start) ||
@@ -419,7 +439,7 @@ int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
                              janas_api_add_text(c, "\n", 1))) ||
                   janas_api_add_markup(c, b.p, b.n) ||
                   janas_api_add_special(c, llm->im_end) ||
-                  janas_api_add_text(c, "\n", 1);
+                  janas_api_end_turn_nl(c);
         janas_buf_free(&b);
         return err ? -1 : 0;
     }
@@ -455,7 +475,7 @@ int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
               janas_api_add_text(c, "system\n", 7) ||
               janas_api_add_markup(c, b.p, b.n) ||
               janas_api_add_special(c, llm->im_end) ||
-              janas_api_add_text(c, "\n", 1) || janas_api_flush_text(c);
+              janas_api_end_turn_nl(c) || janas_api_flush_text(c);
     janas_buf_free(&b);
     if (!err && c->n_ids - ids0 > plain)
         c->tools_tokens = (uint32_t)(c->n_ids - ids0 - plain);
@@ -498,7 +518,7 @@ static int recap(janas_llm_chat *c)
     int err = 0;
     if (!c->closed)
         err |= janas_api_add_special(c, c->llm->im_end);
-    err |= janas_api_add_text(c, "\n", 1);
+    err |= janas_api_end_turn_nl(c);
     err |= janas_api_add_message(c, "user", RECAP_ASK, strlen(RECAP_ASK));
     err |= janas_api_start_reply(c);
     if (!err && janas_llm_session_append(c->s, c->ids, (uint32_t)c->n_ids) == 0)
@@ -842,7 +862,7 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
            it was cut and gets one now; then the newline after it */
         if (!c->closed)
             err |= janas_api_add_special(c, c->llm->im_end);
-        err |= janas_api_add_text(c, "\n", 1);
+        err |= janas_api_end_turn_nl(c);
     } else {
         /* the start: <bos> where the format has one, the system message */
         err |= janas_api_begin_sequence(c);
@@ -866,7 +886,7 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
             err |= janas_api_add_markup(c, "\n</tool_response>", 17);
         }
         err |= janas_api_add_special(c, c->llm->im_end) ||
-               janas_api_add_text(c, "\n", 1);
+               janas_api_end_turn_nl(c);
     } else {
         err |= janas_api_add_message(c, "user", text, n);
     }

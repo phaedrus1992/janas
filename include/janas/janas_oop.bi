@@ -293,6 +293,8 @@ public:
     declare function ToolCall(byval i as long, byref toolName as string, _
                               byref args as string) as boolean
     declare function LogitBias(ids() as long, bias() as single) as boolean
+    '' the tokens the replies may have (an empty array: all of them)
+    declare function Vocab(ids() as long) as boolean
     '' the tokens of the reply (options.logprobs = 1 for their
     '' log-probabilities, options.top_logprobs for the alternatives)
     declare const property Tokens() as long
@@ -1200,6 +1202,19 @@ function Chat.LogitBias(ids() as long, bias() as single) as boolean
     end if
     dim as long rc = janas_llm_chat_logit_bias(hs->chat, n, _
                         @ids(lbound(ids)), @bias(lbound(bias)))
+    if rc <> JANAS_LLM_OK then return Fail(rc)
+    return Done_()
+end function
+
+function Chat.Vocab(ids() as long) as boolean
+    if Closed() then return false
+    dim as long n = ubound(ids) - lbound(ids) + 1
+    dim as long rc
+    if n <= 0 then
+        rc = janas_llm_chat_vocab(hs->chat, 0, 0)
+    else
+        rc = janas_llm_chat_vocab(hs->chat, n, @ids(lbound(ids)))
+    end if
     if rc <> JANAS_LLM_OK then return Fail(rc)
     return Done_()
 end function

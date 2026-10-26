@@ -374,10 +374,10 @@ int janas_m_expert_rows(struct janas_llm_model *m, uint32_t l, uint32_t n,
     uint32_t dm = m->d_model, nbd = dm / JANAS_QK;
     if (n > m->blk)
         return -1;
-    /* as the GPU quantizes the same values (norm_quant.comp): then an
-       expert computed here gives the GPU's bits */
+    /* as the GPU quantizes the same values (norm_quant.comp, as the CPU's
+       own path): then an expert computed here gives the GPU's bits */
     for (uint32_t j = 0; j < n; j++)
-        janas_q8k_quantize_det(xn + (size_t)j * dm, m->xq + j * nbd, dm);
+        janas_q8k_quantize(xn + (size_t)j * dm, m->xq + j * nbd, dm);
     const struct janas_jns_layer *jl = &m->j.layers[l];
     /* the CPU's products only: the GPU waits for these between two of its
        submissions */

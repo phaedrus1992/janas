@@ -31,6 +31,12 @@
  * experts in MXFP4 (the MXFP4_MOE files) stay MXFP4, which the engine reads
  * as it is: as Q8_0 they would read twice the bytes at every token.
  *
+ * Llama's queries and keys (general.architecture "llama") are written in the
+ * row order of the original checkpoint: llama.cpp's converter permutes the
+ * rows of each head, [2][half] to [half][2], for its rotation of adjacent
+ * pairs, and Janas-LLM rotates halves, as Qwen's files have it. The rows are
+ * moved whole, so any type of weight moves exactly.
+ *
  * A model split into several GGUF files (name-00001-of-0000N.gguf) is read
  * from all of them: give the first. Data is copied in streaming; the model
  * is never held in memory.
@@ -82,6 +88,8 @@ struct tensor {
     /* a resident matrix widened with zeros: its rows, then as written */
     uint64_t rows, rb, new_rows, new_rb, new_dims[2], new_bytes;
     uint32_t new_type; /* MXFP4 is written as Q8_0 */
+    uint32_t unperm;   /* Llama's attn_q, attn_k: their heads, rows to put
+                          back in the checkpoint's order */
 };
 
 /* A matrix of a slot: from which tensor, where in an expert's part of it,
@@ -235,6 +243,30 @@ static uint32_t copy_rows(const struct tensor *t, uint64_t src, uint64_t rows,
     return crc;
 }
 
+/* The rows of t, heads of rows / heads each, from llama.cpp's order - row
+   2 i + j of a head - back to the checkpoint's, row j * half + i. */
+static void copy_unpermuted(const struct tensor *t, uint64_t dst)
+{
+    uint64_t rows = t->t->dims[1], rb = t->t->bytes / rows;
+    uint64_t hd = rows / t->unperm, half = hd / 2;
+    uint8_t *in = malloc(t->t->bytes), *outb = malloc(t->t->bytes);
+    if (!in || !outb)
+        die("%s", "out of memory");
+    if (pread(parts[t->part].fd, in, t->t->bytes,
+              (off_t)(t->base + t->t->offset)) != (ssize_t)t->t->bytes)
+        die("%s", "unexpected end of the GGUF file");
+    for (uint64_t h = 0; h < t->unperm; h++)
+        for (uint64_t j = 0; j < 2; j++)
+            for (uint64_t i = 0; i < half; i++)
+                memcpy(outb + (h * hd + j * half + i) * rb,
+                       in + (h * hd + 2 * i + j) * rb, rb);
+    if (pwrite(out_fd, outb, t->t->bytes, (off_t)dst) != (ssize_t)t->t->bytes)
+        die("write failed: %s", strerror(errno));
+    copied += t->t->bytes;
+    free(in);
+    free(outb);
+}
+
 static size_t tiny_blocks; /* MXFP4 blocks below fp16's scales */
 
 /* n bytes of MXFP4 at src of t, to dst as Q8_0 (twice the bytes). */
@@ -334,6 +366,11 @@ int main(int argc, char **argv)
         die("%s: layers or experts out of range", src);
     /* the experts' width as it is (see the top of the file) */
     int keep_width = strcmp(arch, "qwen4exp") == 0;
+    uint64_t llama_heads = 0, llama_kv = 0;
+    if (strcmp(arch, "llama") == 0) {
+        llama_heads = need_uint(g0, "llama.attention.head_count");
+        llama_kv = need_uint(g0, "llama.attention.head_count_kv");
+    }
 
     /* expert geometry per layer */
     struct janas_jns_layer_v2 *layers = calloc(n_layer, sizeof(*layers));
@@ -430,6 +467,15 @@ int main(int argc, char **argv)
         t->new_dims[0] = t->t->dims[0];
         t->new_dims[1] = t->t->dims[1];
         t->new_type = t->t->type;
+        if (llama_heads && nl > 14 &&
+            (!strcmp(name + nl - 14, ".attn_q.weight") ||
+             !strcmp(name + nl - 14, ".attn_k.weight"))) {
+            t->unperm =
+                (uint32_t)(name[nl - 8] == 'q' ? llama_heads : llama_kv);
+            if (t->t->n_dims != 2 || t->t->dims[1] % (2 * t->unperm) ||
+                t->t->bytes % t->t->dims[1])
+                die("%s: unexpected shape", name);
+        }
         if (t->t->type == GGUF_MXFP4) {
             if (t->t->bytes % MXFP4_BLOCK || t->t->dims[0] % 32 ||
                 (t->t->n_dims == 2 && (gu || dn) &&
@@ -509,7 +555,9 @@ int main(int argc, char **argv)
 
     for (size_t i = 0; i < n_res; i++) {
         const struct tensor *t = resident[i];
-        if (t->new_type != t->t->type)
+        if (t->unperm)
+            copy_unpermuted(t, t->new_offset);
+        else if (t->new_type != t->t->type)
             copy_mxfp4(t, t->t->offset, t->t->bytes, t->new_offset);
         else if (t->new_bytes != t->t->bytes)
             copy_rows(t, t->t->offset, t->rows, t->rb, t->new_rows, t->new_rb,

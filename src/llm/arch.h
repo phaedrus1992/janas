@@ -36,6 +36,9 @@ struct janas_arch {
                      weights, V = K where attn_v is missing, scores not
                      scaled (the q and k norms do it) */
     int kv16;     /* keys and values kept at sixteen bits, not eight */
+    /* Llama 3: no norm on the heads of q and k; the file's queries and keys
+       in the checkpoint's row order (gguf2jns), rotated by halves */
+    int no_qk_norm;
     /* Qwen3.8-Flash-Next (qwen4exp, model_hc.c): hyper-connections - the
        residual in several streams, mixed into each sublayer's input by a
        gate of low rank, in place of its norm, and each sublayer's output

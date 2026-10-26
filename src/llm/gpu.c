@@ -469,6 +469,27 @@ uint32_t janas_g_make_pipeline_sg(struct janas_gpu *g, const uint32_t *code,
                : 0;
 }
 
+/* JANAS_GPU_COPY=1: an integrated GPU taken as a card of its own (its
+   value, not its presence: =0 as without) */
+int janas_g_copy_asked(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("JANAS_GPU_COPY");
+        on = e && atoi(e) > 0;
+    }
+    return on;
+}
+
+/* JANAS_GPU_TILES_EXACT=1: the fast prompt's Q4_K and Q6_K tiles summed
+   as the CPU sums, a block at a time (q4k_mmq.comp, q6k_mmq.comp EXACT),
+   being measured */
+static int tiles_exact(void)
+{
+    const char *e = getenv("JANAS_GPU_TILES_EXACT");
+    return e && atoi(e) > 0;
+}
+
 struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
 {
     struct janas_gpu *g = calloc(1, sizeof(*g));
@@ -613,14 +634,14 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                                    sizeof(janas_spv_iq3s_matvec), &g->smi3,
                                    &g->pipei3, 0)) != VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q4k_mmq, sizeof(janas_spv_q4k_mmq),
-                           &g->sm_mm, &g->pipe_mm, 0, NV_PER_GROUP, g->sg)) !=
-            VK_SUCCESS ||
+                           &g->sm_mm, &g->pipe_mm, (uint32_t)tiles_exact(),
+                           NV_PER_GROUP, g->sg)) != VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q6kp_mmq, sizeof(janas_spv_q6kp_mmq),
                            &g->sm_mm6, &g->pipe_mm6, 0, NV_PER_GROUP, g->sg)) !=
             VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q6k_mmq, sizeof(janas_spv_q6k_mmq),
-                           &g->sm_mm6s, &g->pipe_mm6s, 0, NV_PER_GROUP,
-                           g->sg)) != VK_SUCCESS ||
+                           &g->sm_mm6s, &g->pipe_mm6s, (uint32_t)tiles_exact(),
+                           NV_PER_GROUP, g->sg)) != VK_SUCCESS ||
         (r = make_pipeline(g, janas_spv_q3k_mmq, sizeof(janas_spv_q3k_mmq),
                            &g->sm_mm3, &g->pipe_mm3, 0, NV_PER_GROUP, g->sg)) !=
             VK_SUCCESS ||
@@ -722,16 +743,22 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                                       &g->pipe_dv[i], i) != VK_SUCCESS)
                 g->pipe_dv[i] = VK_NULL_HANDLE;
         /* the experts' products on a few vectors (gpu_token_moe.c) */
-        const uint32_t *mc[6] = {janas_spv_q3k_matvec, janas_spv_q4k_matvec,
+        /* (MXFP4, Q2_0, Q5_1: b32_matvec's kinds; Gemma 4 26B's down
+           matrices are Q5_1) */
+        const uint32_t *mc[8] = {janas_spv_q3k_matvec, janas_spv_q4k_matvec,
                                  janas_spv_q6k_matvec, janas_spv_q6kp_matvec,
-                                 janas_spv_b32_matvec, janas_spv_b32_matvec};
-        size_t mb[6] = {
+                                 janas_spv_b32_matvec, janas_spv_b32_matvec,
+                                 janas_spv_b32_matvec, janas_spv_q8_0_matvec};
+        size_t mb[8] = {
             sizeof(janas_spv_q3k_matvec), sizeof(janas_spv_q4k_matvec),
             sizeof(janas_spv_q6k_matvec), sizeof(janas_spv_q6kp_matvec),
-            sizeof(janas_spv_b32_matvec), sizeof(janas_spv_b32_matvec)};
-        /* constant 2: ID, b32_matvec's in bit 8 beside its KIND */
-        uint32_t mk[6] = {1, 1, 1, 1, 256 | 4, 256 | 6};
-        for (int i = 0; i < 6; i++)
+            sizeof(janas_spv_b32_matvec), sizeof(janas_spv_b32_matvec),
+            sizeof(janas_spv_b32_matvec), sizeof(janas_spv_q8_0_matvec)};
+        /* constant 2: ID, b32_matvec's in bit 8 beside its KIND (MXFP4,
+           Q2_0, Q5_1), q8_0_matvec's alone (Gemma 4 26B's down matrices
+           are Q5_1, its last layer's Q8_0) */
+        uint32_t mk[8] = {1, 1, 1, 1, 256 | 4, 256 | 6, 256 | 3, 256};
+        for (int i = 0; i < 8; i++)
             if (janas_g_make_pipeline_nv(g, mc[i], mb[i], &g->sm_mvid[i],
                                          &g->pipe_mvid[i], mk[i],
                                          MVID_NV) != VK_SUCCESS)
@@ -1116,7 +1143,7 @@ void janas_gpu_destroy(struct janas_gpu *g)
             g->vkDestroyPipeline(g->dev, g->pipe_mm5, NULL);
         if (g->sm_mm5)
             g->vkDestroyShaderModule(g->dev, g->sm_mm5, NULL);
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 8; i++) {
             if (g->pipe_mvid[i])
                 g->vkDestroyPipeline(g->dev, g->pipe_mvid[i], NULL);
             if (g->sm_mvid[i])
@@ -1589,7 +1616,7 @@ int janas_gpu_import(struct janas_gpu *g, const void *p, size_t bytes)
         return import_refused(g, p, bytes, "regions, alignment or size", 0);
     /* a discrete GPU (or JANAS_GPU_COPY=1, to test that path) reads a copy
        in its own memory */
-    if (g->discrete || !g->host_import || getenv("JANAS_GPU_COPY"))
+    if (g->discrete || !g->host_import || janas_g_copy_asked())
         return copy_to_device(g, p, bytes);
     struct region *rg = &g->reg[g->n_reg];
     VkMemoryHostPointerPropertiesEXT hp = {
@@ -2010,7 +2037,7 @@ int janas_gpu_begin(struct janas_gpu *g, const struct janas_matvec_task *tasks,
 /* Push constants of the activation shader. */
 struct push_act {
     uint32_t g[2], u[2], x[2];
-    uint32_t blocks;
+    uint32_t blocks, gelu; /* the shader's whole block, gelu 0 here */
 };
 
 void janas_g_push_addr(uint32_t out[2], VkDeviceAddress a)

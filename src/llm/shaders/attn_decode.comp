@@ -8,7 +8,9 @@
 // For each query head h and run c: scores q.k x the key's scale x `scale`
 // (q at eight bits too, a scale per head, as llama.cpp takes it with an
 // eight-bit cache: the dot products are integer, four bytes at a time; q
-// left so by qk_rope.comp, hd / 4 words then the scale in a head's floats),
+// left so by qk_rope.comp, hd / 4 words then the scale in a head's floats;
+// with q16 at sixteen bits, hd / 4 words of its high bytes, hd / 4 of its
+// low ones, then the scale: two integer products, 256 hi.k + lo.k),
 // their maximum m, the sum l of e^(s - m), and the values weighted by e^(s
 // - m) (and the value's scale), written to part at (h nch + c)(hd + 2):
 // the hd sums, then m and l. attn_merge.comp joins the runs. Workgroup x =
@@ -16,7 +18,13 @@
 // the dispatch recorded once serves every position. With list set
 // (qwen4exp's sparse attention, ix_select.comp) token j reads the positions
 // of row j of list (ls words: their count, then the positions) instead of
-// 0 .. pos + j, run c the c-th C of them. The GPU's own order of the sums:
+// 0 .. pos + j, run c the c-th C of them. Gemma 4: a KV head's query
+// heads split among hg workgroups, G each (workgroup x = (kh hg + i) nch +
+// c, its heads (kh hg + i) G ...: the 16 heads of 512 of the full layers do
+// not fit one); a window (a token sees its last `window` positions, the
+// runs wholly before them leave, the positions before it weigh nothing);
+// a ring (position q in row q mod cap); keys and values at sixteen bits
+// (flags' bit 1) with q in float, the scores float products. The GPU's own order of the sums:
 // not the CPU's bits (attention.c), the same result to rounding.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -46,14 +54,17 @@ layout(push_constant) uniform P {
     uint qs, ps; /* floats from a token's qkv, and its runs, to the next's */
     uvec2 pos; /* the token's position, read at run time: npos = pos + 1 */
     uvec2 list;
-    uint ls;
+    uint ls, flags; /* bit 0: q at sixteen bits, 1: the cache's, 2: a ring */
+    uint hg, window;
 } p;
 
 shared float sq[MAXQ];  /* the G query heads */
 shared float sc[MAXS];  /* scores, then weights: head g at g C */
 shared float r8[MAXS / 8u];  /* the maxima of eight scores */
 shared float r8s[MAXS / 8u]; /* and the sums of eight weights */
-shared uint sqw[MAXQ / 4u]; /* the query heads at eight bits, four a word */
+shared uint sqw[MAXQ / 2u]; /* the query heads at eight bits, four a word
+                               (with q16 their two halves, a head's high
+                               words then its low ones) */
 shared float sqs[16];       /* and their scales */
 shared uint spos[C];        /* the run's positions in the cache */
 
@@ -64,7 +75,8 @@ uint comp(uvec4 v, uint i) { return i == 0u ? v.x : i == 1u ? v.y : i == 2u ? v.
 void main()
 {
     uint t = gl_LocalInvocationID.x, hd = p.hd;
-    uint kh = gl_WorkGroupID.x / p.nch, c = gl_WorkGroupID.x % p.nch;
+    uint u = gl_WorkGroupID.x / p.nch, c = gl_WorkGroupID.x % p.nch, kh = u / p.hg;
+    bool q16 = (p.flags & 1u) != 0u, kv16 = (p.flags & 2u) != 0u, ring = (p.flags & 4u) != 0u;
     /* token j of a block (workgroup y): positions 0 .. pos + j */
     uint j0 = gl_WorkGroupID.y;
     bool lst = p.list.x != 0u || p.list.y != 0u;
@@ -72,45 +84,99 @@ void main()
     uint npos = lst ? LP.v[j0 * p.ls] : RP(p.pos).v[0] + j0 + 1u, p0 = c * C;
     if (p0 >= npos)
         return; /* the whole workgroup: past the token */
+    /* a window: the first position the token sees */
+    uint lo = !lst && p.window != 0u && npos > p.window ? npos - p.window : 0u;
+    if (p0 + C <= lo)
+        return; /* the whole workgroup: before the window */
     uint n = min(C, npos - p0);
     /* each of the run's positions, as an index of the cache's rows */
-    for (uint k = t; k < C; k += 256u)
-        spos[k] = kh * p.cap + (lst ? LP.v[j0 * p.ls + 1u + p0 + min(k, n - 1u)] : p0 + min(k, n - 1u));
+    for (uint k = t; k < C; k += 256u) {
+        uint q = lst ? LP.v[j0 * p.ls + 1u + p0 + min(k, n - 1u)] : p0 + min(k, n - 1u);
+        spos[k] = kh * p.cap + (ring ? q % p.cap : q);
+    }
     R Q = R(p.q), KS = R(p.ks), VS = R(p.vs);
     RP QW = RP(p.q);
     B4 KC = B4(p.kc), VC = B4(p.vc); /* 16 bytes a load: hd % 16 == 0 */
     /* the G query heads at eight bits and their scales, as qk_rope.comp
        left them */
-    uint qo = j0 * p.qs + kh * G * hd, nw = hd / 4u;
-    for (uint k = t; k < G * nw; k += 256u)
-        sqw[k] = QW.v[qo + (k / nw) * hd + k % nw];
-    if (t < G)
-        sqs[t] = Q.v[qo + t * hd + nw];
+    uint qo = j0 * p.qs + u * G * hd, nw = hd / 4u, hw = q16 ? 2u * nw : nw;
+    if (kv16) {
+        /* the query heads as they are */
+        for (uint k = t; k < G * hd; k += 256u)
+            sq[k] = Q.v[qo + k];
+    } else {
+        for (uint k = t; k < G * hw; k += 256u)
+            sqw[k] = QW.v[qo + (k / hw) * hd + k % hw];
+        if (t < G)
+            sqs[t] = Q.v[qo + t * hd + hw];
+    }
     barrier();
     /* scores: four threads a position (256 threads: C / 64 rounds), each
        a quarter of the key for all G heads at once - the key read once -
        the quarters added across the cluster */
     for (uint r0 = 0; r0 < C; r0 += 64u) {
         uint j = r0 + t / 4u, qq = t % 4u, jj = min(j, n - 1u);
+        bool seen = j < n && p0 + j >= lo;
+        if (kv16) {
+            /* eight keys' numbers a load, float products */
+            uint w8 = spos[jj] * hd / 8u;
+            float df[G];
+            for (uint g = 0; g < G; g++)
+                df[g] = 0.0;
+            for (uint w = qq; w < hd / 8u; w += 4u) {
+                uvec4 k4 = KC.v[w8 + w];
+                for (uint e = 0; e < 8u; e++) {
+                    float kv = float(bitfieldExtract(int(comp(k4, e / 2u)), int(16u * (e % 2u)), 16));
+                    for (uint g = 0; g < G; g++)
+                        df[g] += sq[g * hd + 8u * w + e] * kv;
+                }
+            }
+            float ksf = KS.v[spos[jj]] * p.scale;
+            for (uint g = 0; g < G; g++) {
+                float d = subgroupClusteredAdd(df[g], 4u);
+                if (qq == 0u && j < n)
+                    sc[g * C + j] = seen ? d * ksf : -1.0 / 0.0;
+            }
+            continue;
+        }
         uint w0 = spos[jj] * hd / 16u;
         int dg[G];
         for (uint g = 0; g < G; g++)
             dg[g] = 0;
-        for (uint w = qq; w < hd / 16u; w += 4u) {
-            uvec4 k4 = KC.v[w0 + w];
-            for (uint g = 0; g < G; g++) {
-                uint o = g * hd / 4u + 4u * w;
-                dg[g] += dotPacked4x8EXT(int(sqw[o]), int(k4.x)) +
-                         dotPacked4x8EXT(int(sqw[o + 1u]), int(k4.y)) +
-                         dotPacked4x8EXT(int(sqw[o + 2u]), int(k4.z)) +
-                         dotPacked4x8EXT(int(sqw[o + 3u]), int(k4.w));
+        if (q16) {
+            /* hi and lo within a byte, k too: |256 hi.k + lo.k| below
+               2^31 for hd up to 256 */
+            for (uint w = qq; w < hd / 16u; w += 4u) {
+                uvec4 k4 = KC.v[w0 + w];
+                for (uint g = 0; g < G; g++) {
+                    uint o = g * hw + 4u * w, l = o + nw;
+                    int dh = dotPacked4x8EXT(int(sqw[o]), int(k4.x)) +
+                             dotPacked4x8EXT(int(sqw[o + 1u]), int(k4.y)) +
+                             dotPacked4x8EXT(int(sqw[o + 2u]), int(k4.z)) +
+                             dotPacked4x8EXT(int(sqw[o + 3u]), int(k4.w));
+                    int dl = dotPacked4x8EXT(int(sqw[l]), int(k4.x)) +
+                             dotPacked4x8EXT(int(sqw[l + 1u]), int(k4.y)) +
+                             dotPacked4x8EXT(int(sqw[l + 2u]), int(k4.z)) +
+                             dotPacked4x8EXT(int(sqw[l + 3u]), int(k4.w));
+                    dg[g] += 256 * dh + dl;
+                }
             }
-        }
+        } else
+            for (uint w = qq; w < hd / 16u; w += 4u) {
+                uvec4 k4 = KC.v[w0 + w];
+                for (uint g = 0; g < G; g++) {
+                    uint o = g * hd / 4u + 4u * w;
+                    dg[g] += dotPacked4x8EXT(int(sqw[o]), int(k4.x)) +
+                             dotPacked4x8EXT(int(sqw[o + 1u]), int(k4.y)) +
+                             dotPacked4x8EXT(int(sqw[o + 2u]), int(k4.z)) +
+                             dotPacked4x8EXT(int(sqw[o + 3u]), int(k4.w));
+                }
+            }
         float ksc = KS.v[spos[jj]] * p.scale;
         for (uint g = 0; g < G; g++) {
             int d = subgroupClusteredAdd(dg[g], 4u);
             if (qq == 0u && j < n)
-                sc[g * C + j] = float(d) * sqs[g] * ksc;
+                sc[g * C + j] = seen ? float(d) * sqs[g] * ksc : -1.0 / 0.0;
         }
     }
     barrier();
@@ -151,7 +217,26 @@ void main()
        heads): a thread 16 dimensions of one head. SH: the slice sets left
        for the shared memory. */
     uint SH;
-    if (G <= 4u && n > 64u) {
+    if (kv16) {
+        /* sixteen-bit values: a thread 8 dimensions of one head, eight
+           numbers a load */
+        uint U = G * hd / 8u;
+        SH = min(256u / U, MAXQ / (G * hd));
+        if (t < U * SH) {
+            uint uu = t % U, sl_ = t / U, g = uu / (hd / 8u), d0 = (uu % (hd / 8u)) * 8u;
+            float a[8];
+            for (uint k = 0; k < 8u; k++)
+                a[k] = 0.0;
+            for (uint j = sl_; j < n; j += SH) {
+                uvec4 v4 = VC.v[(spos[j] * hd + d0) / 8u];
+                float wj = sc[g * C + j];
+                for (uint k = 0; k < 8u; k++)
+                    a[k] += wj * float(bitfieldExtract(int(comp(v4, k / 2u)), int(16u * (k % 2u)), 16));
+            }
+            for (uint k = 0; k < 8u; k++)
+                sq[sl_ * G * hd + g * hd + d0 + k] = a[k];
+        }
+    } else if (G <= 4u && n > 64u) {
         uint U = hd / 8u;
         SH = min(256u / (4u * U), MAXQ / (G * hd));
         if (t < 4u * U * SH) {
@@ -200,7 +285,7 @@ void main()
         float a = sq[k];
         for (uint q = 1u; q < SH; q++)
             a += sq[q * G * hd + k];
-        uint h = kh * G + g;
+        uint h = u * G + g;
         O.v[j0 * p.ps + (h * p.nch + c) * (hd + 2u) + i] = a;
     }
     if (t < G) {
@@ -210,7 +295,7 @@ void main()
             m = max(m, r8[t * (C / 8u) + q]);
         for (uint q = 0; q < C / 8u; q++)
             l += r8s[t * (C / 8u) + q];
-        uint h = kh * G + t;
+        uint h = u * G + t;
         O.v[j0 * p.ps + (h * p.nch + c) * (hd + 2u) + hd] = m;
         O.v[j0 * p.ps + (h * p.nch + c) * (hd + 2u) + hd + 1u] = l;
     }

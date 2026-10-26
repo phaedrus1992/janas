@@ -4,7 +4,7 @@
 // A mixture's routing on the GPU for a prompt's block (gpu_token.c), as
 // model_ffn.c route_tok: per token, the softmax of its ne router logits,
 // the k largest (the first of equals), each weight divided by the sum of
-// the k; logit ne, the shared expert's gate (if sh), through a sigmoid, 1
+// the k (with es set, times its expert's scale: Gemma 4); logit ne, the shared expert's gate (if sh), through a sigmoid, 1
 // without one. A workgroup a token, its logits in shared memory, each
 // search a reduction over the 64 invocations (one invocation a token read
 // some 1300 logits one after the other: 0.5 ms a layer on a single token
@@ -21,7 +21,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer UO
 
 // r: the logits, rs floats a token; pe, pw: expert and weight of pair
 // j k + i; shw: the shared expert's weight of each token
-layout(push_constant) uniform P { uvec2 r, pe, pw, shw; uint ne, rs, k, n, sh; } p;
+layout(push_constant) uniform P { uvec2 r, pe, pw, shw, es; uint ne, rs, k, n, sh; } p;
 
 const uint MAXK = 16u, MAXE = 512u; // k <= 16, ne <= 512
 const uint NONE = 0xffffffffu;
@@ -112,7 +112,10 @@ void main()
     FO PW = FO(p.pw);
     for (uint i = 0u; i < p.k; i++) {
         PE.v[j * p.k + i] = ids[i];
-        PW.v[j * p.k + i] = w[i] / wsum;
+        float wi = w[i] / wsum;
+        if (p.es.x != 0u || p.es.y != 0u)
+            wi *= F(p.es).v[ids[i]];
+        PW.v[j * p.k + i] = wi;
     }
     FO SHW = FO(p.shw);
     SHW.v[j] = p.sh != 0u ? 1.0 / (1.0 + exp(-R.v[base + p.ne])) : 1.0;

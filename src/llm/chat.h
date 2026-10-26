@@ -26,6 +26,11 @@ enum chat_format {
        "model", the reasoning in <|channel>thought\n...<channel|>:
        ChatML's shape, so im_start and im_end hold <|turn> and <turn|> */
     FORMAT_GEMMA,
+    /* Llama 3: <|begin_of_text|> once, then <|start_header_id|>role
+       <|end_header_id|>\n\ntext<|eot_id|>, nothing after: ChatML's shape,
+       im_start and im_end holding <|start_header_id|> and <|eot_id|>, the
+       role closed by hdr_end */
+    FORMAT_LLAMA3,
 };
 
 struct janas_llm {
@@ -35,6 +40,7 @@ struct janas_llm {
     int32_t im_start, im_end;
     const char *asst_role; /* "assistant", or Gemma's "model" */
     int32_t bos;           /* written once at the start, or -1 */
+    int32_t hdr_end;       /* Llama 3's <|end_header_id|>, or -1 */
     int32_t think_on;      /* Gemma's <|think|>: reasoning asked for, or -1 */
     int32_t quote, decl_open, decl_close; /* Gemma's <|"|>, <|tool>, <tool|> */
     int32_t think_open, think_close;      /* reasoning markers, or -1 */
@@ -252,6 +258,8 @@ int janas_api_rtext_add(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_add_text(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_flush_text(janas_llm_chat *c);
 int janas_api_add_special(janas_llm_chat *c, int32_t id);
+/* The newline after a turn's end where the format has one. */
+int janas_api_end_turn_nl(janas_llm_chat *c);
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n);
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n);

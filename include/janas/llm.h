@@ -604,6 +604,19 @@ JANAS_LLM_API int32_t janas_llm_chat_logit_bias(janas_llm_chat *c, int32_t n,
                                                 const float *bias);
 
 /*
+ * The tokens the replies may have, from the next token on, n of them; n of 0
+ * gives back the whole vocabulary. The format's tokens that end a reply are
+ * added. The model computes the logits of these tokens alone - their rows
+ * of the output head copied into one matrix, the other logits -inf - so a
+ * small vocabulary is also faster: the head is the model's largest matrix
+ * read whole at every token (janas-nsm's --strict: the words of the Natural
+ * Semantic Metalanguage). Text of tokens outside it cannot appear; words
+ * made of tokens inside it can.
+ */
+JANAS_LLM_API int32_t janas_llm_chat_vocab(janas_llm_chat *c, int32_t n,
+                                           const int32_t *ids);
+
+/*
  * The tokens of the reply so far, one by one: janas_llm_chat_tokens counts
  * them; janas_llm_chat_token gives token i - its id, which part of the reply
  * it belongs to (JANAS_LLM_PART_...), its log-probability in the model's own

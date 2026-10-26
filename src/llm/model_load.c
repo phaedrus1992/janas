@@ -402,7 +402,9 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
     } else {
         NEED(wq, "attn_q.weight", T_QUANT, dm, qd * (m->a->attn_gate ? 2 : 1))
         NEED(wo, "attn_output.weight", T_QUANT, qd, dm)
-        NEED(q_norm, "attn_q_norm.weight", T_F32, ly->hd, 0)
+        if (!m->a->no_qk_norm) {
+            NEED(q_norm, "attn_q_norm.weight", T_F32, ly->hd, 0)
+        }
         /* a layer reading an earlier one's keys and values has no use for
            its k and v, even where the file has them */
         if (!m->n_kv_layers || l < m->n_kv_layers) {
@@ -411,7 +413,9 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
             if (!m->a->swa || janas_jns_tensor(j, name)) {
                 NEED(wv, "attn_v.weight", T_QUANT, dm, kvd)
             }
-            NEED(k_norm, "attn_k_norm.weight", T_F32, ly->hd, 0)
+            if (!m->a->no_qk_norm) {
+                NEED(k_norm, "attn_k_norm.weight", T_F32, ly->hd, 0)
+            }
         }
     }
     if (m->ple_dim) {
@@ -966,9 +970,10 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     if (!m->mtp && m->j.h.n_layer > m->n_layer &&
         load_mtp_internal(m, err, err_len) != 0)
         goto fail;
-    if (m->a->swa) {
+    {
         /* the full layers' RoPE factors (theta divided by them, pair by
-           pair: Gemma 4 turns only the first quarter of a head) */
+           pair: Gemma 4 turns only the first quarter of a head; Llama 3's
+           long context) */
         const struct janas_jns_tensor *rf =
             janas_jns_tensor(&m->j, "rope_freqs.weight");
         if (rf && (rf->type != 0 || rf->dims[0] != m->n_rot / 2)) {
@@ -1555,6 +1560,9 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->dh_in);
     free(m->dh_ids);
     free(m->dh_logits);
+    free(m->vs_w);
+    free(m->vs_ids);
+    free(m->vs_y);
     free(m->mtp_layer.sh_gate);
     janas_jns_close(&m->j);
     free(m);

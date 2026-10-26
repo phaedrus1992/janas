@@ -60,10 +60,17 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
     /* qwen4exp: qwen3.5's layers inside its streams (model_hc.c), with its
        mixes in bf16 as the file has them, or their down and up rewritten
        as Q8_0 (JANAS_HC_MIX=q8) */
-    if ((m->a->rec && !q35) || (m->a->attn_gate && !q35) || m->a->swa ||
-        m->a->sandwich || m->a->gelu || m->kv16 || m->softcap > 0.0f ||
-        m->ple_dim)
+    /* Gemma 4's dense layers (sliding windows, sandwich norms, GELU,
+       sixteen-bit keys and values, the soft cap on the CPU after); not yet
+       its per-layer embeddings (E2B, E4B) */
+    if ((m->a->rec && !q35) || (m->a->attn_gate && !q35))
         return "an architecture the token's shaders do not take yet";
+    /* per-layer embeddings: the branch's matrices f32, as E2B's and E4B's */
+    for (uint32_t l = 0; m->ple_dim && l < m->n_layer; l++)
+        if (m->layers[l].ple_gate->type != 0 ||
+            m->layers[l].ple_proj->type != 0)
+            return "per-layer embeddings of a type the token's shaders do "
+                   "not take";
     if (m->a->hc) {
         int mt = m->hc_quant[0] ? JANAS_Q8_0 : 30; /* down and up's */
         for (uint32_t l = 0; l <= m->n_layer; l++)
@@ -124,7 +131,8 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
         if (janas_expert_cache_slots(m->cache) < m->n_expert)
             return "an expert cache smaller than a layer's experts";
         for (uint32_t l = 0; l < m->n_layer; l++)
-            if (m->layers[l].exp_scale || !m->layers[l].router16)
+            if (!m->layers[l].router16 ||
+                (m->layers[l].exp_scale && !m->layers[l].pre_norm2))
                 return "a mixture the token's shaders do not take yet";
     }
     if (!janas_m_gpu_tier(m) && (m->arena_gpu != 1 || m->arena_stale))
@@ -137,10 +145,11 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
                 return "a layer the token's shaders do not take yet";
             continue;
         }
-        if (ly->swa || !ly->wk || !ly->wv || !ly->q_norm || !ly->k_norm ||
-            ly->post_attn || ly->post_ffn || ly->pre_norm2 ||
-            m->kv_ring[ly->slot] || ly->hd != m->head_dim ||
-            ly->n_kv != m->n_head_kv || ly->n_rot != m->n_rot)
+        /* not yet: a layer that reads another's keys and values (Gemma 4's
+           E2B, E4B), Gemma 4's mixture */
+        int shared = m->n_kv_layers && l >= m->n_kv_layers;
+        if ((!ly->wk && !shared) || (ly->pre_norm2 && !m->a->swa) ||
+            (!ly->wv && !m->a->swa))
             return "a layer the token's shaders do not take yet";
     }
     return NULL;
@@ -498,8 +507,7 @@ static size_t tier_bytes(const struct janas_llm_model *m)
 /* The layers described for the GPU, the KV cache imported: 0, or -1. */
 static int build(struct janas_llm_model *m, char *err, size_t len)
 {
-    uint32_t dm = m->d_model, hd = m->head_dim, qd = m->n_head * hd,
-             kvd = m->n_head_kv * hd;
+    uint32_t dm = m->d_model;
     if (!m->gtok_kv) {
         if (janas_gpu_import(m->gpu, m->kcache, m->kv_bytes) != 0 ||
             janas_gpu_import(m->gpu, m->vcache, m->kv_bytes) != 0 ||
@@ -590,12 +598,33 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             g->ssm_a = f32(m, ly->ssm_a);
             g->ssm_norm = f32(m, ly->ssm_norm);
         } else {
+            /* the layer's own geometry (Gemma 4's two kinds) */
+            uint32_t qd = m->n_head * ly->hd, kvd = ly->n_kv * ly->hd;
+            g->hd = ly->hd;
+            g->n_kv = ly->n_kv;
+            g->n_rot = ly->n_rot;
+            g->swa = ly->swa;
+            g->cap = m->kv_cap[ly->slot];
+            g->ring = m->kv_ring[ly->slot];
+            g->window = ly->swa ? m->window : 0;
+            g->post_attn = ly->post_attn ? f32(m, ly->post_attn) : NULL;
+            g->post_ffn = ly->post_ffn ? f32(m, ly->post_ffn) : NULL;
+            g->out_scale = ly->out_scale;
             g->slot = ly->slot; /* its KV slot: att_in's row (qwen4exp) */
-            g->q_norm = f32(m, ly->q_norm);
-            g->k_norm = f32(m, ly->k_norm);
+            g->q_norm = ly->q_norm ? f32(m, ly->q_norm) : NULL; /* llama */
+            g->k_norm = ly->k_norm ? f32(m, ly->k_norm) : NULL;
             g->wq = task_of(m, ly->wq, m->a->attn_gate ? 2 * qd : qd, dm);
-            g->wk = task_of(m, ly->wk, kvd, dm);
-            g->wv = task_of(m, ly->wv, kvd, dm);
+            /* none (type 0): another layer's keys and values (Gemma 4's
+               E2B, E4B); V is K (its full layers) */
+            if (ly->wk)
+                g->wk = task_of(m, ly->wk, kvd, dm);
+            if (ly->wv)
+                g->wv = task_of(m, ly->wv, kvd, dm);
+            if (m->ple_dim) {
+                g->ple_gate = f32(m, ly->ple_gate);
+                g->ple_proj = f32(m, ly->ple_proj);
+                g->ple_post = f32(m, ly->ple_post);
+            }
             g->wo = task_of(m, ly->wo, dm, qd);
             if (m->ix_heads && ly->ix_q) {
                 size_t nbk = (m->n_ctx + m->ix_ratio - 1) / m->ix_ratio;
@@ -639,19 +668,40 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
                         .rows = ly->sh_mx[p].rows,
                         .cols = ly->sh_mx[p].cols};
             }
+            /* Gemma 4's: the shared expert a dense branch of its own,
+               normalized, not in the experts' sum */
+            if (ly->pre_norm2) {
+                g->dn_gate = g->sh_gate_w;
+                g->dn_up = g->sh_up;
+                g->dn_down = g->sh_down;
+                g->sh_gate_w = g->sh_up = g->sh_down =
+                    (struct janas_matvec_task){0};
+                g->pre_norm2 = f32(m, ly->pre_norm2);
+                g->post_norm1 = f32(m, ly->post_norm1);
+                g->post_norm2 = f32(m, ly->post_norm2);
+                g->rscale = ly->router_scale;
+                g->exp_scale = ly->exp_scale;
+            }
         }
         /* a mixture: its experts' width, and its shared expert's (the
            feed-forward the token's buffers are made for) */
-        uint32_t lff =
-            moe && g->sh_gate_w.type ? g->sh_gate_w.rows : g->gate.rows;
+        uint32_t lff = moe && g->sh_gate_w.type ? g->sh_gate_w.rows
+                       : moe && g->dn_gate.type ? g->dn_gate.rows
+                                                : g->gate.rows;
         if (l == 0) {
             ff = lff;
             eff = g->gate.rows;
         }
-        if (lff != ff || g->gate.rows != eff || g->up.rows != eff ||
-            g->down.cols != eff ||
-            (moe && g->sh_gate_w.type &&
-             (g->sh_up.rows != ff || g->sh_down.cols != ff))) {
+        /* a dense model's widths may differ layer by layer (Gemma 4's
+           E2B): the token's buffers for the widest */
+        if (!moe && g->up.rows == g->gate.rows &&
+            g->down.cols == g->gate.rows) {
+            if (lff > ff)
+                ff = eff = lff;
+        } else if (lff != ff || g->gate.rows != eff || g->up.rows != eff ||
+                   g->down.cols != eff ||
+                   (moe && g->sh_gate_w.type &&
+                    (g->sh_up.rows != ff || g->sh_down.cols != ff))) {
             snprintf(err, len, "feed-forwards of different widths");
             return -1;
         }
@@ -669,18 +719,40 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         snprintf(err, len, "no attention layer");
         return -1;
     }
+    /* the token's buffers for the largest of any layer: Gemma 4's full
+       layers' heads, its sliding ones' KV heads; the full layers' cache */
+    uint32_t hd = m->a->swa ? m->hd_max : m->head_dim, nkv = m->n_head_kv,
+             room = 0;
+    for (uint32_t l = 0; l < m->n_layer; l++) {
+        const struct janas_gpu_tok_layer *g = &m->gtok_layers[l];
+        if (g->rec)
+            continue;
+        if (g->n_kv > nkv)
+            nkv = g->n_kv;
+        /* a ring holds the window before a block's first token and the
+           block */
+        if (g->ring && (!room || g->cap - g->window + 1 < room))
+            room = g->cap - g->window + 1;
+    }
     m->gtok_md = (struct janas_gpu_tok_model){
         .n_layer = m->n_layer,
         .dm = dm,
         .n_head = m->n_head,
-        .n_kv = m->n_head_kv,
+        .n_kv = nkv,
         .hd = hd,
         .n_rot = m->n_rot,
         .ff = ff,
         .n_vocab = m->n_vocab,
-        .cap = m->kv_cap[m->layers[a0].slot],
+        .cap = m->a->swa ? m->n_ctx : m->kv_cap[m->layers[a0].slot],
         .eps = m->eps,
-        .attn_scale = 1.0f / sqrtf((float)hd),
+        /* Gemma 4: the q and k norms scale the scores */
+        .attn_scale = m->a->swa ? 1.0f : 1.0f / sqrtf((float)hd),
+        .gelu = m->a->gelu,
+        .kv16 = m->kv16,
+        .vnorm = m->a->swa,
+        .n_rot_swa = m->a->swa ? m->n_rot_swa : 0,
+        .ring_room = room,
+        .ple_dim = m->ple_dim,
         .layers = m->gtok_layers,
         .out_norm = m->a->hc ? NULL : f32(m, m->out_norm),
         .output = task_of(m, m->output, m->n_vocab, dm),
@@ -792,7 +864,7 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         tok = e && atoi(e) > 0;
         blocks = b ? atoi(b) > 0 : -1; /* -1: not said */
     }
-    int prompt = janas_gpu_fast_prompt() && !m->prompts_off_gpu &&
+    int prompt = janas_gpu_fast_prompt() && !m->prompts_off_gpu && !m->lp_cpu &&
                  n >= JANAS_GPU_FAST_N && blocks != 0;
     /* A short pass (a chain of drafts to verify) where the tuner chose the
        GPU for it: the whole pass in one submission, the CPU idle, rather
@@ -816,7 +888,8 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
        bus between them gone (an Arc B580 read a prompt at 15.8 tokens/s
        with the products shared with the CPU, issue #43); JANAS_GPU_WHOLE=0
        as on an integrated GPU */
-    int whole = janas_m_gpu_whole() && m->gpu && !janas_gpu_shares_host(m->gpu);
+    int whole = janas_m_gpu_whole() && m->gpu &&
+                !janas_gpu_shares_host(m->gpu) && !m->lp_cpu;
     if (!prompt && !short_pass && !whole && !(tok && (n == 1 || blocks > 0)))
         return -1;
     /* a recurrent model: the GPU replays first what forward() asks (the
@@ -881,6 +954,14 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         if (n - j - k > 0 && n - j - k + 1 < rows)
             k -= rows; /* the last piece long enough */
         m->gtok_md.ng_emb = m->ng_emb + (size_t)j * m->d_model;
+        if (m->ple_dim) /* Gemma 4's per-layer inputs */
+            m->gtok_md.ple_in = m->ple + (size_t)j * m->n_layer * m->ple_dim;
+        if (m->a->swa) { /* Gemma 4's sliding layers' RoPE tables */
+            m->gtok_md.cs_swa =
+                m->rope_cos_swa + (size_t)j * (m->n_rot_swa / 2);
+            m->gtok_md.sn_swa =
+                m->rope_sin_swa + (size_t)j * (m->n_rot_swa / 2);
+        }
         if (m->gtok_md.ix_heads)
             janas_m_qsa_rope(m, m->gtok_ix_rope, pos + j, k);
         int rc = janas_gpu_tok_run(

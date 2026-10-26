@@ -90,13 +90,15 @@ static void qkv_item(const struct tok_job *t, uint32_t j, uint32_t h)
             memcpy(m->qgate + (size_t)j * qd + (size_t)h * hd, src + hd,
                    hd * sizeof(float));
         }
-        rms_norm(v, v, f32(m, ly->q_norm), hd, m->eps);
+        if (ly->q_norm)
+            rms_norm(v, v, f32(m, ly->q_norm), hd, m->eps);
         rope_neox(v, ly->n_rot, cs, sn);
         return;
     }
     h -= m->n_head;
     float *kv = m->kk + (size_t)j * kvd + (size_t)h * hd;
-    rms_norm(kv, kv, f32(m, ly->k_norm), hd, m->eps);
+    if (ly->k_norm)
+        rms_norm(kv, kv, f32(m, ly->k_norm), hd, m->eps);
     rope_neox(kv, ly->n_rot, cs, sn);
     uint32_t p = t->pos0 + j, row = t->ring ? p % t->cap : p;
     size_t at = ((size_t)h * t->cap + row) * hd;

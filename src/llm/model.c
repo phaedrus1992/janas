@@ -194,6 +194,11 @@ static void run_tok(struct janas_llm_model *m, const struct layer *ly,
         janas_pool_run(m->compute, fn, &t);
 }
 
+static int head_of_vocab(struct janas_llm_model *m,
+                         const struct janas_block_q8k *x, float *logits,
+                         uint32_t n);
+static int mask_to_vocab(struct janas_llm_model *m, float *logits, uint32_t n);
+
 /* logits soft-capped: c * tanh(l / c) */
 static void softcap_worker(void *arg, int tid, int n_threads)
 {
@@ -387,10 +392,76 @@ static void prefetch_decide(struct janas_llm_model *m,
     m->pf_would = 0;
 }
 
+/*
+ * A prompt's blocks read with the GPU's whole pass or without it (the
+ * CPU's attention, the products where they go), whichever this machine
+ * reads faster at this position: the attention's cost grows with the
+ * position, and on the GPU it may grow faster or slower than on the CPU -
+ * Qwen3-4B on the development laptop's Arc read 4,096 tokens at 72.6
+ * tokens/s with it and 95.9 without, 16,384 at 31.8 and 55.6 (26 Oct
+ * 2026), where a card with fast memory of its own may well win. So every
+ * LP_BLOCKS of the engine's blocks of positions one block each way,
+ * measured in turn (the first of a band alternating: a later block costs
+ * more), and the faster for the rest of the band - no threshold, only how
+ * often to look again, at most one slower block in LP_BLOCKS.
+ * JANAS_GPU_LONG=0: the whole pass always, as before.
+ */
+#define LP_BLOCKS 8
+
+static int long_prompt_on(const struct janas_llm_model *m, uint32_t n,
+                          uint32_t pos0)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("JANAS_GPU_LONG");
+        off = e && atoi(e) <= 0;
+    }
+    (void)pos0;
+    /* the whole pass asked for (JANAS_GPU_TOKEN=1): as asked */
+    return !off && n >= JANAS_GPU_FAST_N && m->gtok_state == 1 &&
+           janas_llm_model_gpu_prompts(m) && !janas_m_gpu_token_asked();
+}
+
+/* this block's way: lp_cpu set for the one without the whole pass */
+static void long_prompt_begin(struct janas_llm_model *m, uint32_t pos0)
+{
+    uint32_t band = pos0 / (LP_BLOCKS * m->blk);
+    if (band != m->lp.band || m->lp.state == 0) {
+        if (band != m->lp.band)
+            m->lp.first = (int)(band & 1u);
+        m->lp.band = band;
+        m->lp.state = 0;
+    }
+    if (m->lp.state < 2) /* the first way, then the other */
+        m->lp_cpu = m->lp.state == 0 ? m->lp.first : !m->lp.first;
+    else
+        m->lp_cpu = m->lp.cpu < m->lp.gpu;
+}
+
+static void long_prompt_end(struct janas_llm_model *m, double sec_per_token,
+                            int on_gpu)
+{
+    int cpu = m->lp_cpu;
+    m->lp_cpu = 0;
+    if (m->lp.state >= 2 || sec_per_token <= 0 || on_gpu == cpu)
+        return; /* chosen already; or not the way meant (none measured) */
+    *(cpu ? &m->lp.cpu : &m->lp.gpu) = sec_per_token;
+    if (++m->lp.state == 2 && getenv("JANAS_GPU_VERBOSE"))
+        fprintf(stderr,
+                "janas: a prompt from position %u: %.2f ms a token with the "
+                "GPU's whole pass, %.2f without; %s\n",
+                m->lp.band * LP_BLOCKS * m->blk, m->lp.gpu * 1e3,
+                m->lp.cpu * 1e3, m->lp.cpu < m->lp.gpu ? "without" : "with it");
+}
+
 int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
                             uint32_t n, uint32_t pos0, float *logits,
                             int all_logits)
 {
+    int lp = long_prompt_on(m, n, pos0);
+    uint64_t runs0 = m->gtok_runs[2];
+    if (lp)
+        long_prompt_begin(m, pos0);
     /* each pass measured for the tuner: the configuration never changes
        the results */
     int cls = janas_tune_class(n), cand = janas_tuner_pick(&m->tuner, cls);
@@ -411,6 +482,9 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
     /* while the cache is still filling in the background, passes are not
        representative: neither the tuner nor the draft planner may learn
        from them, or a slow start decides the whole session */
+    if (lp)
+        long_prompt_end(m, r == 0 && dt > 0 ? dt / n : 0,
+                        m->gtok_runs[2] > runs0);
     if (r == 0 && dt > 0 && !janas_llm_model_settling(m))
         janas_tuner_record(&m->tuner, cls, cand, dt / n);
     if (r == 0 && n == 1 && m->pf_mode == 1)
@@ -489,6 +563,15 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     if (gpu != 0)  /* the CPU's pass: the state the GPU made newer back */
         janas_m_gtok_host(m, 1);
     if (gpu == 0) {
+        /* Gemma 4's soft cap, as below */
+        if (m->softcap > 0.0f) {
+            struct tok_job sc = {
+                .m = m, .n = all_logits ? n : 1, .out = logits};
+            janas_pool_run(m->compute, softcap_worker, &sc);
+        }
+        /* its head the whole vocabulary's: the others -inf here */
+        if (m->vs_n && mask_to_vocab(m, logits, all_logits ? n : 1) != 0)
+            return -1;
         m->ring_hi = pos0 + n;
         if (m->a->rec && n <= JANAS_LLM_MAX_BLOCK) {
             /* replayed and logged by the GPU: as at the end */
@@ -611,16 +694,20 @@ output:
         janas_m_norm_quant(m, f32(m, m->out_norm), keep ? 0 : first, n);
     if (keep && !m->hc_n)
         memcpy(m->hid, m->xn, (size_t)n * dm * sizeof(float));
-    struct janas_matvec_task to = {.type = (int)m->output->type,
-                                   .w = data(m, m->output),
-                                   .x = m->xq + first * nbd,
-                                   .y = logits,
-                                   .rows = m->n_vocab,
-                                   .cols = dm,
-                                   .n_vec = n - first};
-    if (logits) /* without: the hidden states alone, an embedding */
+    if (logits && m->vs_n) { /* a vocabulary of its own: its rows alone */
+        if (head_of_vocab(m, m->xq + first * nbd, logits, n - first) != 0)
+            return -1;
+    } else if (logits) { /* without: the hidden states alone, an embedding */
+        struct janas_matvec_task to = {.type = (int)m->output->type,
+                                       .w = data(m, m->output),
+                                       .x = m->xq + first * nbd,
+                                       .y = logits,
+                                       .rows = m->n_vocab,
+                                       .cols = dm,
+                                       .n_vec = n - first};
         janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
-    if (logits && m->softcap > 0.0f) {
+    }
+    if (logits && m->softcap > 0.0f && !m->vs_n) {
         struct tok_job sc = {.m = m, .n = n - first, .out = logits};
         janas_pool_run(m->compute, softcap_worker, &sc);
     }
@@ -705,6 +792,98 @@ double janas_m_exp_sum(const float *l, uint32_t n, float mx)
     for (; i < n; i++)
         sum += janas_exp_det(l[i] - mx);
     return sum;
+}
+
+int janas_llm_model_set_vocab(struct janas_llm_model *m, const int32_t *ids,
+                              uint32_t n)
+{
+    m->vs_n = m->vs_cap = 0;
+    if (!n)
+        return 0;
+    int type = (int)m->output->type;
+    if (type == JANAS_Q6_K_P || !janas_qtype_block_size(type))
+        return -1;
+    size_t row = m->d_model / JANAS_QK * janas_qtype_block_size(type);
+    uint8_t *w = realloc(m->vs_w, (size_t)n * row);
+    if (!w)
+        return -1;
+    m->vs_w = w;
+    int32_t *v = realloc(m->vs_ids, n * sizeof(int32_t));
+    if (!v)
+        return -1;
+    m->vs_ids = v;
+    const uint8_t *src = data(m, m->output);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= m->n_vocab)
+            continue;
+        memcpy(m->vs_w + (size_t)k * row, src + (size_t)ids[i] * row, row);
+        m->vs_ids[k++] = ids[i];
+    }
+    m->vs_n = k;
+    return 0;
+}
+
+/* The logits of n vectors through the vocabulary's rows alone, the others
+   -inf (janas_llm_model_set_vocab). */
+static int vocab_room(struct janas_llm_model *m, uint32_t n)
+{
+    if (n > m->vs_cap) {
+        float *y = realloc(m->vs_y, (size_t)n * m->vs_n * sizeof(float));
+        if (!y)
+            return -1;
+        m->vs_y = y;
+        m->vs_cap = n;
+    }
+    return 0;
+}
+
+/* The vocabulary's logits of n rows into vs_y, then every row -inf but
+   for them. */
+static void scatter_vocab(struct janas_llm_model *m, float *logits, uint32_t n)
+{
+    for (uint32_t j = 0; j < n; j++) {
+        float *l = logits + (size_t)j * m->n_vocab;
+        for (uint32_t i = 0; i < m->n_vocab; i++)
+            l[i] = -INFINITY;
+        for (uint32_t i = 0; i < m->vs_n; i++)
+            l[m->vs_ids[i]] = m->vs_y[(size_t)j * m->vs_n + i];
+    }
+}
+
+/* Logits of the whole head (the GPU's whole pass) cut to the vocabulary. */
+static int mask_to_vocab(struct janas_llm_model *m, float *logits, uint32_t n)
+{
+    if (vocab_room(m, n) != 0)
+        return -1;
+    for (uint32_t j = 0; j < n; j++)
+        for (uint32_t i = 0; i < m->vs_n; i++)
+            m->vs_y[(size_t)j * m->vs_n + i] =
+                logits[(size_t)j * m->n_vocab + m->vs_ids[i]];
+    scatter_vocab(m, logits, n);
+    return 0;
+}
+
+static int head_of_vocab(struct janas_llm_model *m,
+                         const struct janas_block_q8k *x, float *logits,
+                         uint32_t n)
+{
+    if (vocab_room(m, n) != 0)
+        return -1;
+    struct janas_matvec_task t = {.type = (int)m->output->type,
+                                  .w = m->vs_w,
+                                  .x = x,
+                                  .y = m->vs_y,
+                                  .rows = m->vs_n,
+                                  .cols = m->d_model,
+                                  .n_vec = n};
+    /* on the CPU: the GPU and the NPU know the model's weights, not these */
+    janas_matvec_q4k_group(m->compute, &t, 1);
+    if (m->softcap > 0.0f) /* as softcap_worker, on the rows computed */
+        for (size_t i = 0; i < (size_t)n * m->vs_n; i++)
+            m->vs_y[i] = m->softcap * janas_tanhf(m->vs_y[i] / m->softcap);
+    scatter_vocab(m, logits, n);
+    return 0;
 }
 
 void janas_llm_mtp_note_tokens(struct janas_llm_model *m, const int32_t *tokens,

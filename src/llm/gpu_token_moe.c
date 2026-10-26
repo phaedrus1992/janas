@@ -44,12 +44,17 @@ int janas_gt_rec_router(struct janas_gpu *g, struct janas_gpu_tok *t,
         janas_gt_rec_ffn(g, t, bound, &ly->sh_gate_w, &ly->sh_up, &ly->sh_down,
                          n, B + t->o_sh) != 0)
         return -1;
+    /* the router's input: the feed-forward's normalized input, or Gemma
+       4's own (o_rin) */
     janas_gt_rec_dense(g, bound, 0, B + t->par[(size_t)l * PAR_N + PAR_R],
-                       B + t->o_xnf, B + t->o_r, ne + (ly->sh_gate ? 1 : 0),
-                       md->dm, ne + 1, n, 1.0f);
+                       B + (ly->pre_norm2 ? t->o_rin : t->o_xnf), B + t->o_r,
+                       ne + (ly->sh_gate ? 1 : 0), md->dm, ne + 1, n, 1.0f);
     janas_g_compute_barrier(g);
     struct push_tk pk = {
         .ne = ne, .rs = ne + 1, .k = md->k, .n = n, .sh = ly->sh_gate != NULL};
+    /* Gemma 4: each expert's own output scale, on its weight */
+    janas_g_push_addr(
+        pk.es, ly->exp_scale ? janas_gt_addr_of(g, ly->exp_scale, ne * 4) : 0);
     janas_g_push_addr(pk.r, B + t->o_r);
     janas_g_push_addr(pk.pe, B + t->o_pe);
     janas_g_push_addr(pk.pw, B + t->o_pw);
@@ -75,7 +80,12 @@ static VkPipeline by_rows(const struct janas_gpu *g,
             : ty == JANAS_Q6_K_P ? 3
             : ty == JANAS_MXFP4  ? 4
             : ty == JANAS_Q2_0   ? 5
+            : ty == JANAS_Q5_1   ? 6
+            : ty == JANAS_Q8_0   ? 7
                                  : -1;
+    /* Q5_1 and Q8_0 have no tiles (*_mmid): by rows on any block */
+    if (i >= 6)
+        return g->pipe_mvid[i];
     return n <= t->mvid_n && i >= 0 ? g->pipe_mvid[i] : VK_NULL_HANDLE;
 }
 
@@ -143,7 +153,7 @@ void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                     t->o_ind);
     janas_g_compute_barrier(g);
     janas_gt_stamp(g, t, PH_GATEUP);
-    struct push_ac ac = {.blocks = np * nbf};
+    struct push_ac ac = {.blocks = np * nbf, .gelu = (uint32_t)t->gelu};
     janas_g_push_addr(ac.g, B + t->o_egu);
     janas_g_push_addr(ac.u, B + t->o_egu + (size_t)np * t->effp * 4);
     janas_g_push_addr(ac.x, B + t->o_eh);

@@ -241,6 +241,18 @@ int janas_llm_model_decode(struct janas_llm_model *m, int32_t token,
  * guesses are chained.
  */
 int janas_llm_model_has_mtp(const struct janas_llm_model *m);
+
+/*
+ * The tokens the model may give from now on, n of them (n 0: all of them
+ * again). Their rows of the LM head are copied into one matrix and the
+ * forward pass computes those alone - a few thousand of 128,257 rows, at a
+ * fraction of the head's reads - the other logits set to -inf. The MTP
+ * block's and the draft head's logits are not restricted: a draft outside
+ * the vocabulary is rejected by the pass that checks it. -1 when the head's
+ * rows cannot be copied (its weights in bit planes) or memory runs out.
+ */
+int janas_llm_model_set_vocab(struct janas_llm_model *m, const int32_t *ids,
+                              uint32_t n);
 /* 1 when chained drafts keep the position of the first (Gemma 4's
    assistant, which reads the main model's cache and has none of its
    own); 0 when each is one position further (an MTP block) */

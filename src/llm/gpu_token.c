@@ -24,6 +24,7 @@
 #include "qk_rope.h"     /* janas_spv_qk_rope */
 #include "attn_decode.h" /* janas_spv_attn_decode */
 #include "attn_merge.h"  /* janas_spv_attn_merge */
+#include "ple_act.h"     /* janas_spv_ple_act */
 #include "gdn_conv.h"    /* janas_spv_gdn_conv */
 #include "gdn_cstate.h"  /* janas_spv_gdn_cstate */
 #include "gdn_l2.h"      /* janas_spv_gdn_l2 */
@@ -58,7 +59,7 @@ static const char *const ph_name[PH_N] = {"norm+quant",    "q k v",
 int janas_gpu_shares_host(const struct janas_gpu *g)
 {
     return g && !g->broken && !g->discrete && g->host_import &&
-           !getenv("JANAS_GPU_COPY");
+           !janas_g_copy_asked();
 }
 
 size_t janas_gpu_local_room(const struct janas_gpu *g)
@@ -119,14 +120,33 @@ static const char *check_ffn(const struct janas_gpu *g,
         ly->up.type != gt ||
         !(dt == JANAS_Q4_K || dt == JANAS_Q6_K || dt == JANAS_Q6_K_P ||
           (dt == JANAS_MXFP4 && g->pipe_idmx) ||
-          (dt == JANAS_Q3_K && g->pipe_id3) || (dt == JANAS_Q2_0 && q20)) ||
-        (md->eff % JANAS_QK && dt != JANAS_Q2_0) || ly->gate.rows != md->eff ||
-        ly->up.rows != md->eff || ly->gate.cols != md->dm ||
-        ly->up.cols != md->dm || ly->down.rows != md->dm ||
-        ly->down.cols != md->eff)
+          (dt == JANAS_Q3_K && g->pipe_id3) || (dt == JANAS_Q2_0 && q20) ||
+          (dt == JANAS_Q5_1 && g->pipe_mvid[6]) ||
+          (dt == JANAS_Q8_0 && g->pipe_mvid[7])) ||
+        (md->eff % JANAS_QK && dt != JANAS_Q2_0 && dt != JANAS_Q5_1 &&
+         dt != JANAS_Q8_0) ||
+        ly->gate.rows != md->eff || ly->up.rows != md->eff ||
+        ly->gate.cols != md->dm || ly->up.cols != md->dm ||
+        ly->down.rows != md->dm || ly->down.cols != md->eff)
         return "experts of a type or shape the GPU's shaders do not take";
     if (!ly->router16)
         return "a mixture's layer without its router";
+    if (ly->pre_norm2) { /* Gemma 4's: its dense branch, norms, scales */
+        const struct janas_matvec_task *d[3] = {&ly->dn_gate, &ly->dn_up,
+                                                &ly->dn_down};
+        for (int i = 0; i < 3; i++)
+            if (!janas_gpu_can(g, d[i]))
+                return "a dense branch's weight the GPU cannot compute";
+        if (ly->dn_gate.rows > md->ff ||
+            !janas_gt_addr_of(g, ly->pre_norm2, md->dm * 4) ||
+            !janas_gt_addr_of(g, ly->post_norm1, md->dm * 4) ||
+            !janas_gt_addr_of(g, ly->post_norm2, md->dm * 4) ||
+            !janas_gt_addr_of(g, ly->post_ffn, md->dm * 4) ||
+            !janas_gt_addr_of(g, ly->rscale, md->dm * 4) ||
+            (ly->exp_scale &&
+             !janas_gt_addr_of(g, ly->exp_scale, md->n_expert * 4)))
+            return "a mixture's norms out of the GPU's reach";
+    }
     if (ly->sh_gate_w.type) {
         const struct janas_matvec_task *s[3] = {&ly->sh_gate_w, &ly->sh_up,
                                                 &ly->sh_down};
@@ -221,10 +241,33 @@ static int check_model(const struct janas_gpu *g,
        check_ffn */
     if (md->dm % JANAS_QK || qd % JANAS_QK || md->ff % 32 || md->dm > 8192 ||
         qd > 8192 || md->hd > 512 || md->hd % 16 || md->n_rot > md->hd ||
-        md->n_kv == 0 || md->n_head % md->n_kv ||
-        md->n_head / md->n_kv * md->hd > ATT_MAXQ_G(md->n_head / md->n_kv) ||
-        md->n_head / md->n_kv * ATT_RUN > ATT_MAXS_G(md->n_head / md->n_kv))
+        md->n_kv == 0 || md->n_head % md->n_kv)
         return fail(err, len, "a shape the token's shaders do not take");
+    /* each attention layer's own: at most two kinds of workgroup (Gemma
+       4's), the query heads of a KV head split among workgroups where they
+       do not fit one */
+    uint32_t kinds[2] = {0, 0};
+    for (uint32_t l = 0; l < md->n_layer; l++) {
+        const struct janas_gpu_tok_layer *ly = &md->layers[l];
+        if (ly->rec)
+            continue;
+        uint32_t ga = ly->n_kv && md->n_head % ly->n_kv == 0
+                          ? janas_gt_att_g(md->n_head / ly->n_kv, ly->hd)
+                          : 0;
+        if (!ga || ly->hd > md->hd || ly->hd % 16 || ly->n_rot > ly->hd ||
+            ly->n_rot % 2 || ly->n_kv > md->n_kv ||
+            ga * ATT_RUN > ATT_MAXS_G(ga) || ly->cap == 0 ||
+            ly->cap > md->cap ||
+            (ly->swa ? ly->n_rot > md->n_rot_swa : ly->n_rot > md->n_rot) ||
+            (md->kv16 && (md->ix_heads || md->n_rec)))
+            return fail(err, len, "a shape the token's shaders do not take");
+        if (!kinds[0] || kinds[0] == ga)
+            kinds[0] = ga;
+        else if (!kinds[1] || kinds[1] == ga)
+            kinds[1] = ga;
+        else
+            return fail(err, len, "more than two kinds of attention layer");
+    }
     if (md->n_expert &&
         (md->n_expert > 512 || md->k == 0 || md->k > 16 ||
          md->k > md->n_expert || md->eff % 32 || !md->fetch || !g->pipe_id4 ||
@@ -270,7 +313,8 @@ static int check_model(const struct janas_gpu *g,
         const struct janas_matvec_task *t[4] = {&ly->wq, &ly->wk, &ly->wv,
                                                 &ly->wo};
         for (int i = 0; i < 4; i++)
-            if (!janas_gpu_can(g, t[i])) {
+            /* none: V is K, or the keys and values another layer's */
+            if ((i == 0 || i == 3 || t[i]->type) && !janas_gpu_can(g, t[i])) {
                 snprintf(err, len,
                          "layer %u: a weight the GPU cannot compute (product "
                          "%d, type %d)",
@@ -279,15 +323,25 @@ static int check_model(const struct janas_gpu *g,
             }
         if (md->gated_q && (ly->wq.type == JANAS_Q6_K_P || ly->wq.plane[0]))
             return fail(err, len, "a gated query in planes");
-        size_t cache = (size_t)md->n_kv * md->cap * md->hd;
+        size_t cache = (size_t)ly->n_kv * ly->cap * ly->hd << md->kv16;
         if ((!md->hc && (!janas_gt_addr_of(g, ly->attn_norm, md->dm * 4) ||
                          !janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4))) ||
-            !janas_gt_addr_of(g, ly->q_norm, md->hd * 4) ||
-            !janas_gt_addr_of(g, ly->k_norm, md->hd * 4) ||
+            (ly->q_norm && !janas_gt_addr_of(g, ly->q_norm, ly->hd * 4)) ||
+            (ly->k_norm && !janas_gt_addr_of(g, ly->k_norm, ly->hd * 4)) ||
+            (ly->post_attn &&
+             !janas_gt_addr_of(g, ly->post_attn, md->dm * 4)) ||
+            (ly->post_ffn && !janas_gt_addr_of(g, ly->post_ffn, md->dm * 4)) ||
+            (ly->ple_gate &&
+             (!md->ple_dim || md->n_expert || !g->pipe_dm[0] ||
+              !janas_gt_addr_of(g, ly->ple_gate,
+                                (size_t)md->ple_dim * md->dm * 4) ||
+              !janas_gt_addr_of(g, ly->ple_proj,
+                                (size_t)md->ple_dim * md->dm * 4) ||
+              !janas_gt_addr_of(g, ly->ple_post, md->dm * 4))) ||
             !janas_gt_addr_of(g, ly->kc, cache) ||
             !janas_gt_addr_of(g, ly->vc, cache) ||
-            !janas_gt_addr_of(g, ly->ks, (size_t)md->n_kv * md->cap * 4) ||
-            !janas_gt_addr_of(g, ly->vs, (size_t)md->n_kv * md->cap * 4))
+            !janas_gt_addr_of(g, ly->ks, (size_t)ly->n_kv * ly->cap * 4) ||
+            !janas_gt_addr_of(g, ly->vs, (size_t)ly->n_kv * ly->cap * 4))
             return fail(err, len,
                         "a norm or the KV cache out of the GPU's "
                         "reach");
@@ -386,6 +440,36 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
     t->o_h = take(&at, nb * t->ffp / JANAS_QK * 320);
     t->o_yd = take(&at, nb * md->dm * 4);
     t->o_rope = take(&at, nb * md->n_rot * 4);
+    t->o_rope2 = md->n_rot_swa ? take(&at, nb * md->n_rot_swa * 4) : 0;
+    t->o_post = take(&at, nb * md->dm * 4);
+    for (uint32_t l = 0; l < md->n_layer; l++)
+        if (md->layers[l].pre_norm2) { /* Gemma 4's mixture */
+            t->o_ybr = take(&at, nb * md->dm * 4);
+            t->o_xbr = take(&at, nb * md->dm * 4);
+            t->o_rin = take(&at, nb * md->dm * 4);
+            t->o_post2 = take(&at, nb * md->dm * 4);
+            break;
+        }
+    if (md->ple_dim) {
+        t->o_ple = take(&at, nb * md->n_layer * md->ple_dim * 4);
+        t->o_pg = take(&at, nb * md->ple_dim * 4);
+        t->o_ph = take(&at, nb * md->ple_dim * 4);
+    }
+    t->gelu = md->gelu;
+    /* the attention's workgroups: the query heads each takes, one or two
+       kinds (check_model) */
+    for (uint32_t l = 0; l < md->n_layer; l++) {
+        const struct janas_gpu_tok_layer *ly = &md->layers[l];
+        if (ly->rec)
+            continue;
+        uint32_t ga = janas_gt_att_g(md->n_head / ly->n_kv, ly->hd);
+        if (!t->at_g[0] || t->at_g[0] == ga)
+            t->at_g[0] = ga;
+        else
+            t->at_g[1] = ga;
+    }
+    if (!t->at_g[0]) /* qwen4exp's streams: the model's own */
+        t->at_g[0] = md->n_head / md->n_kv;
     t->o_logits = take(&at, nb * md->n_vocab * 4);
     t->o_pos = take(&at, 32); /* janas_gpu_tok_run's five words */
     t->o_part = take(&at, t->part_floats * 4);
@@ -485,7 +569,8 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
     int d32 = 0;
     for (uint32_t l = 0; l < md->n_layer; l++)
         d32 |= janas_g_x_in_32(ne ? md->layers[l].sh_down.type
-                                  : md->layers[l].down.type);
+                                  : md->layers[l].down.type) ||
+               janas_g_x_in_32(md->layers[l].dn_down.type); /* Gemma 4's */
     if (d32) {
         t->o_hf = take(&at, nb * t->ffp * 4);
         t->o_h32 = take(&at, nb * t->ffp / JANAS_QK * 320);
@@ -519,9 +604,16 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
                               0) != VK_SUCCESS ||
         janas_g_make_pipeline(g, janas_spv_qk_rope, sizeof(janas_spv_qk_rope),
                               &t->sm_qk, &t->p_qk, 0) != VK_SUCCESS ||
-        janas_g_make_pipeline_sg(
-            g, janas_spv_attn_decode, sizeof(janas_spv_attn_decode), &t->sm_at,
-            &t->p_at, md->n_head / md->n_kv, att_sg()) == 0 ||
+        janas_g_make_pipeline_sg(g, janas_spv_attn_decode,
+                                 sizeof(janas_spv_attn_decode), &t->sm_at,
+                                 &t->p_at, t->at_g[0], att_sg()) == 0 ||
+        (t->at_g[1] &&
+         janas_g_make_pipeline_sg(g, janas_spv_attn_decode,
+                                  sizeof(janas_spv_attn_decode), &t->sm_at2,
+                                  &t->p_at2, t->at_g[1], att_sg()) == 0) ||
+        (md->ple_dim &&
+         janas_g_make_pipeline(g, janas_spv_ple_act, sizeof(janas_spv_ple_act),
+                               &t->sm_pa, &t->p_pa, 0) != VK_SUCCESS) ||
         janas_g_make_pipeline(g, janas_spv_attn_merge,
                               sizeof(janas_spv_attn_merge), &t->sm_am, &t->p_am,
                               0) != VK_SUCCESS ||
@@ -678,13 +770,13 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
                     g->vkFreeCommandBuffers(g->dev, g->cp, 1, &t->cb[n][a][h]);
                 janas_gt_free_segments(g, t, &t->seg_cb[n][a][h]);
             }
-    VkPipeline p[16] = {t->p_nq, t->p_qk, t->p_at, t->p_am, t->p_gc, t->p_gs,
-                        t->p_gl, t->p_gr, t->p_gg, t->p_tk, t->p_ga, t->p_cb,
-                        t->p_sm, t->p_gb, t->p_gx, t->p_pl};
-    VkShaderModule s[16] = {t->sm_nq, t->sm_qk, t->sm_at, t->sm_am,
-                            t->sm_gc, t->sm_gs, t->sm_gl, t->sm_gr,
-                            t->sm_gg, t->sm_tk, t->sm_ga, t->sm_cb,
-                            t->sm_sm, t->sm_gb, t->sm_gx, t->sm_pl};
+    VkPipeline p[18] = {t->p_nq, t->p_qk, t->p_at, t->p_am, t->p_gc,  t->p_gs,
+                        t->p_gl, t->p_gr, t->p_gg, t->p_tk, t->p_ga,  t->p_cb,
+                        t->p_sm, t->p_gb, t->p_gx, t->p_pl, t->p_at2, t->p_pa};
+    VkShaderModule s[18] = {t->sm_nq, t->sm_qk,  t->sm_at, t->sm_am, t->sm_gc,
+                            t->sm_gs, t->sm_gl,  t->sm_gr, t->sm_gg, t->sm_tk,
+                            t->sm_ga, t->sm_cb,  t->sm_sm, t->sm_gb, t->sm_gx,
+                            t->sm_pl, t->sm_at2, t->sm_pa};
     janas_gt_hc_destroy(g, t);
     janas_gt_qsa_destroy(g, t);
     janas_gt_tier_destroy(g, t);
@@ -693,7 +785,7 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
     free(t->fill);
     free(t->ids);
     free(t->slots);
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 18; i++) {
         if (p[i])
             g->vkDestroyPipeline(g->dev, p[i], NULL);
         if (s[i])
@@ -881,7 +973,8 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
     /* the residual: read from X, the sum with a layer's output written to
        XN, the two swapped (every block starts from o_x, the same commands) */
     VkDeviceAddress B = t->buf.addr, X = B + t->o_x, XN = B + t->o_x1, SW,
-                    YWO = B + t->o_ywo, YD = B + t->o_yd, XNF = B + t->o_xnf;
+                    YWO = B + t->o_ywo, YD = B + t->o_yd, XNF = B + t->o_xnf,
+                    POST = B + t->o_post;
     if (g->vkResetCommandBuffer(g->cb, 0) != VK_SUCCESS)
         return -1;
     VkCommandBufferBeginInfo bb = {
@@ -906,7 +999,7 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
        and between the two what the CPU's plan writes and reads */
     int last = seg < 0 || seg == (int)md->n_layer;
     if (t->local && seg <= 0) {
-        VkBufferCopy in[3] = {
+        VkBufferCopy in[5] = {
             {.srcOffset = t->o_x,
              .dstOffset = t->o_x,
              .size = (VkDeviceSize)n * md->dm * sizeof(float)},
@@ -915,8 +1008,21 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
              .size = (VkDeviceSize)n * md->n_rot * sizeof(float)},
             {.srcOffset = t->o_pos,
              .dstOffset = t->o_pos,
-             .size = JANAS_GT_POS_BYTES}};
-        g->vkCmdCopyBuffer(g->cb, t->mirror.buf, t->buf.buf, 3, in);
+             .size = JANAS_GT_POS_BYTES},
+            /* Gemma 4's second RoPE tables, its per-layer inputs */
+            {.srcOffset = t->o_rope2,
+             .dstOffset = t->o_rope2,
+             .size = (VkDeviceSize)n * md->n_rot_swa * sizeof(float)},
+            {.srcOffset = t->o_ple,
+             .dstOffset = t->o_ple,
+             .size =
+                 (VkDeviceSize)n * md->n_layer * md->ple_dim * sizeof(float)}};
+        uint32_t nin = 3;
+        if (md->n_rot_swa)
+            in[nin++] = in[3];
+        if (md->ple_dim)
+            in[nin++] = in[4];
+        g->vkCmdCopyBuffer(g->cb, t->mirror.buf, t->buf.buf, nin, in);
         VkMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                               .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -962,13 +1068,22 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
             janas_gt_rec_experts(g, t, md, &layers[l - 1], &bound, YD, n, part);
             if (part == 1)
                 goto end;
+            if (layers[l - 1].pre_norm2) /* Gemma 4: its branches joined */
+                janas_gt_rec_gemma_moe_tail(g, t, md, &layers[l - 1], &bound,
+                                            YD, n);
         }
-        /* the previous layer's feed-forward added, then this one's norm */
+        /* the previous layer's feed-forward added (Gemma 4: normalized,
+           the sum times the layer's output scale), then this one's norm */
         if (on) {
-            janas_gt_rec_norm_quant(
-                g, t, &bound, X, l ? YD : 0,
+            const struct janas_gpu_tok_layer *pl = l ? &layers[l - 1] : NULL;
+            janas_gt_rec_norm_quant_s(
+                g, t, &bound, X,
+                !pl            ? 0
+                : pl->post_ffn ? POST
+                               : YD,
                 janas_gt_addr_of(g, ly->attn_norm, md->dm * 4), l ? XN : 0,
-                ly->rec ? XNF : 0, md->dm, md->eps, n);
+                ly->rec ? XNF : 0, md->dm, md->eps, n,
+                pl && pl->post_ffn ? pl->out_scale : 0.0f);
             janas_gt_stamp(g, t, PH_NORM);
         }
         if (l)
@@ -978,17 +1093,34 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
                          : janas_gt_rec_attn(g, t, md, ly, &bound, n)) != 0)
                 return -1;
             janas_gt_rec_norm_quant(
-                g, t, &bound, X, YWO,
+                g, t, &bound, X, ly->post_attn ? POST : YWO,
                 janas_gt_addr_of(g, ly->ffn_norm, md->dm * 4), XN,
                 md->n_expert ? XNF : 0, md->dm, md->eps, n);
             janas_gt_stamp(g, t, PH_NORM);
         }
         SW = X, X = XN, XN = SW;
+        /* Gemma 4's mixture: its dense branch, the router's and the
+           experts' inputs first */
+        if (on && ly->pre_norm2 &&
+            janas_gt_rec_gemma_moe(g, t, md, ly, &bound, X, n) != 0)
+            return -1;
         if (on &&
             (md->n_expert ? janas_gt_rec_router(g, t, md, ly, l, &bound, n)
                           : janas_gt_rec_ffn(g, t, &bound, &ly->gate, &ly->up,
                                              &ly->down, n, YD)) != 0)
             return -1;
+        /* Gemma 4: the feed-forward's output normalized, into o_post */
+        if (on && ly->post_ffn && !md->n_expert)
+            janas_gt_rec_post_norm(g, t, &bound, YD, ly->post_ffn, md, n);
+        /* ... and with per-layer embeddings their branch, on the residual
+           with the feed-forward added (its output scale after the branch) */
+        if (on && ly->ple_gate) {
+            janas_gt_rec_norm_quant(g, t, &bound, X, POST, 0, XN, 0, md->dm,
+                                    md->eps, n);
+            SW = X, X = XN, XN = SW;
+            janas_gt_rec_ple(g, t, md, ly, l, &bound, X, YD, n);
+            janas_gt_rec_post_norm(g, t, &bound, YD, ly->ple_post, md, n);
+        }
         /* a mixture's pass in one submission: the plan on the GPU */
         if (seg < 0 && md->n_expert)
             janas_gt_rec_plan(g, t, md, l, &bound, n);
@@ -1002,12 +1134,17 @@ static int record(struct janas_gpu *g, struct janas_gpu_tok *t,
                                  part);
             if (part == 1)
                 goto end;
+            if (layers[nl - 1].pre_norm2)
+                janas_gt_rec_gemma_moe_tail(g, t, md, &layers[nl - 1], &bound,
+                                            YD, n);
         }
         if (first < n || hid) {
-            janas_gt_rec_norm_quant(
-                g, t, &bound, X, YD,
+            const struct janas_gpu_tok_layer *pl = &layers[nl - 1];
+            janas_gt_rec_norm_quant_s(
+                g, t, &bound, X, pl->post_ffn ? POST : YD,
                 janas_gt_addr_of(g, md->out_norm, md->dm * 4), 0,
-                hid ? B + t->o_hid : 0, md->dm, md->eps, n);
+                hid ? B + t->o_hid : 0, md->dm, md->eps, n,
+                pl->post_ffn ? pl->out_scale : 0.0f);
         }
         if (first < n) {
             if (janas_gt_rec_product(g, t, &bound, output,
@@ -1081,6 +1218,9 @@ uint32_t janas_gpu_tok_block_at(const struct janas_gpu_tok *t,
         return 0;
     size_t n =
         t->part_floats / janas_gt_part_tok(t, md, runs_for(t, pos + t->nb));
+    /* the rings hold a window and a block: no more of the block */
+    if (md->ring_room && n > md->ring_room)
+        n = md->ring_room;
     return n < 1 ? 1 : n > t->nb ? t->nb : (uint32_t)n;
 }
 
@@ -1171,7 +1311,8 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
                       uint32_t src, uint32_t dst, uint32_t replay,
                       uint32_t log_row)
 {
-    if (!t || g->busy || g->broken || n < 1 || n > t->nb || pos + n > md->cap)
+    if (!t || g->busy || g->broken || n < 1 || n > t->nb || pos + n > md->cap ||
+        (md->ring_room && n > md->ring_room))
         return -1;
     /* a replay, or a block to log, needs the log on the GPU */
     int logs = log_row != UINT32_MAX;
@@ -1204,6 +1345,18 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
         memcpy(r + half * sizeof(float), sn + (size_t)j * half,
                half * sizeof(float));
     }
+    /* Gemma 4's per-layer inputs */
+    size_t pb = (size_t)n * md->n_layer * md->ple_dim * sizeof(float);
+    if (pb)
+        memcpy(t->buf.map + t->o_ple, md->ple_in, pb);
+    /* Gemma 4's sliding-window layers: their own tables */
+    uint32_t h2 = md->n_rot_swa / 2;
+    for (uint32_t j = 0; h2 && j < n; j++) {
+        uint8_t *r = t->buf.map + t->o_rope2 + (size_t)j * md->n_rot_swa * 4;
+        memcpy(r, md->cs_swa + (size_t)j * h2, h2 * sizeof(float));
+        memcpy(r + h2 * sizeof(float), md->sn_swa + (size_t)j * h2,
+               h2 * sizeof(float));
+    }
     /* the position, the halves of the recurrent state to read and to
        write, the tokens to replay, the log's row: read by the shaders at
        run time */
@@ -1216,6 +1369,10 @@ int janas_gpu_tok_run(struct janas_gpu *g, struct janas_gpu_tok *t,
                int) = t->local ? janas_gt_mirror_cache : janas_gt_sync_range;
     in(g, t, t->o_x, (size_t)n * md->dm * sizeof(float), 1);
     in(g, t, t->o_rope, (size_t)n * md->n_rot * sizeof(float), 1);
+    if (h2)
+        in(g, t, t->o_rope2, (size_t)n * md->n_rot_swa * sizeof(float), 1);
+    if (pb)
+        in(g, t, t->o_ple, pb, 1);
     in(g, t, t->o_pos, sizeof(pw), 1);
     int ai = all == 1 && n == 1 ? 0 : all, hi = hidden != NULL;
     struct timespec w0, w1;
