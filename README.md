@@ -52,6 +52,8 @@ Janas-LLM's figures are the best of the configurations `janas-bench` measures, a
 
 The longer the context, the wider the gap: 2.2 times as fast writing at 1,024 tokens, 6.9 times at 16,384. Both slow down as the context grows, and on both the attention is what grows: at 32,000 tokens it takes 59 of the 93 ms Janas-LLM spends on a token written, and the 32,000 tokens of prompt take 15 minutes to read. Janas-LLM's peak memory went from 2.6 GiB at 1,024 tokens to 4.9 at 32,000. The conditions are the same wherever possible; where not: Janas-LLM keeps the keys and values at eight bits, llama.cpp at sixteen (its default); llama.cpp was not run at 32,000 tokens (almost another hour). How it was measured: [below](#how-the-figures-were-measured).
 
+**New: Gemma 4 whole on the GPU, Llama 3, and `janas-nsm`.** Gemma 4's four models - 12B, the 26B mixture, E2B and E4B - now run every layer of a token on the GPU, with the GPU's norms and quantizations giving the CPU's bits: Gemma-4-12B agrees with llama.cpp at 367 of 400 most likely tokens on the GPU, at 362 on the CPU. Llama 3 models run too, a LoRA adapter merged into one by `tools/hf2gguf`: DeepNSM-1B (Llama-3.2-1B with the adapter of [arXiv 2505.11764](https://arxiv.org/abs/2505.11764)) writes its answers at 57.8 tok/s on the laptop's CPU, where llama.cpp writes 37.9 to 39.8 on the same file. `janas-nsm` asks it for a word's explication in the Natural Semantic Metalanguage - Goddard and Wierzbicka's sixty-odd semantic primes, the words every language has - and counts it as the paper does; it can also restrict the model's output to those words alone. A research tool, and a sign of how far this project means to go: [docs/tools.md](docs/tools.md#janas-nsm).
+
 **Try it** on Linux x86-64 (Ubuntu 22.04, Debian 12 and later):
 
 ```sh
@@ -223,7 +225,7 @@ Janas is designed and written by **Maurizio "camauri" Cammalleri** ([LinkedIn](h
 
 It stands on the work of others, and says so:
 
-- **The models** it runs are their authors': Qwen3, Qwen3.5, Qwen3.6 and Qwen3-Next by the Qwen team of Alibaba Cloud, Gemma 4 by Google; the GGUF quantizations by Qwen, bartowski and unsloth ([MODELS.md](MODELS.md) has every source).
+- **The models** it runs are their authors': Qwen3, Qwen3.5, Qwen3.6 and Qwen3-Next by the Qwen team of Alibaba Cloud, Gemma 4 by Google, Llama 3.2 by Meta (under the Llama 3.2 Community License); DeepNSM's adapter by the authors of [arXiv 2505.11764](https://arxiv.org/abs/2505.11764) (CC BY-NC-SA: research, not commercial use); the GGUF quantizations by Qwen, bartowski and unsloth ([MODELS.md](MODELS.md) has every source).
 - **llama.cpp and ggml** are the reference the engine is checked against (logits, tokens, speed); none of their code is in Janas. The one thing taken from ggml is data that defines a format: the IQ3_S grid, in `src/llm/iq3s_grid.h`, under ggml's MIT licence.
 - **The Unicode Character Database** gives the tokenizer its tables (`tools/gen_unicode`), and **OpenAI's OpenAPI specification** gives `janas-server` its route table (`tools/openapi_routes`).
 - **GNU libmicrohttpd, yyjson and Mbed TLS** are compiled into the programs named below.
