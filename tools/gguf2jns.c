@@ -14,8 +14,13 @@
  * and 2112) is widened with zeros to the next one - rows of zero bytes in
  * gate and up, a zero tail on each row of down: every weight type reads zero
  * bytes as zero weights, so the products are the same, and the engine's
- * activations, quantized 256 at a time, fit. Gate and up fused in one
- * tensor (ffn_gate_up_exps) are split into the two matrices of the slot.
+ * activations, quantized 256 at a time, fit. Qwen3.8-Flash-Next's experts
+ * (qwen4exp, 640 wide) keep their width: the engine reads rows that end
+ * inside a group of 256 in the types stored in blocks of 32 or 64
+ * (janas_dot_rows_n), the only ones such a down can have, and the zeros
+ * would be a fifth more bytes read at every token. Gate and up fused in
+ * one tensor (ffn_gate_up_exps) are split into the two matrices of the
+ * slot.
  *
  * A resident tensor in MXFP4 (unsloth's Qwen3-Coder-Next files have their
  * shared experts so, issue #18) is written as Q8_0, which holds it exactly:
@@ -327,6 +332,8 @@ int main(int argc, char **argv)
     uint64_t d_model = need_uint(g0, key);
     if (n_layer == 0 || n_layer > 4096 || n_expert == 0 || n_expert > 65536)
         die("%s: layers or experts out of range", src);
+    /* the experts' width as it is (see the top of the file) */
+    int keep_width = strcmp(arch, "qwen4exp") == 0;
 
     /* expert geometry per layer */
     struct janas_jns_layer_v2 *layers = calloc(n_layer, sizeof(*layers));
@@ -366,10 +373,13 @@ int main(int argc, char **argv)
             uint64_t rb = per / t->t->dims[1];
             /* widened to a multiple of 256: the rows of gate and up, the
                row of down */
-            uint64_t new_rows = p < 2 ? wide(rows) : rows;
-            uint64_t new_cols = p < 2 ? cols : wide(cols);
+            uint64_t new_rows = p < 2 && !keep_width ? wide(rows) : rows;
+            uint64_t new_cols = p < 2 || keep_width ? cols : wide(cols);
             if (new_cols != cols && (rb * new_cols) % cols)
                 die("%s: cannot widen this type", key);
+            if (keep_width &&
+                janas_qtype_row_bytes((int)t->t->type, cols) != rb)
+                die("%s: a row the engine cannot read at this width", key);
             uint64_t new_rb = rb * new_cols / cols;
             off = align_up(off, MATRIX_ALIGN);
             layers[l].m[p] =

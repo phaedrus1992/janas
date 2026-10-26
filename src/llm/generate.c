@@ -215,7 +215,8 @@ static int mtp_step(struct janas_llm_model *m, const int32_t *hist,
                     float min_conf, struct planner *pl, float *hrow,
                     int32_t *draft, float *survs, int *n_draft)
 {
-    uint32_t dm = janas_llm_model_n_embd(m);
+    /* a row of hidden state: d_model, or qwen4exp's streams */
+    uint32_t dm = janas_llm_model_hidden_width(m);
     *n_draft = 0;
     janas_llm_mtp_note_tokens(m, hist + pos + 1, acc + 1);
     if (!drafting)
@@ -442,7 +443,7 @@ janas_llm_session_create(struct janas_llm_model *m,
     s->cap = janas_llm_model_n_ctx(m);
     s->hist = malloc((s->cap + MAX_SPEC_K + 2) * sizeof(int32_t));
     s->logits = malloc((size_t)(MAX_SPEC_K + 1) * s->nv * sizeof(float));
-    s->hrow = malloc(janas_llm_model_n_embd(m) * sizeof(float));
+    s->hrow = malloc(janas_llm_model_hidden_width(m) * sizeof(float));
     s->smp = janas_sampler_create(s->nv);
     if (o->draft)
         s->dlogits = malloc((size_t)s->nv * sizeof(float));
@@ -702,6 +703,10 @@ int janas_llm_session_append(struct janas_llm_session *s, const int32_t *tokens,
         return 0;
     if (n > s->cap + 1 - s->n)
         return -1;
+    /* a new turn: the passes' costs learned again, on the cache and the
+       context as they are now (the drafts' odds are kept) */
+    memset(s->pl.t, 0, sizeof(s->pl.t));
+    s->pl.chain = 0;
     memcpy(s->hist + s->n, tokens, n * sizeof(int32_t));
     s->n += n;
     s->ret = s->n;
@@ -956,6 +961,17 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
                                 1) != 0)
         return -1;
     double dt = now() - tp;
+    /* what the planner and spec_auto learn: the pass without its waits for
+       the disk, and nothing from a pass the tuner ran on an alternative it
+       was trying. In a new conversation it tries each configuration in turn
+       on the passes of 2 to 16 tokens, those that verify the drafts, and
+       learned from the slow ones (279-357 ms a pass where its choice takes
+       50), the planner refused the drafts: Qwen3-Next-80B-A3B wrote a reply
+       of 64 tokens with 4 drafts at 24.7 token/s, where janas-bench, its
+       configuration forced, wrote with drafts at 34.8 (21 Oct 2026). The
+       statistics keep the time as it was. */
+    double cost = janas_llm_model_pass_seconds(m);
+    int learn = cost > 0;
     s->call_start = pos;
     s->st.passes++;
     /* accept the drafts the model would have produced, then its token; a
@@ -987,9 +1003,9 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         s->st.pass_count[nd + 1]++;
         s->st.pass_seconds[nd + 1] += dt;
     }
-    if ((plan || copies) && !settling_now) {
+    if ((plan || copies) && !settling_now && learn) {
         double *tt = &s->pl.t[nd + 1];
-        *tt = *tt > 0 ? 0.8 * *tt + 0.2 * dt : dt;
+        *tt = *tt > 0 ? 0.8 * *tt + 0.2 * cost : cost;
     }
     if (o->spec_mode == JANAS_SPEC_DRAFT && nd > 0)
         /* the drafts the target took were the drafting model's own, so its
@@ -1020,8 +1036,9 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         s->st.spec_passes++;
         s->st.drafted += (uint32_t)nd;
         s->st.accepted += (uint32_t)acc;
-        if (!settling) {
-            s->spec_cost = s->spec_cost ? 0.8 * s->spec_cost + 0.2 * dt : dt;
+        if (!settling && learn) {
+            s->spec_cost =
+                s->spec_cost ? 0.8 * s->spec_cost + 0.2 * cost : cost;
             s->gain = s->gain ? 0.8 * s->gain + 0.2 * (acc + 1) : acc + 1;
             s->spec_seen++;
         }
@@ -1042,10 +1059,11 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
                 s->retry = AUTO_RETRY_MIN;
             }
         }
-    } else if (settling) {
-        /* nothing learned while the cache fills */
+    } else if (settling || !learn) {
+        /* nothing learned while the cache fills, nor from a try */
     } else {
-        s->single_cost = s->single_cost ? 0.8 * s->single_cost + 0.2 * dt : dt;
+        s->single_cost =
+            s->single_cost ? 0.8 * s->single_cost + 0.2 * cost : cost;
         s->single_at = s->st.passes;
     }
     /* the MTP rows of the new tokens always (the block's KV cache must stay

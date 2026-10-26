@@ -16,19 +16,34 @@
 /* The push constants a shader may take: every Vulkan device gives 128. */
 #define JANAS_G_PUSH_BYTES 128
 /* the kinds of product shader (gpu.c's prod_index) */
-#define N_PROD 13
+#define N_PROD 15
 /* the kinds of b32_matvec.comp (gpu.c's b32_kind) */
-#define N_B32 5
+#define N_B32 7
+/* the 256-block types of iq2_matvec, iq3xxs_matvec, iq1_matvec and
+   q2k_matvec.comp (gpu.c's iqk_index) */
+#define N_IQK 7
 
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
-#define MAX_REGIONS 48
+/* the spin-wait hint while a submission runs, as pool.c's */
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define gpu_relax() _mm_pause()
+#elif defined(__aarch64__)
+#define gpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define gpu_relax() ((void)0)
+#endif
+
+/* the resident region, the experts' arena (4 GiB a region: 15 on a
+   machine whose cache holds 60 GB), the engine's buffers (some 30), the
+   KV cache */
+#define MAX_REGIONS 80
 #define MAX_PENDING 64
 #define MAX_XCACHE 8
 #define X_STAGE_BYTES                                                          \
@@ -37,6 +52,7 @@
 #define ROWS_PER_GROUP 64 /* local_size_x of the shader */
 #define NV_PER_GROUP 8    /* its NV */
 #define MV_NV 8           /* q4k_mv's */
+#define B16_NV 4          /* bf16_matvec's vectors a workgroup */
 #define MVD_ROWS 32       /* q4k_mvd's rows a workgroup */
 #define GPU_BLOCK 320     /* a Q8_K block in the shader's layout */
 #define SHARE_SLOTS 64
@@ -134,6 +150,9 @@ struct push {
     uint32_t w[2], x[2], y[2];
     uint32_t rows, nb, nv, xs, ys, level;
     uint32_t p1[2], p0[2];
+    /* b32_matvec.comp, q8_0_matvec.comp: blocks of 32 past the row's
+       whole groups of 256 */
+    uint32_t tail;
 };
 
 struct janas_gpu {
@@ -162,16 +181,37 @@ struct janas_gpu {
     VkPipeline pipex4, pipe3, pipei3; /* IQ4_XS, Q3_K, IQ3_S */
     /* Q4_K on many vectors in tiles (q4k_mm.comp), MM_ROWS x MM_VECS */
     VkShaderModule sm_mm, sm_mm6, sm_mm6s, sm_mm80, sm_mm5, sm_mm3, sm_mmx4,
-        sm_mmi3, sm_mmn4, sm_mmmx,
-        sm_dm[2]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL, mmmx MXFP4 */
+        sm_mmi3, sm_mmn4, sm_mmmx, sm_mm50, sm_mm20,
+        sm_dm[3]; /* sm_mmx4 IQ4_XS, mmi3 IQ3_S, mmn4 IQ4_NL, mmmx MXFP4,
+                     mm50 Q5_0, mm20 Q2_0; dm f32, bf16 and Q8_0 weights on
+                     float vectors */
     VkPipeline pipe_mm, pipe_mm6, pipe_mm6s, pipe_mm80, pipe_mm5, pipe_mm3,
-        pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_mmmx, pipe_dm[2];
-    int only_fast; /* janas_gpu_set_only_fast */
-    uint32_t nvg;  /* vectors a product's workgroup takes (NV_PER_GROUP) */
+        pipe_mmx4, pipe_mmi3, pipe_mmn4, pipe_mmmx, pipe_mm50, pipe_mm20,
+        pipe_dm[3];
+    int only_fast;   /* janas_gpu_set_only_fast */
+    uint32_t pass_n; /* janas_gpu_set_pass; UINT32_MAX until said */
+    uint32_t nvg;    /* vectors a product's workgroup takes (NV_PER_GROUP) */
     /* a mixture's experts in one dispatch (experts_id): Q4_K, Q6_K_P,
        Q6_K, MXFP4 */
-    VkShaderModule sm_id4, sm_id6, sm_id6s, sm_idmx;
-    VkPipeline pipe_id4, pipe_id6, pipe_id6s, pipe_idmx;
+    VkShaderModule sm_id4, sm_id6, sm_id6s, sm_idmx, sm_id3;
+    VkPipeline pipe_id4, pipe_id6, pipe_id6s, pipe_idmx, pipe_id3;
+    /* ... and in blocks of 32 or 64 (b32_mmid.comp): IQ4_NL, Q5_0, Q2_0 */
+    VkShaderModule sm_idb[3];
+    VkPipeline pipe_idb[3];
+    /* bf16 weights on float vectors, bit for bit (bf16_matvec.comp) */
+    VkShaderModule sm_b16;
+    VkPipeline pipe_b16;
+    /* Q2_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ1_S, IQ1_M, a row an
+       invocation, for groups of vectors and for one (NULL: the CPU's) */
+    VkShaderModule sm_iqk[N_IQK], sm1_iqk[N_IQK];
+    VkPipeline pipe_iqk[N_IQK], pp1_iqk[N_IQK];
+    /* ... and their experts in one dispatch, IQ3_S's and IQ4_XS's too
+       (iqk_mmid.comp, gpu.c's iqm_kind) */
+    VkShaderModule sm_iqm[N_IQK + 2];
+    VkPipeline pipe_iqm[N_IQK + 2];
+    /* ... and their tiles for the fast prompt (iqk_mmq.comp) */
+    VkShaderModule sm_iqq[N_IQK];
+    VkPipeline pipe_iqq[N_IQK];
     struct stage ts; /* their table, 3 uvec4 an expert */
     /* the product shaders made for a single vector (prod_index) */
     VkShaderModule pm1[N_PROD];
@@ -226,9 +266,10 @@ struct janas_gpu {
     int verbose, nospin, block_wait;
     double t_waited; /* last janas_gpu_finish */
     size_t y_used;   /* bytes of the Y stage written by the last group */
-    double t_conv, t_rec, t_sub; /* verbose: time in janas_gpu_begin */
-    VkDeviceSize atom;           /* nonCoherentAtomSize */
-    float ts_period;             /* nanoseconds a timestamp tick */
+    double t_conv, t_rec, t_sub;    /* verbose: time in janas_gpu_begin */
+    uint64_t b16_calls, b16_staged; /* janas_gpu_bf16_mv's, staged among them */
+    VkDeviceSize atom;              /* nonCoherentAtomSize */
+    float ts_period;                /* nanoseconds a timestamp tick */
     /* keep-alive: an empty dispatch every keep_us while running, so that
        the GPU does not fall asleep between products (waking it costs up to
        ~0.5 ms per submission) */

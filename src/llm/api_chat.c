@@ -361,12 +361,48 @@ int janas_api_add_markup(janas_llm_chat *c, const char *s, size_t n)
     return janas_api_add_text(c, s + from, n - from);
 }
 
+const char *janas_api_think_note(const janas_llm_chat *c)
+{
+    const janas_llm *llm = c->llm;
+    return llm->format == FORMAT_CHATML && llm->thinker && c->p.thinking != 0 &&
+                   llm->think_note[0]
+               ? llm->think_note
+               : NULL;
+}
+
 /* The system message, with the tools when there are: the dialect's
-   template writes them into it. */
+   template writes them into it. While the model reasons, its words on
+   reasoning (janas_api_think_note) at the top, before the tools, as its
+   template writes them: the message trimmed after them. */
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
 {
     const janas_llm *llm = c->llm;
     c->tools_tokens = 0;
+    const char *note = janas_api_think_note(c);
+    struct janas_buf nb = {0};
+    if (note && llm->format == FORMAT_CHATML) {
+        while (n && sys &&
+               (*sys == ' ' || *sys == '\n' || *sys == '\t' || *sys == '\r'))
+            sys++, n--;
+        while (n && (sys[n - 1] == ' ' || sys[n - 1] == '\n' ||
+                     sys[n - 1] == '\t' || sys[n - 1] == '\r'))
+            n--;
+        janas_buf_puts(&nb, note);
+        if (n && (!c->tools_sys || llm->tools == JANAS_TOOLS_NONE)) {
+            janas_buf_puts(&nb, "\n\n");
+            janas_buf_put(&nb, sys, n);
+        }
+        if (nb.oom) {
+            janas_buf_free(&nb);
+            return -1;
+        }
+        if (!c->tools_sys || llm->tools == JANAS_TOOLS_NONE) {
+            int err = janas_api_add_message(c, "system", nb.p, nb.n);
+            janas_buf_free(&nb);
+            return err;
+        }
+        janas_buf_puts(&nb, "\n\n"); /* before the tools */
+    }
     if (llm->format == FORMAT_GEMMA) {
         /* a system turn only when there is something to say: the message,
            or <|think|> at its top when reasoning is asked for */
@@ -392,15 +428,28 @@ int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
     /* how many of its tokens the tools take: the message without them is
        built and taken back, for the count alone */
     size_t ids0 = c->n_ids;
-    if (janas_api_flush_text(c) != 0)
+    if (janas_api_flush_text(c) != 0) {
+        janas_buf_free(&nb);
         return -1;
+    }
     ids0 = c->n_ids;
-    if (janas_api_add_message(c, "system", sys ? sys : "", n) != 0 ||
-        janas_api_flush_text(c) != 0)
+    /* the words on reasoning are the message's, not the tools' */
+    size_t nn = nb.n;
+    if (n)
+        janas_buf_put(&nb, sys, n);
+    if (nb.oom ||
+        janas_api_add_message(c, "system", nb.p ? nb.p : "", nb.n) != 0 ||
+        janas_api_flush_text(c) != 0) {
+        janas_buf_free(&nb);
         return -1;
+    }
+    nb.n = nn;
     size_t plain = c->n_ids - ids0;
     c->n_ids = ids0;
     struct janas_buf b = {0};
+    if (nb.n)
+        janas_buf_put(&b, nb.p, nb.n);
+    janas_buf_free(&nb);
     janas_tools_system(&b, llm->tools, c->tools_sys, sys, n);
     int err = b.oom || janas_api_add_special(c, llm->im_start) ||
               janas_api_add_text(c, "system\n", 7) ||
@@ -551,7 +600,8 @@ int32_t janas_llm_chat_prepare(janas_llm_chat *c, int32_t *done, int32_t *total)
             return 0; /* the conversation has started */
         c->n_ids = c->n_text = 0;
         int err = janas_api_begin_sequence(c);
-        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA)
+        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA ||
+            janas_api_think_note(c))
             err |= janas_api_add_system(c, c->system,
                                         c->system ? strlen(c->system) : 0);
         err |= janas_api_flush_text(c);
@@ -796,7 +846,8 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
     } else {
         /* the start: <bos> where the format has one, the system message */
         err |= janas_api_begin_sequence(c);
-        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA)
+        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA ||
+            janas_api_think_note(c))
             err |= janas_api_add_system(c, c->system,
                                         c->system ? strlen(c->system) : 0);
         c->sys_tokens = (uint32_t)c->n_ids;

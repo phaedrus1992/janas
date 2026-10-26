@@ -145,6 +145,26 @@ JANAS_LLM_API int32_t janas_llm_open(const char *path,
 JANAS_LLM_API void janas_llm_close(janas_llm *llm);
 
 /*
+ * The memory a model would take, before opening it, with the parameters
+ * janas_llm_open would get (n_ctx, mtp_path; p may be NULL): *fixed, what
+ * it needs whatever its expert cache - the resident weights, the keys and
+ * values of n_ctx tokens, the attention's partial results, a pass's
+ * scratch, an MTP file - and *experts, an expert cache holding every expert
+ * (a dense model needs all of it: its feed-forward weights are read at
+ * every token, in order). The reckoning janas_llm_open makes for its
+ * automatic cache_bytes. Either pointer may be NULL.
+ */
+JANAS_LLM_API int32_t janas_llm_estimate(const char *path,
+                                         const struct janas_llm_params *p,
+                                         uint64_t *fixed, uint64_t *experts);
+/* The memory an open model holds: its resident weights, its expert cache
+   (all of it allocated, filled as experts are read), and the keys and
+   values of its context with their scales (allocated for all of n_ctx,
+   filled as the context grows). Either pointer may be NULL. */
+JANAS_LLM_API int32_t janas_llm_memory(const janas_llm *llm, uint64_t *resident,
+                                       uint64_t *cache, uint64_t *kv);
+
+/*
  * The model's multi-token prediction file, looked for beside it: a .jns in
  * the same directory that fits the model by its header - Gemma 4's
  * assistant, or an MTP block made by hf2jns_mtp - the one sharing the
@@ -225,6 +245,21 @@ JANAS_LLM_API int32_t janas_llm_attn_scores(const janas_llm *llm);
  */
 JANAS_LLM_API int32_t janas_llm_preload(const janas_llm *llm, int64_t *done,
                                         int64_t *total);
+
+/*
+ * The NPU's preparation. The first passes it takes in a session, the
+ * blocks of a prompt, wait while it is made ready: the weights it reads
+ * copied in eight bits and its graphs compiled, seconds to a minute (about
+ * a minute for Qwen3-4B on a Core Ultra 9 185H). 1 while that goes on, with
+ * *done of *total graphs made (*total 0 when not known ahead) and *seconds
+ * since it began; 0 otherwise, *seconds then the time the session's
+ * preparations took. Callable from another thread while the engine works,
+ * as janas_llm_preload, so that a front end can show it; without an NPU 0
+ * and zeros.
+ */
+JANAS_LLM_API int32_t janas_llm_npu_preparing(const janas_llm *llm,
+                                              int32_t *done, int32_t *total,
+                                              double *seconds);
 
 /* A short description of the model ("qwen3next, 48 layers, ..."). Writes at
    most cap bytes, NUL-terminated; *len gets the full length. */
@@ -522,8 +557,11 @@ JANAS_LLM_API int32_t janas_llm_chat_aside(
 
 /* Whether the model calls a tool, from the next reply on: as it judges
    (AUTO, default), never (NONE), at least one (REQUIRED), or the function
-   named (FUNCTION, name of len bytes). parallel 0 allows one call at most
-   where calls are required. */
+   named (FUNCTION, name of len bytes). REQUIRED with a name (len bytes, or
+   to its end with -1; NULL or "": any): the calls only to the functions
+   whose names begin with it, where one does - janas-chat holds the reply
+   after a service is opened to that service's tools. parallel 0 allows one
+   call at most where calls are required. */
 #define JANAS_LLM_TOOLS_AUTO 0
 #define JANAS_LLM_TOOLS_NONE 1
 #define JANAS_LLM_TOOLS_REQUIRED 2

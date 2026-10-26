@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "llm/gpu.h"
 #include "llm/matvec.h"
@@ -29,7 +30,7 @@ static int n_kept;
 /* aligned, and freed only after the GPU (see above) */
 static void *buffer(size_t bytes)
 {
-    void *p = aligned_alloc(4096, bytes);
+    void *p = janas_aligned_alloc(4096, bytes);
     if (p && n_kept < 8)
         kept[n_kept++] = p;
     return p;
@@ -125,7 +126,7 @@ int main(void)
     janas_pool_destroy(pool);
     janas_gpu_destroy(g);
     for (int i = 0; i < n_kept; i++)
-        free(kept[i]);
+        janas_aligned_free(kept[i]);
     if (!rc)
         printf("test_gpu_output_copy: ok\n");
     return rc;

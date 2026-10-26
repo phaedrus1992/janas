@@ -58,4 +58,7 @@ uint64_t janas_mem_available(void);
 /* Installed memory, in bytes (0 if unknown). */
 uint64_t janas_mem_total(void);
 
+/* The process's resident memory now, in bytes (0 if unknown). */
+uint64_t janas_rss_bytes(void);
+
 #endif

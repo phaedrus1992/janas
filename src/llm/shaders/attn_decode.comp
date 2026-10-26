@@ -13,8 +13,11 @@
 // - m) (and the value's scale), written to part at (h nch + c)(hd + 2):
 // the hd sums, then m and l. attn_merge.comp joins the runs. Workgroup x =
 // kh nch + c; the runs past the token's position leave at once, so that
-// the dispatch recorded once serves every position. The GPU's own order of
-// the sums: not the CPU's bits (attention.c), the same result to rounding.
+// the dispatch recorded once serves every position. With list set
+// (qwen4exp's sparse attention, ix_select.comp) token j reads the positions
+// of row j of list (ls words: their count, then the positions) instead of
+// 0 .. pos + j, run c the c-th C of them. The GPU's own order of the sums:
+// not the CPU's bits (attention.c), the same result to rounding.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -25,8 +28,10 @@ layout(local_size_x = 256) in;
 
 layout(constant_id = 2) const uint G = 4; /* query heads a KV head */
 const uint C = 128u;       /* positions a run: gpu_token.c ATT_RUN */
-const uint MAXQ = 2048u;  /* G x hd */
-const uint MAXS = 1024u;  /* G x C */
+/* G x hd and G x C: 2048 and 1024, or G x 256 and G x 128 where G is
+   larger than 8 (Qwen3.8-Flash-Next's 12; gpu_token.c att_maxq) */
+const uint MAXQ = G * 256u > 2048u ? G * 256u : 2048u;
+const uint MAXS = G * C > 1024u ? G * C : 1024u;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer B4 { uvec4 v[]; };
@@ -40,6 +45,8 @@ layout(push_constant) uniform P {
     float scale;
     uint qs, ps; /* floats from a token's qkv, and its runs, to the next's */
     uvec2 pos; /* the token's position, read at run time: npos = pos + 1 */
+    uvec2 list;
+    uint ls;
 } p;
 
 shared float sq[MAXQ];  /* the G query heads */
@@ -48,6 +55,7 @@ shared float r8[MAXS / 8u];  /* the maxima of eight scores */
 shared float r8s[MAXS / 8u]; /* and the sums of eight weights */
 shared uint sqw[MAXQ / 4u]; /* the query heads at eight bits, four a word */
 shared float sqs[16];       /* and their scales */
+shared uint spos[C];        /* the run's positions in the cache */
 
 int byte_of(uint w, uint i) { return bitfieldExtract(int(w), int(8u * i), 8); }
 
@@ -59,10 +67,15 @@ void main()
     uint kh = gl_WorkGroupID.x / p.nch, c = gl_WorkGroupID.x % p.nch;
     /* token j of a block (workgroup y): positions 0 .. pos + j */
     uint j0 = gl_WorkGroupID.y;
-    uint npos = RP(p.pos).v[0] + j0 + 1u, p0 = c * C;
+    bool lst = p.list.x != 0u || p.list.y != 0u;
+    RP LP = RP(p.list);
+    uint npos = lst ? LP.v[j0 * p.ls] : RP(p.pos).v[0] + j0 + 1u, p0 = c * C;
     if (p0 >= npos)
         return; /* the whole workgroup: past the token */
     uint n = min(C, npos - p0);
+    /* each of the run's positions, as an index of the cache's rows */
+    for (uint k = t; k < C; k += 256u)
+        spos[k] = kh * p.cap + (lst ? LP.v[j0 * p.ls + 1u + p0 + min(k, n - 1u)] : p0 + min(k, n - 1u));
     R Q = R(p.q), KS = R(p.ks), VS = R(p.vs);
     RP QW = RP(p.q);
     B4 KC = B4(p.kc), VC = B4(p.vc); /* 16 bytes a load: hd % 16 == 0 */
@@ -74,13 +87,12 @@ void main()
     if (t < G)
         sqs[t] = Q.v[qo + t * hd + nw];
     barrier();
-    uint base = kh * p.cap + p0; /* the run's first position */
     /* scores: four threads a position (256 threads: C / 64 rounds), each
        a quarter of the key for all G heads at once - the key read once -
        the quarters added across the cluster */
     for (uint r0 = 0; r0 < C; r0 += 64u) {
         uint j = r0 + t / 4u, qq = t % 4u, jj = min(j, n - 1u);
-        uint w0 = (base + jj) * hd / 16u;
+        uint w0 = spos[jj] * hd / 16u;
         int dg[G];
         for (uint g = 0; g < G; g++)
             dg[g] = 0;
@@ -94,7 +106,7 @@ void main()
                          dotPacked4x8EXT(int(sqw[o + 3u]), int(k4.w));
             }
         }
-        float ksc = KS.v[base + jj] * p.scale;
+        float ksc = KS.v[spos[jj]] * p.scale;
         for (uint g = 0; g < G; g++) {
             int d = subgroupClusteredAdd(dg[g], 4u);
             if (qq == 0u && j < n)
@@ -124,7 +136,7 @@ void main()
             m = max(m, r8[g * (C / 8u) + q]);
         float e = on ? exp(sc[k] - m) : 0.0;
         if (in_g)
-            sc[k] = on ? e * VS.v[base + j] : 0.0;
+            sc[k] = on ? e * VS.v[spos[j]] : 0.0;
         float ce = subgroupClusteredAdd(e, 8u);
         if (t % 8u == 0u && in_g)
             r8s[k / 8u] = ce;
@@ -149,7 +161,7 @@ void main()
             for (uint k = 0; k < G * 8u; k++)
                 a[k] = 0.0;
             for (uint j = slo + 4u * shi; j < n; j += 4u * SH) {
-                uvec2 v2 = VC2.v[((base + j) * hd + d0) / 8u];
+                uvec2 v2 = VC2.v[(spos[j] * hd + d0) / 8u];
                 for (uint k = 0; k < 8u; k++) {
                     float vb = float(byte_of(k < 4u ? v2.x : v2.y, k % 4u));
                     for (uint g = 0; g < G; g++)
@@ -172,7 +184,7 @@ void main()
             for (uint k = 0; k < 16u; k++)
                 a[k] = 0.0;
             for (uint j = sl_; j < n; j += SH) {
-                uvec4 v4 = VC.v[((base + j) * hd + d0) / 16u];
+                uvec4 v4 = VC.v[(spos[j] * hd + d0) / 16u];
                 float wj = sc[g * C + j];
                 for (uint k = 0; k < 16u; k++)
                     a[k] += wj * float(byte_of(comp(v4, k / 4u), k % 4u));
