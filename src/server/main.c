@@ -7,6 +7,7 @@
  */
 #include "server.h"
 
+#include "common/devices.h"
 #include "common/env_names.h"
 #include "common/sock.h"
 #include "common/stop.h"
@@ -48,6 +49,19 @@ static void usage(FILE *f)
         "  --draft FILE      a small model of the same family, for speed\n"
         "  --mode M          auto, eco or max (default auto)\n"
         "  --no-gpu          never give the GPU work\n"
+        "  --prompt-on DEV   what reads the prompts: auto (default: what\n"
+        "                    measures fastest here), cpu, gpu, npu, npu+gpu\n"
+        "                    (both in each pass), or a list apart by commas\n"
+        "                    for the engine to choose from (npu,gpu); the\n"
+        "                    CPU takes part in every pass, the NPU in blocks\n"
+        "                    of 64 tokens and more; a choice wins over the\n"
+        "                    mode\n"
+        "  --drafts-on DEV   the same for the passes that check guessed\n"
+        "                    tokens (2 to 16)\n"
+        "  --reply-on DEV    the same for a reply's tokens, one at a time\n"
+        "  --npu-int8        the NPU reads prompts with eight-bit\n"
+        "                    activations: faster, a little less exact\n"
+        "                    (dense Qwen3 models)\n"
         "  --embedding-model FILE  a model for /v1/embeddings (such as\n"
         "                    Qwen3-Embedding), run beside the chat model\n"
         "  --think on|off    reasoning before replying, for models that do\n"
@@ -123,7 +137,8 @@ static const char *const OPTIONS[] = {
     "--connections", "--max-input",       "--warn-input",
     "--fim-prefix",  "--fim-suffix",      "--fim-max",
     "--metrics",     "--progress",        "--no-mcp",
-    "--test",        "--verbose"};
+    "--test",        "--verbose",         "--prompt-on",
+    "--drafts-on",   "--reply-on",        "--npu-int8"};
 
 /* the value of option argv[*i], read whole within [lo, hi]; a mistake
    ends the program, as a missing value does */
@@ -209,6 +224,8 @@ int main(int argc, char **argv)
     c->reasoning_budget = -1;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
+        char dwhy[240];
+        int dk;
         if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
             usage(stdout);
             return 0;
@@ -252,6 +269,8 @@ int main(int argc, char **argv)
             c->no_mtp = 1;
         } else if (!strcmp(a, "--no-gpu")) {
             c->no_gpu = 1;
+        } else if (!strcmp(a, "--npu-int8")) {
+            setenv("JANAS_NPU_A8", "1", 1); /* read when the model opens */
         } else if (!strcmp(a, "--keep")) {
             c->keep = (int)num(argc, argv, &i, 0, 1 << 20);
         } else if (!strcmp(a, "--keep-memory")) {
@@ -293,6 +312,14 @@ int main(int argc, char **argv)
         } else if (!strcmp(a, "--verbose")) {
             c->verbose = 1;
             setenv("JANAS_PROGRESS", "30", 0); /* unless one is asked */
+        } else if (a[0] == '-' && (dk = janas_devices_option(
+                                       a, i + 1 < argc ? argv[i + 1] : NULL,
+                                       dwhy, sizeof dwhy)) != 0) {
+            if (dk < 0) {
+                fprintf(stderr, "janas-server: %s\n", dwhy);
+                return 2;
+            }
+            i++; /* its value, put in the engine's variable */
         } else if (a[0] == '-') {
             char why[200];
             janas_unknown_word(why, sizeof why, a, "an option", OPTIONS,

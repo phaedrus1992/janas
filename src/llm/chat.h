@@ -26,6 +26,11 @@ enum chat_format {
        "model", the reasoning in <|channel>thought\n...<channel|>:
        ChatML's shape, so im_start and im_end hold <|turn> and <turn|> */
     FORMAT_GEMMA,
+    /* Llama 3: <|begin_of_text|> once, then <|start_header_id|>role
+       <|end_header_id|>\n\ntext<|eot_id|>, nothing after: ChatML's shape,
+       im_start and im_end holding <|start_header_id|> and <|eot_id|>, the
+       role closed by hdr_end */
+    FORMAT_LLAMA3,
 };
 
 struct janas_llm {
@@ -35,10 +40,19 @@ struct janas_llm {
     int32_t im_start, im_end;
     const char *asst_role; /* "assistant", or Gemma's "model" */
     int32_t bos;           /* written once at the start, or -1 */
+    int32_t hdr_end;       /* Llama 3's <|end_header_id|>, or -1 */
     int32_t think_on;      /* Gemma's <|think|>: reasoning asked for, or -1 */
     int32_t quote, decl_open, decl_close; /* Gemma's <|"|>, <|tool>, <tool|> */
     int32_t think_open, think_close;      /* reasoning markers, or -1 */
-    int thinker;       /* the template knows enable_thinking */
+    int thinker; /* the template knows enable_thinking */
+    /* the template's words at the top of the system message while the
+       model reasons, at its default effort (Qwen3.8: "Reasoning effort is
+       set to xhigh. ..."); empty where it has none */
+    char think_note[512];
+    /* the template gives every earlier turn of the assistant its reasoning
+       back (Qwen3.8: preserve_thinking unless told otherwise), not only
+       those after the user's last question (Qwen3.5 and 3.6) */
+    int think_kept;
     int empty_thought; /* Gemma 4: an empty channel when not reasoning */
     enum janas_tool_dialect tools; /* how its template writes tool calls */
     int32_t call_open, call_close; /* <tool_call>, </tool_call>, or -1 */
@@ -165,6 +179,9 @@ struct janas_llm_chat {
     struct janas_toolset *tools, *tools_sys;
     char *tools_json, *more_json;
     int32_t tool_choice, tool_only, parallel;
+    char tool_prefix[128]; /* REQUIRED with a name: the calls' names begin
+                              with it (tool_prefix_n bytes; 0: any) */
+    size_t tool_prefix_n;
     int32_t format;
     struct janas_json_doc *schema;
     struct janas_grammar *g;       /* of the reply being read, with ... */
@@ -241,9 +258,15 @@ int janas_api_rtext_add(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_add_text(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_flush_text(janas_llm_chat *c);
 int janas_api_add_special(janas_llm_chat *c, int32_t id);
+/* The newline after a turn's end where the format has one. */
+int janas_api_end_turn_nl(janas_llm_chat *c);
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n);
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n);
+/* The model's words on reasoning for the system message's top
+   (janas_llm.think_note) when this chat's replies reason, else NULL: where
+   it is not NULL there is a system message whatever the caller says. */
+const char *janas_api_think_note(const janas_llm_chat *c);
 int janas_api_start_reply(janas_llm_chat *c);
 int janas_api_begin_sequence(janas_llm_chat *c);
 int janas_api_note_turn(janas_llm_chat *c, uint32_t at);

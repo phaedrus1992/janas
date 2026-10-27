@@ -9,7 +9,8 @@
 // divided by the total - then quantized to Q8_K as norm_quant.comp does
 // (q256, and q32 if set): no dispatch of its own between the two. With
 // gate set (qwen3.5's attention), each output times sigmoid of its gate
-// (gs floats a token) before.
+// (gs floats a token) before. With a window (Gemma 4's sliding layers) the
+// runs wholly before it, which attn_decode.comp left, are not read.
 #extension GL_EXT_buffer_reference : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -29,6 +30,8 @@ layout(push_constant) uniform P {
     uint gs;  /* the gate's floats a token */
     uvec2 pos;
     uvec2 gate;
+    uvec2 list; /* attn_decode.comp's, if set: the positions' count */
+    uint ls, window;
 } p;
 
 shared float m8[32];        /* the block's maxima, eight values each */
@@ -44,6 +47,16 @@ float recip_det(float d)
     return y;
 }
 
+/* a / b correctly rounded (b normal, positive), as the CPU's division:
+   the output quantized as janas_q8k_quantize does it (att_out_tok) */
+float div_cr(float a, float b)
+{
+    precise float r = recip_det(b);
+    precise float q = a * r;
+    precise float e = fma(-q, b, a);
+    return fma(e, r, q);
+}
+
 int q8(float v, float id)
 {
     precise float q = roundEven(v * id);
@@ -56,15 +69,19 @@ void main()
     U Q = U(p.q256), Q32 = U(p.q32);
     /* token j of a block (workgroup y): positions 0 .. pos + j */
     uint j0 = gl_WorkGroupID.y;
-    uint runs = (RP(p.pos).v[0] + j0 + C) / C; /* npos / C, rounded up */
+    bool lst = set(p.list);
+    uint npos = lst ? RP(p.list).v[j0 * p.ls] : RP(p.pos).v[0] + j0 + 1u;
+    uint runs = (npos + C - 1u) / C; /* rounded up */
+    uint lo = !lst && p.window != 0u && npos > p.window ? npos - p.window : 0u;
+    uint c0 = lo / C; /* the first run attn_decode.comp computed */
     R PR = R(p.part);
     uint e = 256u * b + t, h = e / hd, i = e % hd;
     uint at = j0 * p.ps + h * p.nch * (hd + 2u);
-    float M = PR.v[at + hd];
-    for (uint c = 1u; c < runs; c++)
+    float M = PR.v[at + c0 * (hd + 2u) + hd];
+    for (uint c = c0 + 1u; c < runs; c++)
         M = max(M, PR.v[at + c * (hd + 2u) + hd]);
     float L = 0.0, a = 0.0;
-    for (uint c = 0; c < runs; c++) {
+    for (uint c = c0; c < runs; c++) {
         uint o = at + c * (hd + 2u);
         float f = exp(PR.v[o + hd] - M);
         L += PR.v[o + hd + 1u] * f;
@@ -85,10 +102,10 @@ void main()
     float m256 = 0.0;
     for (uint k = 0; k < 32u; k++)
         m256 = max(m256, m8[k]);
-    precise float dd = m256 * 0.007874015718698502;
-    float id = dd > 0.0 ? recip_det(dd) : 0.0;
-    precise float d32 = m32 * 0.007874015718698502;
-    float id32 = d32 > 0.0 ? recip_det(d32) : 0.0;
+    precise float dd = div_cr(m256, 127.0);
+    float id = dd > 0.0 ? div_cr(1.0, dd) : 0.0;
+    precise float d32 = div_cr(m32, 127.0);
+    float id32 = d32 > 0.0 ? div_cr(1.0, d32) : 0.0;
     int qa = q8(v, id), qb = q8(v, id32);
     /* four quants a word, from four neighbouring threads */
     uint wa = subgroupClusteredOr((uint(qa) & 0xffu) << (8u * (t % 4u)), 4u);
@@ -113,8 +130,7 @@ void main()
             int sb0 = s8b[4u * t] + s8b[4u * t + 1u], sb1 = s8b[4u * t + 2u] + s8b[4u * t + 3u];
             Q32.v[base + 64u + t] = (uint(sb0) & 0xffffu) | (uint(sb1) << 16);
             precise float dt =
-                max(max(m8[4u * t], m8[4u * t + 1u]), max(m8[4u * t + 2u], m8[4u * t + 3u])) *
-                0.007874015718698502;
+                div_cr(max(max(m8[4u * t], m8[4u * t + 1u]), max(m8[4u * t + 2u], m8[4u * t + 3u])), 127.0);
             Q32.v[base + 72u + t] = floatBitsToUint(dt);
         }
     }
