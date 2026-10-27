@@ -24,17 +24,17 @@
 
 Janas-LLM's figures are the best of the configurations `janas-bench` measures: the GPU reading a prompt's blocks, or on the smaller dense models (Qwen3-4B and smaller, Gemma-4-E2B and E4B) the NPU; llama.cpp ran with its Vulkan backend on the same GPU, the API Janas-LLM uses (on the two models larger than the memory it wrote with its CPU backend, faster there); the conditions are the same wherever the two engines allow it, and the main README says where they are not. † llama.cpp's figures of 11 October. On another machine the figures will be other ones: `janas-bench` measures yours (below). How they were taken, and everything else: <https://github.com/prabanta-dev/janas>.
 
-**Long contexts: at 16,384 tokens Janas-LLM writes a reply at 15.0 tok/s, where llama.cpp manages 2.2, and reads the prompt at 56 tok/s, against 31.** Qwen3-4B Q4_K_M on the same laptop, the CPU alone on both sides (12 threads), the same file, 26 October 2026; a prompt read from the start, then 64 tokens written after it:
+**Long contexts: at 8,192 tokens Janas-LLM writes a reply at 18.2 tok/s, where llama.cpp manages 4.9, and reads the prompt at 74 tok/s, against 20 - both keeping keys and values at eight bits.** Qwen3-4B Q4_K_M on the same laptop, the CPU alone on both sides (12 threads), the same file, 26-27 October 2026; a prompt read from the start, then 64 tokens written after it:
 
 | Context | reading the prompt: Janas-LLM | llama.cpp | writing after it: Janas-LLM | llama.cpp |
 |---|---|---|---|---|
-| 1,024 tokens | 118 tok/s | 67 | 27.6 tok/s | 12.5 |
-| 4,096 | 96 | 55 | 22.0 | 7.7 |
-| 8,192 | 74 | 44 | 18.2 | 4.6 |
-| 16,384 | 56 | 31 | 15.0 | 2.2 |
+| 1,024 tokens | 118 tok/s | 54 | 27.6 tok/s | 12.1 |
+| 4,096 | 96 | 32 | 22.0 | 7.5 |
+| 8,192 | 74 | 20 | 18.2 | 4.9 |
+| 16,384 | 56 | under 9.1 | 15.0 | - |
 | 32,000 | 35 | - | 10.7 | - |
 
-The longer the context, the wider the gap: 2.2 times as fast writing at 1,024 tokens, 6.9 times at 16,384. Both slow down as the context grows, and on both the attention is what grows: at 32,000 tokens it takes 59 of the 93 ms Janas-LLM spends on a token written, and the 32,000 tokens of prompt take 15 minutes to read. Janas-LLM's peak memory went from 2.6 GiB at 1,024 tokens to 4.9 at 32,000. The conditions are the same wherever possible; where not: Janas-LLM keeps the keys and values at eight bits, llama.cpp at sixteen (its default); llama.cpp was not run at 32,000 tokens (almost another hour). How it was measured: [the README on GitHub](https://github.com/prabanta-dev/janas#how-the-figures-were-measured).
+The longer the context, the wider the gap: 2.3 times as fast writing at 1,024 tokens, 3.7 times at 8,192. Both slow down as the context grows, and on both the attention is what grows: at 32,000 tokens it takes 59 of the 93 ms Janas-LLM spends on a token written, and the 32,000 tokens of prompt take 15 minutes to read. Janas-LLM's peak memory went from 2.6 GiB at 1,024 tokens to 4.9 at 32,000. The same conditions on both sides: keys and values at eight bits (llama.cpp's q8_0 cache, with its flash attention, which q8_0 values need). llama.cpp had not finished reading 16,384 tokens after 30 minutes, so its writing there was not measured, nor anything at 32,000. With its default sixteen-bit cache llama.cpp read faster (67, 55, 44 and 31 tok/s at 1,024 to 16,384 tokens) and wrote about as fast (12.5, 7.7, 4.6 and 2.2). How it was measured: [the README on GitHub](https://github.com/prabanta-dev/janas#how-the-figures-were-measured).
 
 **New: Gemma 4 whole on the GPU, Llama 3, and `janas-nsm`.** Gemma 4's four models - 12B, the 26B mixture, E2B and E4B - now run every layer of a token on the GPU, with the GPU's norms and quantizations giving the CPU's bits: Gemma-4-12B agrees with llama.cpp at 367 of 400 most likely tokens on the GPU, at 362 on the CPU. Llama 3 models run too, a LoRA adapter merged into one by `tools/hf2gguf`: DeepNSM-1B (Llama-3.2-1B with the adapter of [arXiv 2505.11764](https://arxiv.org/abs/2505.11764)) writes its answers at 57.8 tok/s on the laptop's CPU, where llama.cpp writes 37.9 to 39.8 on the same file. `janas-nsm` asks it for a word's explication in the Natural Semantic Metalanguage - Goddard and Wierzbicka's sixty-odd semantic primes, the words every language has - and counts it as the paper does; it can also restrict the model's output to those words alone. A research tool, and a sign of how far this project means to go: [docs/tools.md](https://github.com/prabanta-dev/janas/blob/main/docs/tools.md#janas-nsm).
 
