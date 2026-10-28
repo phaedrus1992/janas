@@ -406,7 +406,9 @@ static int run_gpu(struct janas_gpu *g, const struct kase *c, struct diff *d,
     size_t rows = t.rows;
     int waited;
     shader[0] = 0;
-    if (janas_gpu_begin(g, &t, &rows, 1) != 0)
+    /* what the engine would not give the GPU (a misaligned block: only
+       some drivers read words off a 4-byte boundary) the CPU computes */
+    if (!janas_gpu_can(g, &t) || janas_gpu_begin(g, &t, &rows, 1) != 0)
         return -1;
     if (janas_gpu_finish(g, &waited) != 0)
         return -2;

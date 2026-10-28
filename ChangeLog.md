@@ -2,6 +2,10 @@
 
 > Curated, user-facing summary of completed work, newest first.
 
+## [2026-10-28] - gpu_check asks what the engine asks
+
+- **`gpu_check` no longer runs on the GPU a product the engine would leave to the CPU** (issue #46): its "every row on the GPU" pass called the GPU without asking whether it takes the product, and one of its shapes starts a row into the buffer, two bytes off a 4-byte boundary for the blocks of 110, 210, 82, 50, 66, 74 and 98 bytes (Q3_K, IQ3_S, Q6_K, Q6_K_P, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS). The engine never gives those to the GPU (`janas_gpu_can` wants their weights 4-byte aligned, as model files keep them); the Arc read them right anyway, AMD's driver did not, and gpu_check reported 164 wrong products on a Radeon 890M. Now they are counted as left to the CPU, as the engine computes them: on the laptop's Arc 3,980 products, 0 wrong, 220 left to the CPU.
+
 ## [2026-10-26] - The GPU's attention nearer the CPU's
 
 - **The attention's scores the way this processor computes them faster**: in float over the query as it is, or over the query at sixteen bits (an integer sum), measured on the calls themselves - every 4,096 positions eight calls each way, a token's and a block's apart - in place of the sixteen-bit query only past 16,384 tokens of context. The two agree with llama.cpp alike: the most likely token at 2,961 of 3,200 positions with the sixteen-bit query, 2,963 in float (Qwen3 0.6B and 4B, Qwen3.5 0.8B and 2B, prose and code or instructions), mean |diff| 0.3033 and 0.3037. Qwen3-4B on the laptop's CPU, which takes the sixteen-bit way: a token written after 4,096 tokens 22.0 to 23.4 tok/s (the attention 10.7 to 8.2 ms), after 8,192 18.2 to 19.6; the prompts 95.9 to 99.6 and 74.0 to 78.7. `JANAS_ATTN=float` or `int16` fixes it.
