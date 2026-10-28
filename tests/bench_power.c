@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/aligned.h"
 #include "llm/gpu.h"
 #include "llm/matvec.h"
 #include "llm/quant.h"
@@ -154,7 +155,7 @@ int main(int argc, char **argv)
     struct ctx c;
     size_t nb = COLS / JANAS_QK, wbytes = (size_t)NMAT * ROWS * nb * 144;
     wbytes = (wbytes + 4095) / 4096 * 4096;
-    c.w = aligned_alloc(4096, wbytes);
+    c.w = janas_aligned_alloc(4096, wbytes);
     srand(1);
     for (size_t i = 0; i < wbytes; i++)
         c.w[i] = (uint8_t)rand();

@@ -1,0 +1,93 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// Q2_K weights times up to NV Q8_K vectors, one row per invocation, as
+// janas_q2k_dot_ref computes them: 84 bytes a block (sixteen bytes of a
+// group of 16's scale and minimum, a nibble each; 64 of two-bit weights,
+// weight e at bits 2 j of byte 32 n + l for e = 128 n + 32 j + l; d and
+// dmin), the block's exact integer sums - the scales times each group's
+// dot, the minima times its activations' sum - each in one fma into an
+// accumulator of its own, with d d8 and dmin d8, the second taken from the
+// first at the end: the CPU's float operations, so the results agree bit
+// for bit. Activations shared across the subgroup as in q4k_matvec.comp.
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8;
+layout(constant_id = 1) const uint SG = 8;
+const uint NX = (19u + SG - 1u) / SG;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
+
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+
+int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+int dp4(uvec4 a, uvec4 b) { return dp(a.x, b.x) + dp(a.y, b.y) + dp(a.z, b.z) + dp(a.w, b.w); }
+uvec4 bc(uvec4 xr[NX], uint k) { return subgroupBroadcast(xr[k / SG], k % SG); }
+
+void main()
+{
+    U1 W = U1(p.w);
+    U4 X = U4(p.x);
+    F Y = F(p.y);
+    uint lane = gl_SubgroupInvocationID;
+    uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
+    uint xo[NV];
+    for (uint v = 0; v < NV; v++)
+        xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
+    float acc[NV], accm[NV];
+    for (uint v = 0; v < NV; v++) {
+        acc[v] = 0.0;
+        accm[v] = 0.0;
+    }
+    uint off = row * p.nb * 21u; /* words: 84 bytes a block */
+    for (uint b = 0; b < p.nb; b++, off += 21u) {
+        uint wd[21];
+        for (uint k = 0; k < 21u; k++)
+            wd[k] = W.v[off + k];
+        vec2 dm = unpackHalf2x16(wd[20]);
+        /* group g of 16: four words of its weights, unsigned (0-3), its
+           scale and minimum */
+        uvec4 q[16];
+        int sc[16], mn[16];
+        for (uint g = 0; g < 16u; g++) {
+            uint n = g / 8u, j = (g % 8u) / 2u, l0 = 16u * (g % 2u);
+            uint w0 = 4u + (32u * n + l0) / 4u; /* qs from byte 16 */
+            q[g] = uvec4((wd[w0] >> (2u * j)) & 0x03030303u,
+                         (wd[w0 + 1u] >> (2u * j)) & 0x03030303u,
+                         (wd[w0 + 2u] >> (2u * j)) & 0x03030303u,
+                         (wd[w0 + 3u] >> (2u * j)) & 0x03030303u);
+            uint s = (wd[g / 4u] >> (8u * (g % 4u))) & 0xffu;
+            sc[g] = int(s & 15u);
+            mn[g] = int(s >> 4);
+        }
+        for (uint v = 0; v < NV; v++) {
+            uvec4 xr[NX];
+            for (uint j = 0; j < NX; j++)
+                xr[j] = X.v[xo[v] + min(j * SG + lane, 19u)];
+            uvec4 b0 = bc(xr, 16u), b1 = bc(xr, 17u);
+            uint bw[8] = uint[8](b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w);
+            int sumi = 0, summ = 0;
+            for (uint g = 0; g < 16u; g++) {
+                sumi += sc[g] * dp4(q[g], bc(xr, g));
+                summ += mn[g] * bitfieldExtract(int(bw[g / 2u]), 16 * int(g % 2u), 16);
+            }
+            float d8 = uintBitsToFloat(bc(xr, 18u).x);
+            acc[v] = fma(dm.x * d8, float(sumi), acc[v]);
+            accm[v] = fma(dm.y * d8, float(summ), accm[v]);
+            xo[v] += 20u;
+        }
+    }
+    if (grow < p.rows)
+        for (uint v = 0; v < NV; v++)
+            if (v0 + v < p.nv)
+                Y.v[(v0 + v) * p.ys + row] = acc[v] - accm[v];
+}

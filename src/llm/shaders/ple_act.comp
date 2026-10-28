@@ -1,0 +1,62 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// Gemma 4's per-layer embeddings (E2B, E4B): a layer's branch after its
+// gate, h = GELU(gate) times the layer's own inputs, bit for bit as the
+// CPU's janas_gelu_mul_det (src/llm/vmath.h; model_ple.c
+// janas_m_ple_layer): the deterministic e^x and reciprocal. A value an
+// invocation: token j's gate at g[j P + i], its inputs at in[j W + i] (in
+// already offset to the layer's), h at h[j P + i].
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FO { float v[]; };
+
+layout(push_constant) uniform P { uvec2 g, in_, h; uint n, pd, w; } p;
+
+float exp_det(float x)
+{
+    precise float xc = clamp(x, -88.0, 88.0);
+    precise float n = roundEven(xc * 1.44269504088896341);
+    precise float r = fma(-n, 0.693359375, xc);
+    r = fma(-n, -2.12194440e-4, r);
+    precise float y = 1.9875691500e-4;
+    y = fma(y, r, 1.3981999507e-3);
+    y = fma(y, r, 8.3334519073e-3);
+    y = fma(y, r, 4.1665795894e-2);
+    y = fma(y, r, 1.6666665459e-1);
+    y = fma(y, r, 5.0000001201e-1);
+    precise float rr = r * r;
+    y = fma(y, rr, r);
+    y = y + 1.0;
+    return y * uintBitsToFloat(uint(int(n) + 127) << 23);
+}
+
+float recip_det(float d)
+{
+    precise float y = uintBitsToFloat(0x7EF311C3u - floatBitsToUint(d));
+    for (int i = 0; i < 3; i++) {
+        precise float e = fma(-d, y, 1.0);
+        y = fma(y, e, y);
+    }
+    return y;
+}
+
+void main()
+{
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= p.n * p.pd)
+        return;
+    uint j = k / p.pd, i = k % p.pd;
+    float gv = F(p.g).v[k], uv = F(p.in_).v[j * p.w + i];
+    /* GELU(g) = g / (1 + e^-2z), z = sqrt(2/pi) (g + 0.044715 g^3) */
+    precise float z2 = 1.5957691216057308 * fma(0.044715 * gv, gv * gv, gv);
+    precise float e = exp_det(clamp(-z2, -88.0, 30.0));
+    precise float s = recip_det(1.0 + e);
+    precise float gs = gv * s;
+    precise float hv = gs * uv;
+    FO(p.h).v[k] = hv;
+}

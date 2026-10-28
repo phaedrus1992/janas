@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "jmath.h"
+
 struct cand {
     float logit;
     int32_t id;
@@ -263,8 +265,8 @@ static void learn(struct janas_sampler *s, const float *lg, int32_t t,
     float mx = lg[argmax(lg, s->nv)];
     double sum = 0;
     for (uint32_t i = 0; i < s->nv; i++)
-        sum += exp((double)(lg[i] - mx));
-    float lse = mx + (float)log(sum);
+        sum += janas_exp((double)(lg[i] - mx));
+    float lse = mx + (float)janas_log(sum);
     lp->logprob = lg[t] - lse;
     lp->n_top = 0;
     if (s->p.logprobs > 0) {
@@ -308,7 +310,8 @@ static int32_t draw(struct janas_sampler *s, const float *lg, int filtered)
     double sum = 0;
     for (uint32_t i = 0; i < nc; i++) {
         /* the probability, unnormalized, in place of the logit */
-        s->cands[i].logit = expf((s->cands[i].logit - top) / o->temperature);
+        s->cands[i].logit =
+            janas_expf((s->cands[i].logit - top) / o->temperature);
         sum += s->cands[i].logit;
     }
     if (o->top_p > 0 && o->top_p < 1) {

@@ -1,0 +1,66 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's indexer, second step (model_qsa.c pool_block): the blocks of
+// r positions a block of n tokens at pos completes, workgroup x = w the
+// w-th from block pos / r on (those not complete by pos + n leave): the
+// mean of its r raw keys (half precision, d a row), normalized (rms norm
+// with the weights kn) and its first n_rot numbers turned for the block's
+// first position (row rb + w of rope, which the caller wrote), into row b
+// of pool.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RU { uint v[]; };
+
+layout(push_constant) uniform P {
+    uvec2 raw, kn, rope, pool, pos;
+    uint d, r, n, n_rot, rb;
+    float eps;
+} p;
+
+shared float sv[256];
+shared float ss[256];
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x, d = p.d;
+    uint pos = RU(p.pos).v[0], b = pos / p.r + w;
+    if ((b + 1u) * p.r > pos + p.n)
+        return; /* the whole workgroup: not complete */
+    RU RAW = RU(p.raw);
+    float x = 0.0;
+    if (t < d) {
+        for (uint k = 0; k < p.r; k++) {
+            uint wd = RAW.v[((b * p.r + k) * d + t) / 2u];
+            x += unpackHalf2x16(wd)[t % 2u];
+        }
+        x /= float(p.r);
+    }
+    ss[t] = x * x;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s)
+            ss[t] += ss[t + s];
+        barrier();
+    }
+    float scale = 1.0 / sqrt(ss[0] / float(d) + p.eps);
+    if (t < d)
+        sv[t] = x * scale * R(p.kn).v[t];
+    barrier();
+    uint half_ = p.n_rot / 2u, row = p.rb + w;
+    if (t < d) {
+        float v = sv[t];
+        if (t < p.n_rot) {
+            R RO = R(p.rope);
+            uint i = t % half_;
+            float c = RO.v[row * p.n_rot + i], s = RO.v[row * p.n_rot + half_ + i];
+            v = t < half_ ? sv[t] * c - sv[t + half_] * s : sv[t - half_] * s + sv[t] * c;
+        }
+        W(p.pool).v[b * d + t] = v;
+    }
+}

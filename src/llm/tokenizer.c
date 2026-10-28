@@ -28,9 +28,10 @@ struct janas_tokenizer {
     uint8_t cp_byte[512]; /* byte-level code point -> byte */
     int32_t *special;     /* ids of the special tokens, longest first */
     uint32_t n_special;
-    int marks; /* words take combining marks too (the qwen35 expression) */
-    int spm;   /* SentencePiece style (gemma4): raw UTF-8 characters, spaces
-                  written as U+2581, unknown characters as <0xXX> bytes */
+    int marks;  /* words take combining marks too (the qwen35 expression) */
+    int digits; /* a number's digits taken together, up to: 1, Llama 3's 3 */
+    int spm;    /* SentencePiece style (gemma4): raw UTF-8 characters, spaces
+                   written as U+2581, unknown characters as <0xXX> bytes */
 };
 
 static uint64_t hash_bytes(const char *s, size_t n)
@@ -209,6 +210,7 @@ struct janas_tokenizer *janas_tokenizer_create(const struct janas_jns *j,
     }
     t->n = (uint32_t)n;
     t->marks = strcmp(pre, "qwen35") == 0;
+    t->digits = strcmp(pre, "llama-bpe") == 0 ? 3 : 1;
     t->spm = strcmp(model, "gemma4") == 0;
     uint64_t total = 0;
     const uint8_t *p = toks;
@@ -360,9 +362,11 @@ int32_t janas_tokenizer_find(const struct janas_tokenizer *t, const char *s)
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
  *   | ' '?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  * With marks (Qwen3.5 and later), \p{L} in the word runs and in the
- * punctuation alternative's exclusion becomes [\p{L}\p{M}].
+ * punctuation alternative's exclusion becomes [\p{L}\p{M}]. With digits 3
+ * (Llama 3), \p{N} becomes \p{N}{1,3}.
  */
-static size_t pretoken_end(const uint32_t *cp, size_t n, size_t i, int marks)
+static size_t pretoken_end(const uint32_t *cp, size_t n, size_t i, int marks,
+                           int digits)
 {
 #define WORD(c) (is_letter(c) || (marks && is_mark(c)))
     uint32_t c = cp[i];
@@ -390,8 +394,12 @@ static size_t pretoken_end(const uint32_t *cp, size_t n, size_t i, int marks)
             k++;
         return k;
     }
-    if (is_number(c))
-        return i + 1;
+    if (is_number(c)) {
+        size_t e = i + 1;
+        while (e < n && e - i < (size_t)digits && is_number(cp[e]))
+            e++;
+        return e;
+    }
     k = i + (c == ' ');
     if (k < n && !is_space(cp[k]) && !WORD(cp[k]) && !is_number(cp[k])) {
         while (k < n && !is_space(cp[k]) && !WORD(cp[k]) && !is_number(cp[k]))
@@ -604,7 +612,7 @@ static int encode_plain(const struct janas_tokenizer *t, const char *text,
     }
     at[n] = len;
     for (size_t i = 0; i < n;) {
-        size_t e = pretoken_end(cp, n, i, t->marks);
+        size_t e = pretoken_end(cp, n, i, t->marks, t->digits);
         bpe(t, (const unsigned char *)text + at[i], at[e] - at[i], out, max,
             count);
         i = e;
