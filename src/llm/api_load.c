@@ -136,11 +136,13 @@ static int add_ids(janas_llm_chat *c, const int32_t *ids, uint32_t n)
  * An assistant's message the model did not write here (or not lately): as
  * the template writes it, with its calls. A Qwen3.5 or 3.6 template gives
  * the turns after the user's last question their reasoning back, empty
- * when there is none to give.
+ * when there is none to give; a Qwen3.8 one every turn (think_kept).
  */
 static int add_assistant(janas_llm_chat *c, const struct cmsg *m, int after_q)
 {
     const janas_llm *llm = c->llm;
+    if (llm->format == FORMAT_LLAMA3) /* no reasoning, no tools */
+        return janas_api_add_message(c, llm->asst_role, m->text, m->n) ? -1 : 0;
     enum janas_tool_dialect d = llm->tools;
     int err = janas_api_add_special(c, llm->im_start);
     /* Qwen3-Coder writes the calls right after the role */
@@ -148,7 +150,7 @@ static int add_assistant(janas_llm_chat *c, const struct cmsg *m, int after_q)
     err |= janas_api_add_text(c, llm->asst_role, strlen(llm->asst_role));
     if (!bare)
         err |= janas_api_add_text(c, "\n", 1);
-    if (d == JANAS_TOOLS_XML && llm->thinker && after_q)
+    if (d == JANAS_TOOLS_XML && llm->thinker && (after_q || llm->think_kept))
         err |= janas_api_add_markup(c, "<think>\n\n</think>\n\n", 19);
     if (m->n_calls && d != JANAS_TOOLS_NONE) {
         struct janas_buf b = {0};
@@ -159,7 +161,7 @@ static int add_assistant(janas_llm_chat *c, const struct cmsg *m, int after_q)
         err |= janas_api_add_text(c, m->text, m->n);
     }
     err |= janas_api_add_special(c, llm->im_end);
-    err |= janas_api_add_text(c, "\n", 1);
+    err |= janas_api_end_turn_nl(c);
     return err ? -1 : 0;
 }
 
@@ -195,8 +197,8 @@ static size_t add_gemma_turn(janas_llm_chat *c, size_t i, int reopen, int *open)
         j < c->n_msgs && c->msgs[j].role == JANAS_LLM_ROLE_ASSISTANT;
     *open = next_model || (j == c->n_msgs && k > 0);
     if (!*open)
-        err |= janas_api_add_special(c, llm->im_end) ||
-               janas_api_add_text(c, "\n", 1);
+        err |=
+            janas_api_add_special(c, llm->im_end) || janas_api_end_turn_nl(c);
     return err ? (size_t)-1 : j - 1;
 }
 
@@ -210,9 +212,10 @@ static int render(janas_llm_chat *c, uint32_t *reply_off)
         if (c->msgs[i].role == JANAS_LLM_ROLE_USER)
             last_q = i;
     int err = janas_api_begin_sequence(c);
-    if (llm->format == FORMAT_GEMMA && !c->tools_sys &&
-        c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM)
-        err |= janas_api_add_system(c, NULL, 0); /* <|think|>, if asked */
+    if ((llm->format == FORMAT_GEMMA || janas_api_think_note(c)) &&
+        !c->tools_sys && c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM)
+        err |= janas_api_add_system(c, NULL, 0); /* <|think|>, or the words
+                                                    on reasoning, if asked */
     if (c->tools_sys && c->msgs[0].role != JANAS_LLM_ROLE_SYSTEM) {
         /* with tools there is a system message whatever the caller says */
         err |= janas_api_add_system(c, NULL, 0);
@@ -253,7 +256,7 @@ static int render(janas_llm_chat *c, uint32_t *reply_off)
                 err |= add_ids(c, mm->ids, mm->n);
                 if (!mm->closed)
                     err |= janas_api_add_special(c, llm->im_end);
-                err |= janas_api_add_text(c, "\n", 1);
+                err |= janas_api_end_turn_nl(c);
             } else {
                 err |= add_assistant(c, m, i > last_q);
             }
@@ -275,7 +278,7 @@ static int render(janas_llm_chat *c, uint32_t *reply_off)
             err |= janas_api_add_markup(c, "\n</tool_response>", 17);
             if (last)
                 err |= janas_api_add_special(c, llm->im_end) ||
-                       janas_api_add_text(c, "\n", 1);
+                       janas_api_end_turn_nl(c);
             break;
         }
         }
@@ -436,7 +439,9 @@ int32_t janas_llm_chat_prompt(janas_llm_chat *c, const char *text, int32_t len)
     c->n_ids = c->n_text = 0;
     c->n_turn = 0;
     c->sys_tokens = 0;
-    if (janas_api_add_text(c, text, janas_api_text_len(text, len)) != 0)
+    /* Llama 3's text starts with <|begin_of_text|>, as its tokenizer adds */
+    if ((c->llm->format == FORMAT_LLAMA3 && janas_api_begin_sequence(c)) ||
+        janas_api_add_text(c, text, janas_api_text_len(text, len)) != 0)
         return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
     c->in_think = 0;
     return load_ids(c, UINT32_MAX);

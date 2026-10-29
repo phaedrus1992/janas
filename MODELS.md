@@ -123,6 +123,16 @@ e40ec6c58ef2390c7a4ce8c9b7b6b384ed4e55c9980f646d1c98e83e2c018115  qwen3.5-9b-q4k
 138d1db3af7e48d3bd36a428f7a81dfd8813434521aced84459c546e4830ab5b  qwen3.8-27b-ud-q4kxl.jns   (gguf2jns)
 ```
 
+**Qwen3.8-Flash-Next**, a mixture of 512 experts, from [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) at revision `ed59f920`, ISTA's GSQ-RCO quantization in Q2_0 (folder `Q2_0`), a quantization of [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) at `de4b8e4d`. Two parts, the first given to `gguf2jns`, which reads the second beside it; converted in one step. Its multi-token prediction block is a GGUF file of its own, from [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) at `766911a6` (folder `MTP`), copied by `hf2jns_mtp` with the converted model ([how](docs/models.md)); two runs of it give the same bytes. Under the Qwen Community License 1.0, not Apache 2.0 ([below](#what-this-project-redistributes)).
+
+```
+69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720  Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113  Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+b5b4dbe4e3ae01bffc41acefa0d1e62afdfe4b5b9bc24c2a3fab591a41f9087f  qwen3.8-flash-next-gsq-q20.jns   (gguf2jns)
+8087dbb39fc73f79ac069b1debe4069a44b73ada900c8bd761569d43a5a90231  mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+d9c9dd94ef2e52391613db98c2e34c574341c48ab8752454696534d0f69a29ca  qwen3.8-flash-next-mtp-q4km.jns   (hf2jns_mtp)
+```
+
 **Qwen3-30B-A3B**, from [`Qwen/Qwen3-30B-A3B-GGUF`](https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF):
 
 ```
@@ -222,7 +232,7 @@ The same tensors from shards on disk give the same bytes. A private or gated rep
 
 **The converter, always. The weights, only when their licence plainly allows it.** In order:
 
-1. **Models under Apache 2.0, MIT or a similar licence.** Every model Janas supports today is under **Apache 2.0** and none is gated: Qwen3-Next (including Qwen3-Coder-Next), Qwen3.5, Qwen3.6 and Qwen3.8-27B, and Qwen3 MoE — checked on their pages, not in their files. Converted files may be published, and when they are, they carry:
+1. **Models under Apache 2.0, MIT or a similar licence.** Every model Janas supports but one is under **Apache 2.0** and none is gated: Qwen3-Next (including Qwen3-Coder-Next), Qwen3.5, Qwen3.6 and Qwen3.8-27B, Qwen3 MoE and Gemma 4 — checked on their pages, not in their files. The one is **Qwen3.8-Flash-Next**, under the **Qwen Community License 1.0** (on [its page](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)): use, copies, changes and redistribution are allowed with its notice, but a product above 100 million monthly users or US$ 20 million a month must show the model's name, and a business offering models as a service or an AI work assistant needs a separate licence from Qwen for commercial use. ISTA-DASLab's GGUF of it says Apache 2.0 in its card; the model's page is the licence. Its converted files are published with that notice: [`prabanta-dev/Qwen3.8-Flash-Next-JNS`](https://huggingface.co/prabanta-dev/Qwen3.8-Flash-Next-JNS) carries the Qwen Community License as the model's repository gives it, and `janas-get qwen3.8-flash-next --from-gguf` converts ISTA's GGUF on your machine instead. Converted files of all of them may be published, and when they are, they carry:
    - a link to the original model and to its licence;
    - the original `LICENSE` and, where there is one, the `NOTICE`;
    - a statement of what was changed (the list above) and which version of the tools did it;
