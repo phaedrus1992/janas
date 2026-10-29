@@ -121,7 +121,7 @@ static void store(void)
     CHECK(f, "open: %s", err);
     if (!f)
         return;
-    struct srv_file a, b, c, x;
+    struct srv_file a, b, c, d, x;
     CHECK(srv_files_add(f, "C:\\docs\\a.jsonl", "batch", "abc", 3, 0, &a, err,
                         sizeof err) == 0 &&
               !strcmp(a.filename, "a.jsonl"),
@@ -131,7 +131,7 @@ static void store(void)
               !strcmp(b.filename, "b.txt") &&
               b.expires_at == b.created_at + 3600,
           "add b");
-    CHECK(srv_files_add(f, "c", "assistants", "xyz", 3, 1, &c, err,
+    CHECK(srv_files_add(f, "c", "assistants", "xyz", 3, 0, &c, err,
                         sizeof err) == 0,
           "add c");
     struct srv_file *l;
@@ -145,8 +145,13 @@ static void store(void)
     n = srv_files_list(f, "batch", 0, NULL, &l);
     CHECK(n == 1 && !strcmp(l[0].id, a.id), "by purpose");
     free(l);
-    sleep(2); /* c expires */
-    CHECK(srv_files_get(f, c.id, &x) != 0, "an expired file still there");
+    /* d expires: added after the listings, which a slow disk (Windows'
+       runners) could otherwise outlast */
+    CHECK(srv_files_add(f, "d", "assistants", "xyz", 3, 1, &d, err,
+                        sizeof err) == 0,
+          "add d");
+    sleep(2);
+    CHECK(srv_files_get(f, d.id, &x) != 0, "an expired file still there");
     int fd = srv_files_open_content(f, a.id);
     char got[8] = {0};
     CHECK(fd >= 0 && read(fd, got, 8) == 3 && !memcmp(got, "abc", 3),
