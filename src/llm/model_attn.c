@@ -318,9 +318,16 @@ void janas_m_attn_core(struct janas_llm_model *m, const struct layer *ly,
     /* attention takes JANAS_LLM_MAX_BLOCK tokens a call; the keys and values
        of the whole block are in the cache already, and each piece sees the
        positions up to its own end, as the block would */
+    /* a picture whose tokens see one another: each sees to its end */
+    int both = m->n_media && janas_m_media_both(m, pos0, n);
+    if (both)
+        janas_m_media_last(m, pos0, n, m->att_last);
     for (uint32_t s = 0; s < n; s += JANAS_LLM_MAX_BLOCK) {
         uint32_t len =
             n - s < JANAS_LLM_MAX_BLOCK ? n - s : JANAS_LLM_MAX_BLOCK;
+        if (both)
+            janas_attn_set_last(ly->swa ? m->attn_swa : m->attn,
+                                m->att_last + s);
         janas_attn_run(ly->swa ? m->attn_swa : m->attn, m->compute,
                        m->q + (size_t)s * qd, kc, kcs, vc, vcs, len, pos0 + s,
                        m->att + (size_t)s * qd);

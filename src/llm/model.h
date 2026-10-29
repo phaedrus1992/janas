@@ -49,6 +49,8 @@ struct janas_llm_options {
                         choice to the engine: every bit when the experts fit
                         in cache_bytes, four otherwise (environment
                         JANAS_EXPERT_BITS overrides) */
+    int min_quality; /* JANAS_LLM_QUALITY_*: the lowest the engine's own
+                        choices go (expert bits, experts left out) */
     int head_bits;   /* 4: the output head, if the file holds it at six bits
                         (Q6_K), requantized to four (Q4_K) at load - faster, a
                         little less accurate; 0 or 6: as in the file
@@ -61,6 +63,8 @@ struct janas_llm_options {
                         experts (janas_llm_open); 0: read a row at a time
                         from the file (environment JANAS_PLE_RAM=0/1
                         overrides) */
+    uint32_t min_block; /* the prefill block at least this (a picture whose
+                           tokens attend both ways goes in one pass) */
 };
 
 struct janas_llm_model;
@@ -152,9 +156,9 @@ double janas_llm_model_pass_seconds(const struct janas_llm_model *m);
  * the expert cache) the GPU's fast prompt takes whole (gate and up Q4_K,
  * down Q4_K or Q6_K, plain or in planes; janas_gpu_fast_prompt on), else
  * 256;
- * 64 .. 4096.
+ * 64 .. 4096; at_least raises it (pictures in one pass).
  */
-uint32_t janas_llm_prefill_block(const struct janas_jns *j);
+uint32_t janas_llm_prefill_block(const struct janas_jns *j, uint32_t at_least);
 
 /* The model's own layers in j: all of them less an MTP block in the file
    (qwen35moe: nextn_predict_layers, the last ones). */
@@ -222,6 +226,30 @@ struct janas_llm_state *janas_llm_state_read(const struct janas_llm_model *m,
                                              FILE *f);
 
 /* One token at position pos: janas_llm_model_forward with n = 1. */
+/*
+ * Pictures in the sequence (model_media.c): the nx * ny embeddings
+ * (d_model wide, row-major over the grid) taken for the tokens at
+ * at .. at + nx * ny - 1 in place of theirs, with positions for the RoPE
+ * of their row and column; the text after a picture goes on from its start
+ * plus max(nx, ny), as Qwen3-VL's get_rope_index has it. both_ways: its
+ * tokens see one another, the later ones too (Gemma 4 12B and 26B), so
+ * a pass must hold the whole picture. _add: 0, or -1 (memory, overlap, no
+ * room). _drop: those that begin at or after `from`
+ * forgotten (one cut by it as well). _count: how many there are.
+ */
+int janas_llm_model_media_add(struct janas_llm_model *m, uint32_t at,
+                              const float *embd, uint32_t nx, uint32_t ny,
+                              int both_ways);
+void janas_llm_model_media_drop(struct janas_llm_model *m, uint32_t from);
+/* A pass of n tokens from pos0 shortened so that it does not cut a picture
+   whose tokens attend both ways: ending before it, or taking it whole. */
+uint32_t janas_llm_model_media_cut(const struct janas_llm_model *m,
+                                   uint32_t pos0, uint32_t n);
+uint32_t janas_llm_model_media_count(const struct janas_llm_model *m);
+/* The model's compute threads, for work between its passes (a picture's
+   encoding). */
+struct janas_pool *janas_llm_model_pool(const struct janas_llm_model *m);
+
 int janas_llm_model_decode(struct janas_llm_model *m, int32_t token,
                            uint32_t pos, float *logits);
 

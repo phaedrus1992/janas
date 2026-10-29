@@ -127,7 +127,10 @@ static void act_worker(void *arg, int tid, int n_threads)
         /* deterministic operations only, so that a GPU computing an
            expert gives the same bits */
         uint32_t r = 0;
-        if (m->a->gelu) {
+        if (m->a->nh) { /* relu^2 on up, no gate (Nemotron-H) */
+            for (; r < ff; r++)
+                h[r] = u[r] > 0.0f ? u[r] * u[r] : 0.0f;
+        } else if (m->a->gelu) {
 #if defined(__x86_64__)
             if (m->avx2)
                 r = gelu_mul_avx2(gt, u, h, ff);
@@ -163,6 +166,7 @@ struct router_job {
     struct janas_llm_model *m;
     const uint16_t *w;
     uint32_t n;
+    uint32_t ne; /* the layer's experts: the model's, or fewer (Nemotron-H) */
 };
 
 static float dot_f16_ref(const uint16_t *w, const float *x, uint32_t n)
@@ -199,7 +203,7 @@ static void router_worker(void *arg, int tid, int n_threads)
     struct router_job *r = arg;
     struct janas_llm_model *m = r->m;
     uint32_t ne = m->n_expert, dm = m->d_model;
-    for (uint32_t e = (uint32_t)tid; e < ne; e += (uint32_t)n_threads)
+    for (uint32_t e = (uint32_t)tid; e < r->ne; e += (uint32_t)n_threads)
         for (uint32_t j = 0; j < r->n; j++) {
             const float *x = m->xn + (size_t)j * dm;
             const uint16_t *w = r->w + (size_t)e * dm;
@@ -250,8 +254,11 @@ static void run_experts(struct janas_llm_model *m,
                         const struct expert_run *runs, uint32_t n_runs)
 {
     double t_enter = janas_m_exp_tracing() ? now() : 0;
-    uint32_t dm = m->d_model, ff = m->ff_buf;
+    /* dm: the experts' input and output width (the latent one of
+       Nemotron-H's mixtures), xs their input */
+    uint32_t dm = m->moe_w, ff = m->ff_buf;
     size_t nbd = dm / JANAS_QK, nbf = ff / JANAS_QK;
+    const struct janas_block_q8k *xs = m->moe_xq;
     struct janas_matvec_task t1[2 * MAX_RUNS], t2[MAX_RUNS];
     struct janas_neuron_run nr[MAX_RUNS]; /* down by neuron: no product */
     uint32_t ng = 0, n1 = 0, n2 = 0, nn = 0;
@@ -263,7 +270,7 @@ static void run_experts(struct janas_llm_model *m,
         uint32_t a = runs[r].a, cnt = runs[r].b - runs[r].a;
         for (uint32_t g = a; g < runs[r].b; g++)
             memcpy(m->xg + (size_t)g * nbd,
-                   m->xq + (size_t)m->pair_tok[m->order[g]] * nbd,
+                   xs + (size_t)m->pair_tok[m->order[g]] * nbd,
                    nbd * sizeof(*m->xg));
         if (nf_run < 0 && m->npu &&
             janas_m_npu_ffn_begin(m, runs[r].base, runs[r].plane, runs[r].mx,
@@ -274,7 +281,7 @@ static void run_experts(struct janas_llm_model *m,
         }
         for (uint32_t g = a; g < runs[r].b; g++) {
             m->glist[ng++] = g;
-            m->hlen[g] = runs[r].mx[0].rows;
+            m->hlen[g] = runs[r].mx[JANAS_JNS_UP].rows;
             if (m->nskipq)
                 m->nskipq[g] = runs[r].mx[JANAS_JNS_DOWN].type == JANAS_Q6_K_PN;
             if (m->ana_exp) /* the Ana-Net probe: the pair's expert */
@@ -283,6 +290,8 @@ static void run_experts(struct janas_llm_model *m,
         }
         for (int p = 0; p < 2; p++) {
             const struct janas_jns_matrix *mx = &runs[r].mx[p];
+            if (mx->type == 0)
+                continue; /* no gate */
             t1[n1++] = (struct janas_matvec_task){
                 .type = (int)mx->type,
                 .w = runs[r].base[p] + mx->offset,
@@ -423,7 +432,7 @@ int janas_m_route_rank(struct janas_llm_model *m, uint32_t l, uint32_t n,
         return -1;
     /* xn and router are free between layers: l + 1 norms into xn first */
     janas_m_norm_quant(m, f32(m, ly->ffn_norm), 0, n);
-    struct router_job rj = {m, ly->router16, n};
+    struct router_job rj = {m, ly->router16, n, ne};
     janas_pool_run(m->compute, router_worker, &rj); /* 512 x 2048 a layer */
     for (uint32_t j = 0; j < n; j++) {
         float *r = m->router + (size_t)j * ne;
@@ -507,9 +516,48 @@ void janas_m_prefetch_block(struct janas_llm_model *m, uint32_t l, uint32_t n)
     m->phase[JANAS_PH_ROUTER] += now() - t0;
 }
 
-/* The router's choice for token j: softmax, top-k, normalized weights. */
-static void route_tok(struct janas_llm_model *m, uint32_t j)
+/* Nemotron-H's choice for token j: sigmoid scores, the k best by score
+   plus the layer's bias, their scores as weights, normalized to one (at
+   least 2^-14 for the sum, as llama.cpp), times the model's scale. */
+static void route_sigmoid(struct janas_llm_model *m, const struct layer *ly,
+                          uint32_t j)
 {
+    uint32_t ne = ly->n_exp, k = m->k_use;
+    float *r = m->router + (size_t)j * m->n_expert, sel[4096];
+    for (uint32_t e = 0; e < ne; e++) {
+        r[e] = sigmoid(r[e]);
+        sel[e] = r[e] + ly->exp_bias[e];
+    }
+    float wsum = 0.0f;
+    for (uint32_t i = 0; i < k; i++) {
+        uint32_t best = 0;
+        float bv = -INFINITY;
+        for (uint32_t e = 0; e < ne; e++)
+            if (sel[e] > bv) {
+                bv = sel[e];
+                best = e;
+            }
+        sel[best] = -INFINITY; /* taken */
+        uint32_t p = j * k + i;
+        m->pair_tok[p] = j;
+        m->pair_exp[p] = best;
+        m->pair_w[p] = r[best];
+        wsum += r[best];
+    }
+    if (wsum < 6.103515625e-5f)
+        wsum = 6.103515625e-5f;
+    for (uint32_t i = 0; i < k; i++)
+        m->pair_w[j * k + i] = m->pair_w[j * k + i] / wsum * m->route_scale;
+}
+
+/* The router's choice for token j: softmax, top-k, normalized weights. */
+static void route_tok(struct janas_llm_model *m, const struct layer *ly,
+                      uint32_t j)
+{
+    if (ly && ly->exp_bias) {
+        route_sigmoid(m, ly, j);
+        return;
+    }
     uint32_t ne = m->n_expert, k = m->k_use;
     float *r = m->router + (size_t)j * ne, mx = -INFINITY, sum = 0.0f;
     for (uint32_t e = 0; e < ne; e++)
@@ -543,7 +591,7 @@ static void route_worker(void *arg, int tid, int n_threads)
 {
     struct tok_job *t = arg;
     for (uint32_t j = (uint32_t)tid; j < t->n; j += (uint32_t)n_threads)
-        route_tok(t->m, j);
+        route_tok(t->m, t->ly, j);
 }
 
 /* The experts' outputs added to the tokens: each token takes its own pairs
@@ -559,12 +607,12 @@ static void axpy_worker(void *arg, int tid, int n_threads)
 {
     struct axpy_job *a = arg;
     struct janas_llm_model *m = a->m;
-    uint32_t dm = m->d_model;
+    uint32_t w = m->moe_w;
     for (uint32_t j = (uint32_t)tid; j < a->n; j += (uint32_t)n_threads)
         for (uint32_t c = a->first[j]; c < a->first[j + 1]; c++) {
             uint32_t g = a->list[c];
-            janas_axpy_f32(m->x + (size_t)j * dm, m->pair_w[m->order[g]],
-                           m->dout + (size_t)g * dm, dm);
+            janas_axpy_f32(m->moe_out + (size_t)j * w, m->pair_w[m->order[g]],
+                           m->dout + (size_t)g * w, w);
         }
 }
 
@@ -591,9 +639,19 @@ static uint32_t skip_misses(struct janas_llm_model *m,
         wmax[m->pair_exp[p]] = 0.0f;
         mark[m->pair_exp[p]] = 0;
     }
-    for (uint32_t p = 0; p < np; p++)
-        if (m->pair_w[p] > wmax[m->pair_exp[p]])
-            wmax[m->pair_exp[p]] = m->pair_w[p];
+    /* a weight against its token's sum: the router's may sum to a scale
+       (Nemotron-H's 5.0), not to one */
+    float tot = 0.0f;
+    for (uint32_t p = 0; p < np; p++) {
+        if (p % k == 0) {
+            tot = 0.0f;
+            for (uint32_t i = 0; i < k; i++)
+                tot += m->pair_w[p + i];
+        }
+        float w = tot > 0.0f ? m->pair_w[p] / tot : 0.0f;
+        if (w > wmax[m->pair_exp[p]])
+            wmax[m->pair_exp[p]] = w;
+    }
     uint32_t light[256];
     uint8_t in[256];
     size_t nl = 0;
@@ -615,17 +673,20 @@ static uint32_t skip_misses(struct janas_llm_model *m,
     }
     uint32_t q = 0;
     for (uint32_t j = 0; j < n; j++) {
-        float kept = 0.0f;
-        for (uint32_t i = 0; i < k; i++)
+        float kept = 0.0f, all = 0.0f;
+        for (uint32_t i = 0; i < k; i++) {
+            all += m->pair_w[j * k + i];
             if (mark[m->pair_exp[j * k + i]] != 2)
                 kept += m->pair_w[j * k + i];
+        }
+        /* the weights left brought back to the sum the router gave */
         for (uint32_t i = 0; i < k; i++) {
             uint32_t p = j * k + i;
             if (mark[m->pair_exp[p]] == 2)
                 continue;
             m->pair_tok[q] = j;
             m->pair_exp[q] = m->pair_exp[p];
-            m->pair_w[q] = m->pair_w[p] / kept;
+            m->pair_w[q] = m->pair_w[p] / kept * all;
             q++;
         }
     }
@@ -644,18 +705,43 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
     double t0 = now();
     uint32_t dm = m->d_model, ne = m->n_expert;
     uint32_t k = part == MOE_SHARED ? 0 : m->k_use;
+    /* the experts' input and where their weighted outputs go: the block
+       and x, or (Nemotron-H) the block brought down to the latent width
+       and a sum there, brought up and added to x at the end */
+    m->moe_w = dm;
+    m->moe_xq = m->xq;
+    m->moe_out = m->x;
+    if (ly->lat_down) {
+        uint32_t L = m->moe_lat;
+        struct janas_matvec_task t = {.type = (int)ly->lat_down->type,
+                                      .w = data(m, ly->lat_down),
+                                      .x = m->xq,
+                                      .y = m->lat,
+                                      .rows = L,
+                                      .cols = dm,
+                                      .n_vec = n};
+        janas_m_products(m, janas_m_gpu(m, 1), &t, 1);
+        for (uint32_t j = 0; j < n; j++)
+            janas_q8k_quantize(m->lat + (size_t)j * L,
+                               m->latq + (size_t)j * (L / JANAS_QK), L);
+        memset(m->lat_acc, 0, (size_t)n * L * sizeof(float));
+        m->moe_w = L;
+        m->moe_xq = m->latq;
+        m->moe_out = m->lat_acc;
+    }
     uint32_t np = n * k;
     double t_route = 0;
     if (k) {
-        struct router_job rj = {m, ly->router16, n};
+        struct router_job rj = {m, ly->router16, n,
+                                ly->n_exp ? ly->n_exp : m->n_expert};
         janas_pool_run(m->compute, router_worker, &rj);
         if (janas_m_exp_tracing())
             t_route = now();
 
         /* per token: softmax, top-k, normalized weights */
-        struct tok_job tj = {.m = m, .n = n};
+        struct tok_job tj = {.m = m, .ly = ly, .n = n};
         if (n < 2)
-            route_tok(m, 0);
+            route_tok(m, ly, 0);
         else
             janas_pool_run(m->compute, route_worker, &tj);
         /* an expert's own output scale, folded into its weight (Gemma 4) */
@@ -664,7 +750,7 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
                 m->pair_w[p] *= ly->exp_scale[m->pair_exp[p]];
         if (m->route_fn && cache == m->cache)
             m->route_fn(m->route_ctx, l, n, k, m->pair_exp);
-        /* the weights must be the router's own, summing to one a token */
+        /* the weights must be the router's own, the same sum each token */
         if (m->miss_skip > 0 && cache && !ly->exp_scale)
             np = skip_misses(m, cache, l, n, k);
     }
@@ -707,8 +793,15 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
 
     /* experts in chunks: compute those in RAM while the others load; the
        shared expert, resident, goes with the first of them */
-    for (uint32_t c0 = 0; c0 < nd || (c0 == 0 && nt > np); c0 += EXPERT_CHUNK) {
-        uint32_t cn = nd - c0 < EXPERT_CHUNK ? nd - c0 : EXPERT_CHUNK;
+    /* a request is at most as many experts as the cache has slots (a
+       small one: fewer than EXPERT_CHUNK) */
+    uint32_t chunk = EXPERT_CHUNK;
+    if (cache && janas_expert_cache_slots(cache) < chunk)
+        chunk = (uint32_t)janas_expert_cache_slots(cache);
+    if (!chunk)
+        return -1;
+    for (uint32_t c0 = 0; c0 < nd || (c0 == 0 && nt > np); c0 += chunk) {
+        uint32_t cn = nd - c0 < chunk ? nd - c0 : chunk;
         const uint8_t *slots[EXPERT_CHUNK];
         uint8_t ready[EXPERT_CHUNK];
         if (cn) {
@@ -756,15 +849,16 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
             if (nr)
                 run_experts(m, runs, nr);
         }
-        if (nd <= c0 + EXPERT_CHUNK)
+        if (nd <= c0 + chunk)
             break;
     }
     if (n < 2) {
         EX_T(
             ex_axpy, for (uint32_t g = 0; g < nt; g++) {
                 uint32_t p = m->order[g];
-                janas_axpy_f32(m->x + (size_t)m->pair_tok[p] * dm, m->pair_w[p],
-                               m->dout + (size_t)g * dm, dm);
+                janas_axpy_f32(m->moe_out + (size_t)m->pair_tok[p] * m->moe_w,
+                               m->pair_w[p], m->dout + (size_t)g * m->moe_w,
+                               m->moe_w);
             });
     } else {
         /* the rows of each token, in increasing order: a counting sort */
@@ -780,6 +874,25 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
             list[fill[m->pair_tok[m->order[g]]]++] = g;
         struct axpy_job aj = {m, first, list, n};
         EX_T(ex_axpy, janas_pool_run(m->compute, axpy_worker, &aj));
+    }
+    if (ly->lat_down) {
+        uint32_t L = m->moe_lat;
+        for (uint32_t j = 0; j < n; j++)
+            janas_q8k_quantize(m->lat_acc + (size_t)j * L,
+                               m->latq + (size_t)j * (L / JANAS_QK), L);
+        struct janas_matvec_task t = {.type = (int)ly->lat_up->type,
+                                      .w = data(m, ly->lat_up),
+                                      .x = m->latq,
+                                      .y = m->xn,
+                                      .rows = dm,
+                                      .cols = L,
+                                      .n_vec = n};
+        janas_m_products(m, janas_m_gpu(m, 1), &t, 1);
+        for (size_t i = 0; i < (size_t)n * dm; i++)
+            m->x[i] += m->xn[i];
+        m->moe_w = dm;
+        m->moe_xq = m->xq;
+        m->moe_out = m->x;
     }
     m->phase[JANAS_PH_EXPERTS] += now() - t1;
     return 0;

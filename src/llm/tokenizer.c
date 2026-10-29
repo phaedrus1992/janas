@@ -32,6 +32,9 @@ struct janas_tokenizer {
     int digits; /* a number's digits taken together, up to: 1, Llama 3's 3 */
     int spm;    /* SentencePiece style (gemma4): raw UTF-8 characters, spaces
                    written as U+2581, unknown characters as <0xXX> bytes */
+    int tekken; /* Mistral's Tekken expression (pre "pixtral": Nemotron-H),
+                   and a pre-token in the vocabulary taken whole, unmerged */
+    int gpt2;   /* GPT-2's expression (pre "whisper") */
 };
 
 static uint64_t hash_bytes(const char *s, size_t n)
@@ -212,6 +215,8 @@ struct janas_tokenizer *janas_tokenizer_create(const struct janas_jns *j,
     t->marks = strcmp(pre, "qwen35") == 0;
     t->digits = strcmp(pre, "llama-bpe") == 0 ? 3 : 1;
     t->spm = strcmp(model, "gemma4") == 0;
+    t->tekken = strcmp(pre, "pixtral") == 0 || strcmp(pre, "tekken") == 0;
+    t->gpt2 = strcmp(pre, "whisper") == 0 || strcmp(pre, "gpt-2") == 0;
     uint64_t total = 0;
     const uint8_t *p = toks;
     for (uint64_t i = 0; i < n; i++) {
@@ -426,6 +431,117 @@ static size_t pretoken_end(const uint32_t *cp, size_t n, size_t i, int marks,
     return i + 1;
 }
 
+/*
+ * The same for GPT-2's expression (Whisper's):
+ *   's|'t|'re|'ve|'m|'ll|'d | ' '?\p{L}+ | ' '?\p{N}+
+ *   | ' '?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+ */
+static size_t gpt2_end(const uint32_t *cp, size_t n, size_t i)
+{
+    uint32_t c = cp[i];
+    if (c == '\'' && i + 1 < n) {
+        uint32_t a = cp[i + 1], b = i + 2 < n ? cp[i + 2] : 0;
+        if (a == 's' || a == 't' || a == 'm' || a == 'd')
+            return i + 2;
+        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
+            (a == 'l' && b == 'l'))
+            return i + 3;
+    }
+    size_t k = i + (c == ' ' && i + 1 < n && !is_space(cp[i + 1]));
+    if (k < n && is_letter(cp[k])) {
+        while (k < n && is_letter(cp[k]))
+            k++;
+        return k;
+    }
+    if (k < n && is_number(cp[k])) {
+        while (k < n && is_number(cp[k]))
+            k++;
+        return k;
+    }
+    if (k < n && !is_space(cp[k])) {
+        while (k < n && !is_space(cp[k]) && !is_letter(cp[k]) &&
+               !is_number(cp[k]))
+            k++;
+        return k;
+    }
+    size_t e = i;
+    while (e < n && is_space(cp[e]))
+        e++;
+    if (e < n && e - i >= 2)
+        return e - 1; /* leave the last space to the next word */
+    return e;
+}
+
+/*
+ * The same for Tekken's expression (llama.cpp's form of it):
+ *   [^\r\n\p{L}\p{N}]?U*W+ | [^\r\n\p{L}\p{N}]?U+W* | \p{N}
+ *   | ' '?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * U a letter or mark that is not a-z, W one that is not A-Z: a word is its
+ * capitals then its small letters (HelloWorld is two), letters beyond ASCII
+ * either. The first alternative backtracks as a regex does: U* gives back
+ * up to the last W it took.
+ */
+static size_t tekken_end(const uint32_t *cp, size_t n, size_t i)
+{
+#define LM(c) (is_letter(c) || is_mark(c))
+#define UP(c) (LM(c) && !((c) >= 'a' && (c) <= 'z'))
+#define LO(c) (LM(c) && !((c) >= 'A' && (c) <= 'Z'))
+    uint32_t c = cp[i];
+    size_t k = i;
+    if (!is_newline(c) && !is_letter(c) && !is_number(c) && i + 1 < n &&
+        LM(cp[i + 1]))
+        k = i + 1;
+    if (k < n && LM(cp[k])) {
+        size_t u = k;
+        while (u < n && UP(cp[u]))
+            u++;
+        if (u < n && LO(cp[u])) { /* U* then W+ */
+            while (u < n && LO(cp[u]))
+                u++;
+            return u;
+        }
+        for (size_t p = u; p > k; p--) /* U* gives back to a W */
+            if (LO(cp[p - 1])) {
+                size_t e = p - 1;
+                while (e < n && LO(cp[e]))
+                    e++;
+                return e;
+            }
+        if (u > k) /* U+ then W*, W* empty here */
+            return u;
+    }
+    if (is_number(c))
+        return i + 1;
+    k = i + (c == ' ');
+    if (k < n && !is_space(cp[k]) && !is_letter(cp[k]) && !is_number(cp[k])) {
+        while (k < n && !is_space(cp[k]) && !is_letter(cp[k]) &&
+               !is_number(cp[k]))
+            k++;
+        while (k < n && (is_newline(cp[k]) || cp[k] == '/'))
+            k++;
+        return k;
+    }
+    if (is_space(c)) {
+        size_t e = i, last_nl = 0;
+        while (e < n && is_space(cp[e])) {
+            if (is_newline(cp[e]))
+                last_nl = e + 1;
+            e++;
+        }
+        if (last_nl)
+            return last_nl;
+        if (e == n)
+            return e;
+        if (e - i >= 2)
+            return e - 1;
+        return e;
+    }
+    return i + 1;
+#undef LM
+#undef UP
+#undef LO
+}
+
 struct cand {
     uint32_t rank, pos; /* a mergeable pair, by its left symbol */
 };
@@ -591,6 +707,32 @@ static int encode_spm(const struct janas_tokenizer *t, const char *text,
 }
 
 /* Plain text (no special tokens): pre-tokens, then BPE on each. */
+/* Tekken's ignore_merges: a pre-token that is a token of the vocabulary
+   (its bytes as byte-level characters) is that token, unmerged. */
+static int whole(const struct janas_tokenizer *t, const unsigned char *s,
+                 size_t len, int32_t *out, size_t max, long *count)
+{
+    char buf[256];
+    size_t k = 0;
+    for (size_t b = 0; b < len; b++) {
+        int32_t id = t->byte_id[s[b]];
+        if (id < 0)
+            return 0;
+        size_t l = t->off[id + 1] - t->off[id];
+        if (k + l > sizeof(buf))
+            return 0;
+        memcpy(buf + k, t->pool + t->off[id], l);
+        k += l;
+    }
+    int32_t id = lookup(t, buf, k);
+    if (id < 0)
+        return 0;
+    if ((size_t)*count < max)
+        out[*count] = id;
+    (*count)++;
+    return 1;
+}
+
 static int encode_plain(const struct janas_tokenizer *t, const char *text,
                         size_t len, int32_t *out, size_t max, long *count)
 {
@@ -612,7 +754,14 @@ static int encode_plain(const struct janas_tokenizer *t, const char *text,
     }
     at[n] = len;
     for (size_t i = 0; i < n;) {
-        size_t e = pretoken_end(cp, n, i, t->marks, t->digits);
+        size_t e = t->tekken ? tekken_end(cp, n, i)
+                   : t->gpt2 ? gpt2_end(cp, n, i)
+                             : pretoken_end(cp, n, i, t->marks, t->digits);
+        if (t->tekken && whole(t, (const unsigned char *)text + at[i],
+                               at[e] - at[i], out, max, count)) {
+            i = e;
+            continue;
+        }
         bpe(t, (const unsigned char *)text + at[i], at[e] - at[i], out, max,
             count);
         i = e;

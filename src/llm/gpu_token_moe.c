@@ -274,10 +274,7 @@ void janas_gt_tier_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
         struct stage *st = i < TIER_PIECES    ? &t->tier[i]
                            : i == TIER_PIECES ? &t->up
                                               : &t->at;
-        if (st->buf)
-            g->vkDestroyBuffer(g->dev, st->buf, NULL);
-        if (st->mem)
-            g->vkFreeMemory(g->dev, st->mem, NULL);
+        janas_g_free_stage(g, st);
     }
     free(t->slot_of);
     free(t->uses);

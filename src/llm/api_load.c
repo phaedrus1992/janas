@@ -21,6 +21,7 @@ static void free_msgs(janas_llm_chat *c)
             free((char *)m->calls[k].args);
         }
         free(m->calls);
+        janas_api_pics_free(m->pics, m->n_pics);
     }
     c->n_msgs = 0;
 }
@@ -73,6 +74,13 @@ int32_t janas_llm_chat_add(janas_llm_chat *c, int32_t role, const char *text,
     if (!t)
         return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
     c->msgs[c->n_msgs++] = (struct cmsg){.role = role, .text = t, .n = n};
+    if (role == JANAS_LLM_ROLE_USER && c->n_pics) {
+        /* the pictures queued go with it */
+        c->msgs[c->n_msgs - 1].pics = c->pics;
+        c->msgs[c->n_msgs - 1].n_pics = c->n_pics;
+        c->pics = NULL;
+        c->n_pics = 0;
+    }
     return JANAS_LLM_OK;
 }
 
@@ -235,7 +243,7 @@ static int render(janas_llm_chat *c, uint32_t *reply_off)
             err |= janas_api_flush_text(c);
             c->last_at = (uint32_t)c->n_ids; /* the last one's, at the end */
             err |= janas_api_note_turn(c, (uint32_t)c->n_ids);
-            err |= janas_api_add_message(c, "user", m->text, m->n);
+            err |= janas_api_add_user(c, m->text, m->n, m->pics, m->n_pics);
             break;
         case JANAS_LLM_ROLE_ASSISTANT: {
             if (llm->tools == JANAS_TOOLS_GEMMA && (m->n_calls || gemma_open)) {
@@ -314,10 +322,15 @@ static int32_t load_ids(janas_llm_chat *c, uint32_t reply_off)
             c->n_ids, c->llm->n_ctx);
     if (c->llm->mode == JANAS_LLM_MODE_AUTO)
         janas_api_apply_mode(c->llm);
-    janas_api_keep_pick(c);
+    /* a picture's tokens are the same whatever the picture: nothing
+       computed is taken past the first one, nor kept */
+    uint32_t media = janas_api_media_first(c);
+    if (media == UINT32_MAX)
+        janas_api_keep_pick(c);
     const int32_t *h;
     uint32_t hn = janas_llm_session_tokens(c->s, &h), same = 0;
-    while (same < hn && same < c->n_ids && h[same] == c->ids[same])
+    while (same < hn && same < c->n_ids && same < media &&
+           h[same] == c->ids[same])
         same++;
     /* the last token must be read for its logits: when it has been, keep
        one less (a prompt kept before its reply has not: it is kept whole,
@@ -339,6 +352,8 @@ static int32_t load_ids(janas_llm_chat *c, uint32_t reply_off)
         return janas_api_fail(JANAS_LLM_EFULL,
                               "the context is full (%u tokens)", c->llm->n_ctx);
     }
+    if (media != UINT32_MAX && janas_api_media_register(c, 0, 0) != 0)
+        return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
     c->dropped = 0;
     c->loaded = (uint32_t)c->n_ids;
     if (janas_api_begin_reply(c, reply_off, (uint32_t)c->n_ids, same) != 0)
@@ -346,7 +361,7 @@ static int32_t load_ids(janas_llm_chat *c, uint32_t reply_off)
     /* the prompt is kept once read, which janas_llm_chat_next does a block
        at a time: reading it here would leave the caller without word for
        as long as it takes */
-    c->keep_prompt = 1;
+    c->keep_prompt = media == UINT32_MAX;
     return JANAS_LLM_OK;
 }
 
@@ -363,6 +378,7 @@ int32_t janas_llm_chat_run(janas_llm_chat *c)
     c->tools_tokens = 0; /* until a system message with tools says */
     janas_api_reply_clear(c);
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     c->n_turn = 0;
     c->sys_tokens = 0;
     free(c->system);
@@ -391,11 +407,13 @@ int32_t janas_llm_chat_count(janas_llm_chat *c, int32_t *n)
     if (turns)
         memcpy(saved, c->turn, turns * sizeof(*saved));
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     c->n_turn = 0;
     uint32_t reply_off;
     int err = render(c, &reply_off) || janas_api_flush_text(c);
     *n = (int32_t)c->n_ids;
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     c->sys_tokens = sys;
     c->n_turn = 0;
     for (size_t i = 0; i < turns && !err; i++)
@@ -437,6 +455,7 @@ int32_t janas_llm_chat_prompt(janas_llm_chat *c, const char *text, int32_t len)
     c->tools_tokens = 0;
     janas_api_reply_clear(c);
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     c->n_turn = 0;
     c->sys_tokens = 0;
     /* Llama 3's text starts with <|begin_of_text|>, as its tokenizer adds */
@@ -465,6 +484,7 @@ int32_t janas_llm_chat_infill(janas_llm_chat *c, const char *prefix,
     c->tools_tokens = 0;
     janas_api_reply_clear(c);
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     c->n_turn = 0;
     c->sys_tokens = 0;
     int err =

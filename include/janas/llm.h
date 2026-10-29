@@ -59,6 +59,11 @@ extern "C" {
 #define JANAS_LLM_MODE_ECO 1
 #define JANAS_LLM_MODE_MAX 2
 
+/* The lowest quality the engine may choose on its own (min_quality) */
+#define JANAS_LLM_QUALITY_LOW 0
+#define JANAS_LLM_QUALITY_MEDIUM 1
+#define JANAS_LLM_QUALITY_HIGH 2
+
 typedef struct janas_llm janas_llm;           /* an open model */
 typedef struct janas_llm_chat janas_llm_chat; /* a conversation */
 
@@ -115,6 +120,21 @@ struct janas_llm_params {
        requantized for both: Qwen3.5-2B 9% faster, 352 where 376. 0 or 6:
        as in the file (default) */
     int32_t head_bits;
+    /*
+     * The lowest quality the engine may go down to on its own, where the
+     * machine is short of memory for the experts and would wait for the disk
+     * at every token: JANAS_LLM_QUALITY_*. LOW (default): whatever reads
+     * fastest there - the experts at four bits when they do not all fit in
+     * memory (5 to 7 positions of 400 where the most likely token differs
+     * from all six), and with less than a fifth of them in memory the light
+     * ones not in RAM left out (Nemotron 3.5 Bolt with 2.7 GB: 391 of 400
+     * against llama.cpp where 396, 6% faster). MEDIUM: four bits, no expert
+     * left out. HIGH: neither, every bit of every expert the router chose.
+     * With the memory to hold them all, all three read the same. The levers
+     * a caller sets (expert_bits, head_bits, janas_llm_set_experts) are its
+     * own choice and stand whatever this says.
+     */
+    int32_t min_quality;
 };
 
 /*
@@ -375,6 +395,19 @@ JANAS_LLM_API int32_t janas_llm_chat_system(janas_llm_chat *c, const char *text,
  */
 JANAS_LLM_API int32_t janas_llm_chat_prepare(janas_llm_chat *c, int32_t *done,
                                              int32_t *total);
+
+/*
+ * A picture (the n bytes of a PNG or a JPEG) for the next user message,
+ * sent (janas_llm_chat_send) or added (janas_llm_chat_add): read now by the
+ * model's vision encoder - a <model>.vision.jns beside the model, made by
+ * tools/hf2jns_vision (Qwen3.5) - and placed before the message's text, in
+ * the order given. JANAS_LLM_EMODEL when the model has no encoder,
+ * JANAS_LLM_EINVAL when the bytes are not a picture this reads. A picture
+ * of more than a megapixel is made smaller (JANAS_IMAGE_MAX_TOKENS: its
+ * tokens at most, 1024 by default).
+ */
+JANAS_LLM_API int32_t janas_llm_chat_image(janas_llm_chat *c, const void *data,
+                                           int64_t n);
 
 /*
  * Sends a user message; the reply follows through janas_llm_chat_next. A
@@ -765,6 +798,152 @@ struct janas_llm_chat_stats {
 /* Counters of the last message and reply. s->size must be set. */
 JANAS_LLM_API int32_t janas_llm_chat_stats(const janas_llm_chat *c,
                                            struct janas_llm_chat_stats *s);
+
+/*
+ * Speech to text: a Whisper model (a .jns made by tools/hf2jns_whisper from
+ * a Hugging Face checkpoint, openai/whisper-*), apart from the chat models.
+ * A recording - the bytes of a WAV, FLAC, MP3 (or other MPEG audio), Ogg,
+ * MP4/M4A, AAC or WebM file, any rate and channels - is
+ * transcribed in the language it is spoken in, or translated into English;
+ * then its text, its language and its segments with their times are read.
+ * A speech model is used from one thread at a time.
+ */
+typedef struct janas_llm_speech janas_llm_speech;
+
+struct janas_llm_speech_params {
+    uint32_t size;             /* sizeof(struct janas_llm_speech_params) */
+    int32_t threads;           /* 0: one a performance core (default) */
+    const char *vad_model;     /* a voice activity detector (Silero VAD, made
+                                  by tools/silero2jns) for chunking; NULL:
+                                  silero-vad.jns beside the speech model, if
+                                  there is one (default) */
+    const char *speaker_model; /* speaker embeddings (WeSpeaker ResNet34,
+                                  made by tools/wespeaker2jns) for
+                                  diarization; NULL: wespeaker-resnet34.jns
+                                  beside the speech model, if there is one
+                                  (default) */
+};
+JANAS_LLM_API void
+janas_llm_speech_params_default(struct janas_llm_speech_params *p);
+/* p may be NULL; *out gets the model. JANAS_LLM_EOPEN when the file is not
+   a Whisper model this reads. */
+JANAS_LLM_API int32_t
+janas_llm_speech_open(const char *path, const struct janas_llm_speech_params *p,
+                      janas_llm_speech **out);
+JANAS_LLM_API void janas_llm_speech_close(janas_llm_speech *s);
+
+struct janas_llm_transcribe_params {
+    uint32_t size;        /* sizeof(struct janas_llm_transcribe_params) */
+    int32_t translate;    /* 1: into English (default 0) */
+    const char *language; /* "it", or "italian"; NULL: found out (default) */
+    const char *prompt;   /* text said before, or the words and spelling
+                             expected (names, terms); NULL: none */
+    uint64_t seed;        /* of the sampling */
+    float temperature;    /* 0: the likeliest words, a higher temperature
+                             only where they go round in a loop or are
+                             unlikely (default); up to 1: sampled from the
+                             start at that temperature */
+    int32_t words;        /* 1: the words' times too, as OpenAI's finds
+                             them (default 0) */
+    /* called during the transcription with each segment once it is final
+       (janas_llm_speech_segment and the others read it), in order; NULL:
+       none */
+    void (*on_segment)(void *user, int32_t segment);
+    void *user;
+    /* set to nonzero (from another thread) to stop it between windows;
+       NULL: none */
+    volatile int32_t *stop;
+    /* how the recording is cut, as OpenAI's chunking_strategy: 0 whole
+       (default); 1 auto (loudness normalized, then voice activity
+       detection with the defaults below); 2 voice activity detection with
+       vad_threshold, vad_prefix_ms and vad_silence_ms. Only the speech is
+       read, its windows within each stretch of it. */
+    int32_t chunking;
+    float vad_threshold;    /* 0.5 */
+    int32_t vad_prefix_ms;  /* 300: kept before speech */
+    int32_t vad_silence_ms; /* 200: that ends a stretch of speech */
+    /* 1: who speaks when (janas_llm_speech_turns), as OpenAI's
+       gpt-4o-transcribe-diarize; known speakers, at most 8: their names and
+       a short recording of each (the bytes of a sound file, 2-10 s) */
+    int32_t diarize;
+    int32_t n_speakers;
+    const char *const *speaker_names;
+    const void *const *speaker_refs;
+    const int64_t *speaker_ref_bytes;
+};
+JANAS_LLM_API void
+janas_llm_transcribe_params_default(struct janas_llm_transcribe_params *p);
+/* The n bytes of a sound file (WAV, FLAC, MP3, Ogg, M4A, WebM; any rate and
+   channels; up to four hours at 48 kHz) transcribed; p may be NULL.
+   JANAS_LLM_EINVAL when the bytes are not a sound this reads, or the
+   language is unknown. */
+JANAS_LLM_API int32_t
+janas_llm_speech_transcribe(janas_llm_speech *s, const void *data, int64_t n,
+                            const struct janas_llm_transcribe_params *p);
+/* Of the last transcription: its text (as janas_llm_describe writes
+   strings), its language's code ("it"), its length in seconds, its
+   segments. */
+JANAS_LLM_API int32_t janas_llm_speech_text(const janas_llm_speech *s,
+                                            char *buf, int32_t cap,
+                                            int32_t *len);
+JANAS_LLM_API int32_t janas_llm_speech_language(const janas_llm_speech *s,
+                                                char *buf, int32_t cap,
+                                                int32_t *len);
+/* The English name of a language, in lower case ("italian"), from its
+   code; NULL for a code Whisper does not know. */
+JANAS_LLM_API const char *janas_llm_speech_language_name(const char *code);
+JANAS_LLM_API double janas_llm_speech_duration(const janas_llm_speech *s);
+JANAS_LLM_API int32_t janas_llm_speech_segments(const janas_llm_speech *s);
+/* Segment i: start and end in seconds, its text (beginning with a space,
+   as the model writes it). */
+JANAS_LLM_API int32_t janas_llm_speech_segment(const janas_llm_speech *s,
+                                               int32_t i, double *start,
+                                               double *end, char *buf,
+                                               int32_t cap, int32_t *len);
+/* How sure the model was of segment i: the mean log-probability of its
+   tokens, the probability that its window held no speech, the
+   temperature it was decoded at, its window's compression ratio (its
+   text's bytes over their zlib-compressed bytes, as OpenAI's: high when it
+   repeats itself); and its tokens (ids of the model's vocabulary, at most
+   max into ids, *n the count; ids may be NULL). */
+JANAS_LLM_API int32_t janas_llm_speech_segment_info(
+    const janas_llm_speech *s, int32_t i, float *avg_logprob,
+    float *no_speech_prob, float *temperature, float *compression_ratio,
+    int32_t *ids, int32_t max, int32_t *n);
+/* The words of the last transcription asked with words = 1, all segments'
+   in order: their count, and word i's start and end in seconds, its
+   probability and its text (with its leading space, punctuation joined,
+   as OpenAI's word timestamps give them). */
+/* The log-probability of each of segment i's tokens (at most max into
+   lp, *n the count), as janas_llm_speech_segment_info gives its tokens. */
+JANAS_LLM_API int32_t janas_llm_speech_segment_logprobs(
+    const janas_llm_speech *s, int32_t i, float *lp, int32_t max, int32_t *n);
+/* The bytes a token of the speech model stands for (as
+   janas_llm_describe writes strings; a token may end inside a UTF-8
+   character: join them before reading them as text). */
+JANAS_LLM_API int32_t janas_llm_speech_token(const janas_llm_speech *s,
+                                             int32_t id, char *buf, int32_t cap,
+                                             int32_t *len);
+/* 1 when the token is text, 0 when it is a special one (a timestamp, the
+   end of text...). */
+JANAS_LLM_API int32_t janas_llm_speech_token_is_text(const janas_llm_speech *s,
+                                                     int32_t id);
+JANAS_LLM_API int32_t janas_llm_speech_words(const janas_llm_speech *s);
+/* The turns of the last transcription asked with diarize = 1: their count,
+   and turn i's start and end in seconds, its speaker (a known speaker's
+   name, or "A", "B"... in the order they first speak) and its text. */
+JANAS_LLM_API int32_t janas_llm_speech_turns(const janas_llm_speech *s);
+JANAS_LLM_API int32_t janas_llm_speech_turn(const janas_llm_speech *s,
+                                            int32_t i, double *start,
+                                            double *end, char *speaker,
+                                            int32_t speaker_cap,
+                                            int32_t *speaker_len, char *buf,
+                                            int32_t cap, int32_t *len);
+JANAS_LLM_API int32_t janas_llm_speech_word(const janas_llm_speech *s,
+                                            int32_t i, double *start,
+                                            double *end, float *probability,
+                                            char *buf, int32_t cap,
+                                            int32_t *len);
 
 #ifdef __cplusplus
 }

@@ -54,7 +54,7 @@ void main()
     barrier();
     uint half_ = p.n_rot / 2u, row = p.rb + w;
     if (t < d) {
-        float v = sv[t];
+        precise float v = sv[t]; /* rounded as the CPU's */
         if (t < p.n_rot) {
             R RO = R(p.rope);
             uint i = t % half_;

@@ -183,7 +183,7 @@ int janas_mcp_param_headers(struct janas_mcp *m, const struct janas_mcp_tool *t,
 
 /* The header lines of a request, into an array of pointers into b. */
 static size_t build_headers(struct janas_mcp *m, const char *method,
-                            struct janas_buf *b, const char **h, size_t cap)
+                            struct janas_buf *b, const char ***out)
 {
     janas_buf_puts(b, "Content-Type: application/json\n"
                       "Accept: application/json, text/event-stream\n");
@@ -205,6 +205,14 @@ static size_t build_headers(struct janas_mcp *m, const char *method,
         janas_buf_printf(b, "%s\n", *c);
     if (b->oom)
         return 0;
+    /* as many as there are lines: a call's own never push the configured
+       ones (an Authorization) out */
+    size_t cap = 0;
+    for (size_t i = 0; i < b->n; i++)
+        cap += b->p[i] == '\n';
+    const char **h = malloc(cap * sizeof(*h));
+    if (!h)
+        return 0;
     size_t n = 0;
     for (char *l = b->p; l < b->p + b->n && n < cap;) {
         char *nl = memchr(l, '\n', b->n - (size_t)(l - b->p));
@@ -212,6 +220,7 @@ static size_t build_headers(struct janas_mcp *m, const char *method,
         h[n++] = l;
         l = nl + 1;
     }
+    *out = h;
     return n;
 }
 
@@ -243,8 +252,8 @@ int janas_mcp_http_exchange(struct janas_mcp *m, const char *method, int64_t id,
                             struct janas_rpc_msg *a)
 {
     struct janas_buf hb = {0};
-    const char *h[64];
-    size_t nh = build_headers(m, method, &hb, h, 64);
+    const char **h = NULL;
+    size_t nh = build_headers(m, method, &hb, &h);
     if (!nh) {
         janas_buf_free(&hb);
         return NOMEM;
@@ -255,6 +264,7 @@ int janas_mcp_http_exchange(struct janas_mcp *m, const char *method, int64_t id,
     int rc = janas_http_request(&c, &m->url, "POST", h, nh, body, n,
                                 ms < 0 ? -1 : (int)ms,
                                 (volatile int *)&m->cancel, err, sizeof(err));
+    free(h);
     janas_buf_free(&hb);
     m->http_status = 0;
     if (rc != 0) {

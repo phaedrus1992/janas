@@ -80,15 +80,22 @@ int get_fetch(const char *repo, const char *path, const char *dir,
     }
     printf("   %s from %s, %.2f GB\n", path, repo, (double)size / 1e9);
     fflush(stdout);
+    /* written aside and named only once checked: a download stopped
+       halfway is never taken for the file. A partial one left under the
+       final name by an older janas-get goes on aside. */
+    char part[4200];
+    snprintf(part, sizeof(part), "%s.part", local);
+    if (access(part, F_OK) != 0 && access(local, F_OK) == 0)
+        rename(local, part);
     struct bar b = {.t0 = now()};
-    FILE *f = fopen(local, "rb");
+    FILE *f = fopen(part, "rb");
     if (f) {
         fseek(f, 0, SEEK_END);
         long at = ftell(f);
         b.from = at > 0 ? (uint64_t)at : 0;
         fclose(f);
     }
-    if (janas_hf_download(repo, NULL, path, local, size, got, progress, &b, err,
+    if (janas_hf_download(repo, NULL, path, part, size, got, progress, &b, err,
                           sizeof(err)) != 0) {
         fprintf(stderr, "\njanas-get: %s (run again to resume)\n", err);
         return -1;
@@ -99,10 +106,19 @@ int get_fetch(const char *repo, const char *path, const char *dir,
                 "janas-get: %s is not the file it should be (SHA-256 %s, "
                 "not %s); deleted\n",
                 local, got, expect);
-        remove(local);
+        remove(part);
         return -1;
     }
-    printf("   SHA-256 checked%s\n", want ? " against MODELS.md" : "");
+    if (rename(part, local) != 0) {
+        fprintf(stderr, "janas-get: cannot name %s\n", local);
+        return -1;
+    }
+    if (expect[0])
+        printf("   SHA-256 checked%s\n", want ? " against MODELS.md" : "");
+    else /* a small file kept in git, not LFS: Hugging Face lists no hash */
+        printf("   not checked: Hugging Face publishes no SHA-256 for it "
+               "(SHA-256 %s)\n",
+               got);
     return 0;
 }
 

@@ -14,9 +14,9 @@
  * experts of a mixture whose experts do not all fit, a few tokens each,
  * stay on the CPU, which computes them while the NPU works. A matrix is
  * compiled the first time a block uses it (INT8, a scale a row, from its
- * rows dequantized), for blocks of the model's largest;
- * JANAS_NPU_CACHE=<dir> keeps the compiled matrices there for the next
- * load. Only in the passes whose tuner candidate has the NPU (npu_use):
+ * rows dequantized), for blocks of the model's largest, and kept in
+ * ~/.cache/janas/npu (JANAS_NPU_CACHE=<dir> elsewhere, empty for none) for
+ * the next load: prepared once. Only in the passes whose tuner candidate has the NPU (npu_use):
  * the tuner and janas-bench weigh it against the CPU and the GPU.
  *
  * x reaches the NPU as the CPU's products see it (its Q8_K blocks expanded
@@ -231,7 +231,16 @@ void janas_m_npu_open(struct janas_llm_model *m)
         free(n);
         return;
     }
+    /* the compiled matrices kept across sessions: their preparation is
+       paid once, until the cache is deleted - in JANAS_NPU_CACHE, or
+       ~/.cache/janas/npu (XDG_CACHE_HOME honoured); JANAS_NPU_CACHE= (empty)
+       keeps none */
     const char *c = getenv("JANAS_NPU_CACHE");
+    char dir[1024];
+    if (!c && janas_cache_dir(dir, sizeof dir, 1) == 0) {
+        strcat(dir, "/npu");
+        c = dir;
+    }
     if (c && *c && janas_npu_set_cache(n->u, c))
         fprintf(stderr, "janas: NPU cache %s not usable\n", c);
     const char *mn = getenv("JANAS_NPU_MIN_N");
@@ -1909,6 +1918,9 @@ int janas_m_npu_layers(struct janas_llm_model *m, uint32_t nt, uint32_t pos0)
 {
     struct janas_m_npu *n = m->npu;
     if (!n || !janas_m_npu_takes(m, nt) || (int)nt > n->block || n->lmode < 0)
+        return -1;
+    /* a picture whose tokens attend both ways: the CPU's attention */
+    if (m->n_media && janas_m_media_both(m, pos0, nt))
         return -1;
     if (n->lmode == 0 && !n->lg) {
         const char *e = getenv("JANAS_NPU_LAYERS");

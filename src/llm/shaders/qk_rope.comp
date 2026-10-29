@@ -180,7 +180,9 @@ void main()
     barrier();
     uint half_ = p.n_rot / 2u;
     for (uint i = t; i < hd; i += 128u) {
-        float r = sv[i];
+        /* precise: a * c - b * s rounded twice, as the CPU's (never one
+           fma, which a driver may make of it) */
+        precise float r = sv[i];
         if (i < half_) {
             float a = sv[i], b = sv[i + half_];
             r = a * R.v[ro + i] - b * R.v[ro + half_ + i];

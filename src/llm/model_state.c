@@ -115,7 +115,7 @@ static int copy_hc(struct janas_llm_model *m, struct janas_llm_state *st,
 
 static size_t ssm_len(const struct janas_llm_model *m)
 {
-    return (size_t)m->n_rec * m->n_vh * m->ds * m->ds;
+    return (size_t)m->n_rec * m->ssm_per;
 }
 
 static size_t conv_len(const struct janas_llm_model *m)
@@ -462,8 +462,12 @@ struct janas_llm_state *janas_llm_state_read(const struct janas_llm_model *m,
     for (size_t i = 0; i < sizeof(same) / sizeof(same[0]); i++)
         if (h[same[i]] != want[same[i]])
             return NULL;
+    /* the recurrent log within its buffers, the base within the text */
     if (h[H_N] > m->n_ctx || h[H_NBUF] > 2 ||
-        (h[H_NBUF] != 0) != (m->a->rec != 0))
+        (h[H_NBUF] != 0) != (m->a->rec != 0) ||
+        (h[H_NBUF] == 2 &&
+         (h[H_LOG_N] > JANAS_LLM_MAX_BLOCK || h[H_BASE_POS] > h[H_N] ||
+          h[H_N] > (uint64_t)h[H_BASE_POS] + h[H_LOG_N])))
         return NULL;
     struct janas_llm_state *st = calloc(1, sizeof(*st));
     if (!st)

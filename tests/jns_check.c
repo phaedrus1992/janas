@@ -89,6 +89,8 @@ int main(int argc, char **argv)
         for (uint32_t l = 0; l < h->n_layer; l++)
             for (uint32_t e = 0; e < h->n_expert; e++) {
                 uint64_t n = j.layers[l].slot_bytes;
+                if (janas_jns_expert_offset(&j, l, e) == 0)
+                    continue; /* absent (a layer with fewer experts) */
                 if (pread(fd, buf, n,
                           (off_t)janas_jns_expert_offset(&j, l, e)) !=
                     (ssize_t)n) {

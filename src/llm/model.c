@@ -106,10 +106,37 @@ static void rope_table(float *cs, float *sn, uint32_t n, uint32_t pos0,
         }
 }
 
+/* With pictures in the sequence: each position's three (time, row, column;
+   model_media.c), each frequency taking the one the multimodal sections
+   give it */
+static void rope_media(struct janas_llm_model *m, uint32_t n, uint32_t pos0)
+{
+    uint32_t half = m->n_rot / 2;
+    for (uint32_t j = 0; j < n; j++) {
+        float p3[3];
+        janas_m_media_pos(m, pos0 + j, p3);
+        for (uint32_t i = 0; i < half; i++) {
+            int axis = i % 3 == 1 && i < 3 * m->mrope[1]   ? 1
+                       : i % 3 == 2 && i < 3 * m->mrope[2] ? 2
+                                                           : 0;
+            float theta =
+                p3[axis] *
+                janas_powf(m->rope_base, -2.0f * (float)i / (float)m->n_rot);
+            if (m->rope_freqs)
+                theta /= m->rope_freqs[i];
+            janas_sincosf(theta, &m->rope_sin[(size_t)j * half + i],
+                          &m->rope_cos[(size_t)j * half + i]);
+        }
+    }
+}
+
 static void set_rope(struct janas_llm_model *m, uint32_t n, uint32_t pos0)
 {
-    rope_table(m->rope_cos, m->rope_sin, n, pos0, m->n_rot, m->rope_base,
-               m->rope_freqs);
+    if (m->n_media && (m->mrope[0] || m->mrope[1] || m->mrope[2]))
+        rope_media(m, n, pos0);
+    else
+        rope_table(m->rope_cos, m->rope_sin, n, pos0, m->n_rot, m->rope_base,
+                   m->rope_freqs);
     if (m->a->swa)
         rope_table(m->rope_cos_swa, m->rope_sin_swa, n, pos0, m->n_rot_swa,
                    m->rope_base_swa, NULL);
@@ -255,7 +282,10 @@ static void unrotate_row(void *row, float *scale, uint32_t hd, uint32_t half,
 int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
                           uint32_t drop, uint32_t n_kv)
 {
-    if (!drop || n_kv > m->n_ctx || keep + drop > n_kv || m->hd_max > 512)
+    /* pictures' positions are not slid (yet): the caller reads the prompt
+       again instead */
+    if (!drop || n_kv > m->n_ctx || keep + drop > n_kv || m->hd_max > 512 ||
+        m->n_media)
         return -1;
     /* qwen4exp: its n-gram history first (the one part that can refuse) */
     if (m->hc_n && janas_m_hc_shift(m, keep, drop, n_kv) != 0)
@@ -267,7 +297,10 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
     for (uint32_t sl = 0; sl < slots; sl++) {
         uint32_t hd = m->kv_hd[sl], cap = m->kv_cap[sl];
         int swa = m->kv_swa[sl];
-        uint32_t n_rot = swa ? m->n_rot_swa : m->n_rot, half = n_rot / 2;
+        /* Nemotron-H's attention has no RoPE (its n_rot is the buffers'):
+           the keys move, nothing to turn back */
+        uint32_t n_rot = m->a->nh ? 0 : swa ? m->n_rot_swa : m->n_rot;
+        uint32_t half = n_rot / 2;
         float base = swa ? m->rope_base_swa : m->rope_base;
         const float *ff = swa ? NULL : m->rope_freqs;
         for (uint32_t i = 0; i < half; i++) {
@@ -292,7 +325,7 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
                     memmove(kz + keep, kz + keep + drop, move * sizeof(float));
                     memmove(vz + keep, vz + keep + drop, move * sizeof(float));
                 }
-                for (uint32_t p = keep; p < keep + move; p++)
+                for (uint32_t p = keep; p < keep + move && half; p++)
                     unrotate_row(k + p * row, kz + p, hd, half, cs, sn,
                                  m->kv16);
                 continue;
@@ -318,8 +351,9 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
                 memcpy(v + dst * row, tv + src * row, row);
                 kz[dst] = tkz[src];
                 vz[dst] = tvz[src];
-                unrotate_row(k + dst * row, kz + dst, hd, half, cs, sn,
-                             m->kv16);
+                if (half)
+                    unrotate_row(k + dst * row, kz + dst, hd, half, cs, sn,
+                                 m->kv16);
             }
         }
     }
@@ -331,10 +365,20 @@ int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
     /* the recurrent state holds what it has seen, dropped tokens included -
        that is what carries the older text - but the position it stands at
        moves with everything else */
-    if (m->base_pos != UINT32_MAX)
-        m->base_pos = m->base_pos >= keep + drop ? m->base_pos - drop
-                      : m->base_pos > keep       ? keep
-                                                 : m->base_pos;
+    if (m->base_pos != UINT32_MAX) {
+        uint32_t b = m->base_pos, t = b + m->log_n;
+        if (b >= keep + drop)
+            m->base_pos = b - drop;
+        else if (m->log_n && t > keep) {
+            /* the log runs into what is dropped (or past it): replaying
+               it would count the dropped tokens and land short of the
+               tip, so the state goes on from the tip, the other buffer */
+            m->base = 1 - m->base;
+            m->base_pos = t >= keep + drop ? t - drop : keep;
+            m->log_n = 0;
+        } else if (b > keep)
+            m->base_pos = keep;
+    }
     return 0;
 }
 
@@ -508,6 +552,27 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
     for (uint32_t j = 0; j < n; j++)
         if (tokens[j] < 0 || (uint32_t)tokens[j] >= m->n_vocab)
             return -1;
+    uint32_t dm = m->d_model;
+    size_t nbd = dm / JANAS_QK;
+    for (uint32_t j = 0; j < n; j++) {
+        /* a picture's token: its embedding from the encoder */
+        const float *pic = m->n_media ? janas_m_media_row(m, pos0 + j) : NULL;
+        if (pic)
+            memcpy(m->x + (size_t)j * dm, pic, sizeof(float) * dm);
+        else
+            embed(m, tokens[j], m->x + (size_t)j * dm);
+    }
+    if (m->trace >= 2) {
+        fprintf(stderr, "tokens:");
+        for (uint32_t j = 0; j < n; j++)
+            fprintf(stderr, " %d", tokens[j]);
+        fprintf(stderr, "\n");
+        trace_row(m, "embed", m->x + (size_t)(n - 1) * dm, dm);
+    }
+    /* what can fail before the state is touched: a failure leaves it as
+       it was */
+    if (m->ple_dim && janas_m_ple_inputs(m, tokens, n, pos0) != 0)
+        return -1;
     /* from the start: nothing of the GPU's copy of the state matters, the
        host's (the recurrent states zeroed below) is the one */
     if (m->gtok_dev && pos0 == 0)
@@ -517,8 +582,7 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
             m->src = 0;
             m->replay = 0;
             memset(m->ssm_buf, 0,
-                   (size_t)m->n_rec * m->n_vh * m->ds * m->ds *
-                       sizeof(uint16_t));
+                   (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t));
             memset(m->conv_buf, 0,
                    (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
                        sizeof(float));
@@ -534,20 +598,6 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
         }
         m->base_pos = UINT32_MAX; /* invalid until this pass completes */
     }
-    uint32_t dm = m->d_model;
-    size_t nbd = dm / JANAS_QK;
-
-    for (uint32_t j = 0; j < n; j++)
-        embed(m, tokens[j], m->x + (size_t)j * dm);
-    if (m->trace >= 2) {
-        fprintf(stderr, "tokens:");
-        for (uint32_t j = 0; j < n; j++)
-            fprintf(stderr, " %d", tokens[j]);
-        fprintf(stderr, "\n");
-        trace_row(m, "embed", m->x + (size_t)(n - 1) * dm, dm);
-    }
-    if (m->ple_dim && janas_m_ple_inputs(m, tokens, n) != 0)
-        return -1;
     set_rope(m, n, pos0);
     /* a token (or, with JANAS_GPU_BLOCK=1, a block) on the GPU, whole,
        where it can (model_gpu.c) */
@@ -584,6 +634,12 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
             m->log_n = 0;
         }
         return 0;
+    }
+    /* Nemotron-H: one part a layer (model_nh.c) */
+    if (m->a->nh) {
+        if (janas_m_nh_layers(m, n, pos0) != 0)
+            return -1;
+        goto output;
     }
     /* qwen4exp: its layers on the streams of the residual (model_hc.c) */
     if (m->hc_n) {

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <wchar.h>
@@ -248,6 +249,46 @@ static void term_write(struct janas_term *t, const char *s, size_t n)
 static void term_puts(struct janas_term *t, const char *s)
 {
     term_write(t, s, strlen(s));
+}
+
+/*
+ * Text from outside - a model's reply, a tool's arguments and results - with
+ * the bytes that drive the terminal taken out, in place: a tab becomes a
+ * space (the width the wrapping counts; the terminal would jump to its own
+ * stops), and the control characters but newline go (ESC, which starts the
+ * sequences that move the cursor, set the clipboard (OSC 52) or switch screens;
+ * carriage return; backspace) and DEL, and the C1 controls written in UTF-8
+ * (U+0080 to U+009F: 0xC2 0x80-0x9F, CSI among them). The new length.
+ */
+static size_t term_clean(char *s, size_t n)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\t')
+            c = ' ';
+        if ((c < 0x20 && c != '\n') || c == 0x7f)
+            continue;
+        if (c == 0xc2 && i + 1 < n && (unsigned char)s[i + 1] >= 0x80 &&
+            (unsigned char)s[i + 1] <= 0x9f) {
+            i++;
+            continue;
+        }
+        s[w++] = (char)c;
+    }
+    return w;
+}
+
+/* A copy cleaned (term_clean), NUL-terminated; NULL on memory. */
+static char *term_cleaned(const char *s)
+{
+    size_t n = strlen(s);
+    char *d = malloc(n + 1);
+    if (!d)
+        return NULL;
+    memcpy(d, s, n);
+    d[term_clean(d, n)] = 0;
+    return d;
 }
 
 __attribute__((format(gnu_printf, 2, 3))) static void
@@ -678,8 +719,9 @@ enum {
 static int term_key(void)
 {
     unsigned char c;
-    if (tty_byte(&c) != 1)
-        return TERM_KEY_ESC; /* the input ended: let the page close */
+    if (tty_byte(&c) != 1) /* the input ended: let the page close; a
+                              resize (EINTR) only redraws it */
+        return errno == EINTR ? TERM_KEY_OTHER : TERM_KEY_ESC;
     if (c != 27)
         return c;
     unsigned char lead = 0, final = 0;

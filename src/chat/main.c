@@ -61,7 +61,7 @@ static double sess_tokens, sess_seconds;
 static const char *const commands[] = {
     "/help",    "/about", "/stats", "/reset",   "/system",   "/temp",
     "/spec",    "/think", "/mode",  "/experts", "/markdown", "/mcp",
-    "/context", "/quit",  "/exit",  NULL};
+    "/context", "/image", "/quit",  "/exit",    NULL};
 
 static void on_sigwinch(int sig)
 {
@@ -302,10 +302,17 @@ static void usage(void)
         "  model            a .jns file, or a name of the catalog (none: the\n"
         "                   list, to choose one; a model not here yet is\n"
         "                   downloaded, after asking)\n"
-        "  --profile <quality|fast>\n"
-        "                   quality (default): answers as the file gives\n"
-        "                   them; fast: also what was measured faster on\n"
-        "                   this model at a small cost to its answers\n"
+        "  --quality <high|medium|low>\n"
+        "                   the lowest quality the engine may choose to\n"
+        "                   be faster where memory is short: low (the\n"
+        "                   default) the experts at four bits, the light\n"
+        "                   ones not in memory left out; medium: four\n"
+        "                   bits, nothing left out; high: nothing\n"
+        "                   lowered. With memory for every expert all\n"
+        "                   three read alike. Asked for, low also takes\n"
+        "                   what was measured faster on this model at a\n"
+        "                   small cost (the head at four bits). The\n"
+        "                   levers below (--bits, --head...) win over it\n"
         "  --models <dir>   where the models are (default: JANAS_MODELS,\n"
         "                   or ~/.local/share/janas/models)\n"
         "  --tune           measure again how this model runs fastest on\n"
@@ -416,6 +423,9 @@ static const struct {
     {"/system <text>", "new conversation with this system message"},
     {"/system off", "new conversation with no system message"},
     {"/temp <t>", "temperature (0: greedy)"},
+    {"/image <file>",
+     "a picture (PNG or JPEG) for your next message, for models that see "
+     "(their vision file beside them)"},
     {"/spec [on|off]", "speculative decoding (toggles)"},
     {"/mode [auto|eco|max]", "power mode, and what the engine chose"},
     {"/experts [n]",
@@ -965,7 +975,7 @@ static const char *const OPTIONS[] = {
     "--system",      "--mcp-config", "--progress",    "--temp",
     "--top-k",       "--top-p",      "--min-p",       "--seed",
     "--max",         "--head",       "--profile",     "--models",
-    "--prompt-on",   "--drafts-on",  "--reply-on"};
+    "--quality",     "--prompt-on",  "--drafts-on",   "--reply-on"};
 #define N_OPTIONS (sizeof OPTIONS / sizeof *OPTIONS)
 
 /* v of option a as a whole number or a number within limits; on a
@@ -1012,6 +1022,7 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
     static const char *const BITS[] = {"2", "4", "6"};
     static const char *const HEAD[] = {"4", "6"};
     static const char *const PROFILES[] = {"quality", "fast"};
+    static const char *const QUALITY[] = {"high", "medium", "low"};
     for (int i = 0; i < n; i++) {
         const char *a = w[i], *v = i + 1 < n ? w[i + 1] : NULL;
         long long x;
@@ -1129,9 +1140,17 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             if ((k = opt_choice(a, v, BITS, 3, why, why_len)) < 0)
                 return -1;
             o->mp->expert_bits = 2 + 2 * k;
+        } else if (strcmp(a, "--quality") == 0) {
+            if ((k = opt_choice(a, v, QUALITY, 3, why, why_len)) < 0)
+                return -1;
+            o->mp->min_quality = 2 - k; /* JANAS_LLM_QUALITY_* */
+            *o->profile = k == 2;       /* the catalog's choices: low */
         } else if (strcmp(a, "--profile") == 0) {
+            /* the older name: quality is high, fast is low */
             if ((k = opt_choice(a, v, PROFILES, 2, why, why_len)) < 0)
                 return -1;
+            o->mp->min_quality =
+                k ? JANAS_LLM_QUALITY_LOW : JANAS_LLM_QUALITY_HIGH;
             *o->profile = k;
         } else if (strcmp(a, "--models") == 0) {
             setenv("JANAS_MODELS", v, 1); /* read when the model is found */
@@ -1195,6 +1214,18 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
  */
 /* A question answered with one key. Piped in, nobody is there to answer:
    the caller asked for it in writing and that is the answer. */
+/* A key for a question: a window resized meanwhile (SIGWINCH, no
+   SA_RESTART) is not an answer, Ctrl+C is (no) */
+static int answer_byte(unsigned char *k)
+{
+    for (;;) {
+        int r = tty_byte(k);
+        if (r < 0 && errno == EINTR && !interrupted)
+            continue;
+        return r;
+    }
+}
+
 static int ask_yes(const char *question)
 {
     if (!term.tty)
@@ -1202,7 +1233,7 @@ static int ask_yes(const char *question)
     term_printf(&term, "%s [y/N] ", question);
     term_raw(&term, 1);
     unsigned char k = 0;
-    if (tty_byte(&k) < 0)
+    if (answer_byte(&k) < 0)
         k = 0;
     term_raw(&term, 0);
     int yes = k == 'y' || k == 'Y';
@@ -1368,8 +1399,12 @@ static void conf_write(const char *path, const struct chat_opts *o)
         fprintf(f, "--mcp-auto\n");
     if (*o->mcp_instructions)
         fprintf(f, "--mcp-instructions\n");
-    if (*o->profile)
-        fprintf(f, "--profile fast\n");
+    if (m->min_quality == JANAS_LLM_QUALITY_HIGH)
+        fprintf(f, "--quality high\n");
+    else if (m->min_quality == JANAS_LLM_QUALITY_MEDIUM)
+        fprintf(f, "--quality medium\n");
+    else if (*o->profile) /* asked for: with the catalog's choices */
+        fprintf(f, "--quality low\n");
     fclose(f);
     term_printf(&term, "written to %s (the system message is not kept)\n",
                 path);
@@ -1408,7 +1443,7 @@ static int ask_key(const char *question)
     term_printf(&term, "%s ", question);
     term_raw(&term, 1);
     unsigned char k = 0;
-    if (tty_byte(&k) < 0)
+    if (answer_byte(&k) < 0)
         k = 0;
     term_raw(&term, 0);
     if (k >= 'A' && k <= 'Z')
@@ -1503,12 +1538,18 @@ static int run_calls(janas_llm_chat *c, int autorun)
            for every time, even with --mcp-auto: never "always"; shown
            whole, since the user says yes to what it holds */
         int writes = mcpc_writes(name);
-        int cut = writes ? INT_MAX : 400;
-        term_printf(&term, "%s→ %s%s %s%.*s%s%s\n",
-                    mcpc_own(name) && !writes ? T_DIM(&term) : T_CMD(&term),
-                    name, T_DIM(&term), "", cut, args,
-                    strlen(args) > (size_t)cut ? " ..." : "", T_RESET(&term));
         int go = !writes && (autorun || mcpc_always(name) || mcpc_own(name));
+        /* whole where the user is asked: a yes (or an always) is to all of
+           it, not to its first 400 bytes */
+        int cut = go ? 400 : INT_MAX;
+        char *sname = term_cleaned(name), *sargs = term_cleaned(args);
+        term_printf(
+            &term, "%s→ %s%s %s%.*s%s%s\n",
+            mcpc_own(name) && !writes ? T_DIM(&term) : T_CMD(&term),
+            sname ? sname : "?", T_DIM(&term), "", cut, sargs ? sargs : "?",
+            sargs && strlen(sargs) > (size_t)cut ? " ..." : "", T_RESET(&term));
+        free(sname);
+        free(sargs);
         char *key = call_key(name, args);
         if (failed_before(key)) {
             go = 0;
@@ -1557,16 +1598,20 @@ static int run_calls(janas_llm_chat *c, int autorun)
                 failed.call[failed.n++] = key;
                 key = NULL;
             }
-            const char *t = texts[i] ? texts[i] : "";
-            size_t line = strcspn(t, "\n");
+            char *t = term_cleaned(texts[i] ? texts[i] : "");
+            const char *tt = t ? t : "";
+            size_t line = strcspn(tt, "\n");
             term_printf(
                 &term, "%s%s%.*s%s%s\n", rc ? T_WARN(&term) : T_DIM(&term),
-                rc > 0 ? "tool error: " : "", (int)(line < 200 ? line : 200), t,
-                line < strlen(t) || line > 200 ? " ..." : "", T_RESET(&term));
+                rc > 0 ? "tool error: " : "", (int)(line < 200 ? line : 200),
+                tt, line < strlen(tt) || line > 200 ? " ..." : "",
+                T_RESET(&term));
+            free(t);
             if (shown && *shown) {
                 /* the user's, as the tool wrote it (a page): the model
                    has only a note of it */
                 term_gap(&term);
+                shown[term_clean(shown, strlen(shown))] = 0;
                 term_printf(&term, "%s\n", shown);
             }
             free(shown);
@@ -1634,9 +1679,19 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
             if (conv.back)
                 scroll_draw(&term, &conv); /* re-wrapped to the new width */
         }
-        md_write(&md, piece, (size_t)len);
         if (len > 0)
             tail = piece[len - 1];
+        /* what the model writes drives no terminal; its tabs (code) four
+           spaces */
+        char wide[4 * sizeof(piece)];
+        size_t wn = 0;
+        for (int32_t i = 0; i < len; i++)
+            if (piece[i] == '\t')
+                for (int k = 0; k < 4; k++)
+                    wide[wn++] = ' ';
+            else
+                wide[wn++] = piece[i];
+        md_write(&md, wide, term_clean(wide, wn));
         fflush(stdout);
         struct janas_llm_chat_stats rs = {.size = sizeof(rs)};
         if (len == 0 && janas_llm_chat_stats(c, &rs) == JANAS_LLM_OK &&
@@ -1757,6 +1812,7 @@ int main(int argc, char **argv)
     int gpu = 1;      /* the GPU may be given work, if there is one */
     const char *mcp_config = NULL; /* NULL: the default file */
     int mcp = 1, mcp_auto = 0, mcp_instructions = 0, services = 1, no_mtp = 0;
+    /* profile: the catalog's faster choices, at --quality low asked */
     int all_tools = 0, profile = 0, tune = 0, npu_int8 = 0;
     int devices[JANAS_DEVICES_OPTIONS] = {0, 0, 0};
     static char mtp_found[4096];
@@ -1773,6 +1829,8 @@ int main(int argc, char **argv)
      */
     char cpath[1024];
     char *conf_text = NULL, *mconf_text = NULL;
+    char **old_texts = NULL; /* those /load-config replaced, freed at the end */
+    int n_old_texts = 0;
     int cn = 0, mn = 0;
     char **cw = conf_path(cpath, sizeof(cpath), 0, NULL) == 0
                     ? conf_read(cpath, &cn, &conf_text)
@@ -1795,18 +1853,32 @@ int main(int argc, char **argv)
     char **mw = conf_path(mpath, sizeof(mpath), 0, cm.key) == 0
                     ? conf_read(mpath, &mn, &mconf_text)
                     : NULL;
-    const char *pv = chat_words_last(argc - oi, argv + oi, "--profile");
-    if (!pv)
-        pv = chat_words_last(mn, mw, "--profile");
-    if (!pv)
-        pv = chat_words_last(cn, cw, "--profile");
+    /* the quality asked (--quality, or --profile its older name): typed,
+       else the model's file, else the chat's; low when none says */
+    const char *qs[3][2] = {
+        {chat_words_last(argc - oi, argv + oi, "--quality"),
+         chat_words_last(argc - oi, argv + oi, "--profile")},
+        {chat_words_last(mn, mw, "--quality"),
+         chat_words_last(mn, mw, "--profile")},
+        {chat_words_last(cn, cw, "--quality"),
+         chat_words_last(cn, cw, "--profile")}};
+    const char *qv = NULL;
+    int asked = 0;
+    for (int i = 0; i < 3 && !qv; i++)
+        if ((qv = qs[i][0] ? qs[i][0] : qs[i][1]) != NULL)
+            asked = 1;
+    /* low by default lets the engine choose by the machine (memory short:
+       faster, plenty: the file's quality); asked for, it adds the
+       catalog's choices measured faster on this model whatever the
+       machine (the head at four bits, say) */
+    int low = asked && (!strcmp(qv, "low") || !strcmp(qv, "fast"));
     char why[400];
-    if (pv && strcmp(pv, "fast") == 0) {
+    if (low) {
         const char *fw = cm.entry ? cm.entry->fast : NULL;
-        if (!fw)
-            fprintf(stderr, "profile fast: nothing measured faster on this "
-                            "model yet, so the same as quality\n");
-        else {
+        if (!fw) {
+            fprintf(stderr, "quality low: nothing measured faster on this "
+                            "model beyond the engine's own choices\n");
+        } else {
             /* the catalog's words, split on spaces */
             static char fbuf[256];
             char *pw[16];
@@ -1819,7 +1891,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "janas-chat: catalog: %s\n", why);
                 return 2;
             }
-            fprintf(stderr, "profile fast: %s\n", fw);
+            fprintf(stderr,
+                    "quality low: %s (measured faster on this "
+                    "model; --quality high keeps the file's)\n",
+                    fw);
         }
     }
     /* the levers the user set, in any file or typed: the measure leaves
@@ -2101,7 +2176,15 @@ int main(int argc, char **argv)
                     if (take_options(cn, cw, &o, bad, sizeof bad) != 0)
                         term_printf(&term, "%s: %s\n", cpath, bad);
                     free(cw);
-                    free(conf_text); /* the older words are let go */
+                    /* the older words stay: options not in the new file
+                       (an MTP path, the MCP configuration) still point
+                       into them, and /save-config reads those */
+                    char **ot = realloc(old_texts, (size_t)(n_old_texts + 1) *
+                                                       sizeof(*ot));
+                    if (ot) {
+                        old_texts = ot;
+                        old_texts[n_old_texts++] = conf_text;
+                    }
                     conf_text = text;
                     if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
                         term_printf(&term, "%s\n", janas_llm_last_error());
@@ -2177,6 +2260,30 @@ int main(int argc, char **argv)
                 }
                 janas_llm_experts(llm, &used, &most);
                 term_printf(&term, "%d experts per token of %d\n", used, most);
+            } else if (strcmp(msg, "/image") == 0) {
+                /* a picture for the next message, read now */
+                FILE *f = *arg ? fopen(arg, "rb") : NULL;
+                long fn = -1;
+                char *data = NULL;
+                if (f && fseek(f, 0, SEEK_END) == 0 && (fn = ftell(f)) > 0 &&
+                    fn <= (32L << 20) && fseek(f, 0, SEEK_SET) == 0 &&
+                    (data = malloc((size_t)fn)) &&
+                    fread(data, 1, (size_t)fn, f) != (size_t)fn) {
+                    free(data);
+                    data = NULL;
+                }
+                if (f)
+                    fclose(f);
+                if (!*arg)
+                    term_printf(&term, "/image <file>: a PNG or a JPEG\n");
+                else if (!data)
+                    term_printf(&term, "cannot read %s\n", arg);
+                else if (janas_llm_chat_image(c, data, fn) != JANAS_LLM_OK)
+                    term_printf(&term, "%s\n", janas_llm_last_error());
+                else
+                    term_printf(&term, "the picture goes with your next "
+                                       "message\n");
+                free(data);
             } else if (strcmp(msg, "/temp") == 0 && *arg) {
                 cp.temperature = (float)atof(arg);
                 if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
@@ -2255,6 +2362,9 @@ int main(int argc, char **argv)
     janas_llm_close(llm);
     scroll_free(&conv);
     free(conf_text);
+    for (int i = 0; i < n_old_texts; i++)
+        free(old_texts[i]);
+    free(old_texts);
     if (term.tty) {
         hist_save(&history);
         hist_free(&history);

@@ -367,7 +367,7 @@ static void *keep_alive(void *arg)
 }
 
 /* An empty dispatch (no blocks: nothing read; invocation 0 writes one float
-   at the start of the Y stage, unused), recorded once, for the keep-alive. */
+   into a buffer of its own), recorded once, for the keep-alive. */
 static int record_keep_alive(struct janas_gpu *g)
 {
     VkCommandBufferAllocateInfo cba = {
@@ -382,7 +382,9 @@ static int record_keep_alive(struct janas_gpu *g)
         g->vkCreateFence(g->dev, &fci, NULL, &g->ka_fence) != VK_SUCCESS ||
         g->vkBeginCommandBuffer(g->ka_cb, &bb) != VK_SUCCESS)
         return -1;
-    VkDeviceAddress a = g->ys.addr + g->ys.bytes - 64;
+    if (janas_g_make_stage(g, &g->kas, 64, 0) != 0)
+        return -1;
+    VkDeviceAddress a = g->kas.addr;
     struct push pc = {.rows = 1, .nb = 0, .nv = 1, .xs = 0, .ys = 0};
     pc.y[0] = pc.x[0] = pc.w[0] = (uint32_t)a;
     pc.y[1] = pc.x[1] = pc.w[1] = (uint32_t)(a >> 32);
@@ -811,66 +813,74 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
                 set_err(err, err_len, "cannot create the shaders", r);
                 goto fail;
             }
-        /* the subgroup-per-row shaders written so far */
-        if ((r = janas_g_make_pipeline_nv(g, janas_spv_q4k_row,
-                                          sizeof(janas_spv_q4k_row), &g->rm[0],
-                                          &g->rp[0], 0, 1)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
-        }
-        if ((r = janas_g_make_pipeline_nv(g, janas_spv_q6k_row,
-                                          sizeof(janas_spv_q6k_row), &g->rm[1],
-                                          &g->rp[1], 0, 1)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
-        }
-        if ((r = janas_g_make_pipeline_nv(g, janas_spv_q6kp_row,
-                                          sizeof(janas_spv_q6kp_row), &g->rm[2],
-                                          &g->rp[2], 0, 1)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
-        }
-        if ((r = janas_g_make_pipeline_nv(
-                 g, janas_spv_q6ka_row, sizeof(janas_spv_q6ka_row), &g->rm_q6ka,
-                 &g->rp_q6ka, 0, 1)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
-        }
-        /* the tiled copies (constant 2: the rows of a tile) */
-        if ((r = janas_g_make_pipeline_nv(g, janas_spv_q4k_row,
-                                          sizeof(janas_spv_q4k_row),
-                                          &g->rm_tile[0], &g->rp_tile[0],
-                                          JANAS_TILE, 1)) != VK_SUCCESS ||
-            (r = janas_g_make_pipeline_nv(g, janas_spv_q6ka_row,
-                                          sizeof(janas_spv_q6ka_row),
-                                          &g->rm_tile[1], &g->rp_tile[1],
-                                          JANAS_TILE, 1)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
-        }
-        /* and for 2, 4 and 8 vectors at once */
-        {
-            const uint32_t *code[4] = {janas_spv_q4k_row, janas_spv_q6k_row,
-                                       janas_spv_q6kp_row, janas_spv_q6ka_row};
-            size_t bytes[4] = {
-                sizeof(janas_spv_q4k_row), sizeof(janas_spv_q6k_row),
-                sizeof(janas_spv_q6kp_row), sizeof(janas_spv_q6ka_row)};
-            for (int k = 0; k < 3; k++)
-                for (int i = 0; i < 4; i++)
-                    if ((r = janas_g_make_pipeline_nv(
-                             g, code[i], bytes[i], &g->rmv[k][i], &g->rpv[k][i],
-                             0, 2u << k)) != VK_SUCCESS) {
-                        set_err(err, err_len, "cannot create the shaders", r);
-                        goto fail;
-                    }
-        }
-        /* Q4_K on a few vectors, a row an invocation (JANAS_GPU_MV=1, being
-           measured) */
-        if ((r = janas_g_make_pipeline_nv(
-                 g, janas_spv_q4k_mv, sizeof(janas_spv_q4k_mv), &g->sm_mv,
-                 &g->pipe_mv, 0, MV_NV)) != VK_SUCCESS) {
-            set_err(err, err_len, "cannot create the shaders", r);
-            goto fail;
+        /* the subgroup-per-row shaders and q4k_mv take SG / 8 blocks a
+           step: none where a subgroup has fewer than 8 lanes (their step
+           would be 0, a loop without end), the products going the other
+           ways */
+        if (g->sg >= 8) {
+            /* the subgroup-per-row shaders written so far */
+            if ((r = janas_g_make_pipeline_nv(
+                     g, janas_spv_q4k_row, sizeof(janas_spv_q4k_row), &g->rm[0],
+                     &g->rp[0], 0, 1)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
+            if ((r = janas_g_make_pipeline_nv(
+                     g, janas_spv_q6k_row, sizeof(janas_spv_q6k_row), &g->rm[1],
+                     &g->rp[1], 0, 1)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
+            if ((r = janas_g_make_pipeline_nv(
+                     g, janas_spv_q6kp_row, sizeof(janas_spv_q6kp_row),
+                     &g->rm[2], &g->rp[2], 0, 1)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
+            if ((r = janas_g_make_pipeline_nv(
+                     g, janas_spv_q6ka_row, sizeof(janas_spv_q6ka_row),
+                     &g->rm_q6ka, &g->rp_q6ka, 0, 1)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
+            /* the tiled copies (constant 2: the rows of a tile) */
+            if ((r = janas_g_make_pipeline_nv(g, janas_spv_q4k_row,
+                                              sizeof(janas_spv_q4k_row),
+                                              &g->rm_tile[0], &g->rp_tile[0],
+                                              JANAS_TILE, 1)) != VK_SUCCESS ||
+                (r = janas_g_make_pipeline_nv(g, janas_spv_q6ka_row,
+                                              sizeof(janas_spv_q6ka_row),
+                                              &g->rm_tile[1], &g->rp_tile[1],
+                                              JANAS_TILE, 1)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
+            /* and for 2, 4 and 8 vectors at once */
+            {
+                const uint32_t *code[4] = {janas_spv_q4k_row, janas_spv_q6k_row,
+                                           janas_spv_q6kp_row,
+                                           janas_spv_q6ka_row};
+                size_t bytes[4] = {
+                    sizeof(janas_spv_q4k_row), sizeof(janas_spv_q6k_row),
+                    sizeof(janas_spv_q6kp_row), sizeof(janas_spv_q6ka_row)};
+                for (int k = 0; k < 3; k++)
+                    for (int i = 0; i < 4; i++)
+                        if ((r = janas_g_make_pipeline_nv(
+                                 g, code[i], bytes[i], &g->rmv[k][i],
+                                 &g->rpv[k][i], 0, 2u << k)) != VK_SUCCESS) {
+                            set_err(err, err_len, "cannot create the shaders",
+                                    r);
+                            goto fail;
+                        }
+            }
+            /* Q4_K on a few vectors, a row an invocation (JANAS_GPU_MV=1, being
+               measured) */
+            if ((r = janas_g_make_pipeline_nv(
+                     g, janas_spv_q4k_mv, sizeof(janas_spv_q4k_mv), &g->sm_mv,
+                     &g->pipe_mv, 0, MV_NV)) != VK_SUCCESS) {
+                set_err(err, err_len, "cannot create the shaders", r);
+                goto fail;
+            }
         }
         /* ... and Q4_K, Q6_K, Q5_K and IQ4_XS on 2 to 8 with the lanes on
            the vectors, where a subgroup is 8 lanes, one a vector */
@@ -1005,8 +1015,8 @@ void janas_gpu_destroy(struct janas_gpu *g)
             int waited;
             janas_gpu_finish(g, &waited);
         }
-        struct stage *st[3] = {&g->xs, &g->ys, &g->ts};
-        for (int i = 0; i < 3; i++) {
+        struct stage *st[4] = {&g->xs, &g->ys, &g->ts, &g->kas};
+        for (int i = 0; i < 4; i++) {
             if (st[i]->buf)
                 g->vkDestroyBuffer(g->dev, st[i]->buf, NULL);
             if (st[i]->mem)
@@ -1381,6 +1391,7 @@ static int copy_to_device(struct janas_gpu *g, const void *p, size_t bytes)
     if (g->vkBindBufferMemory(g->dev, rg->buf, rg->mem, 0) != VK_SUCCESS)
         goto fail;
     g->local_bytes += req.size;
+    rg->local = req.size;
     /* staging: 64 MiB of host memory, one chunk at a time */
     struct stage st = {0};
     size_t chunk = (size_t)64 << 20;
@@ -1440,7 +1451,19 @@ static int copy_to_device(struct janas_gpu *g, const void *p, size_t bytes)
 fail:
     g->vkDestroyBuffer(g->dev, rg->buf, NULL);
     g->vkFreeMemory(g->dev, rg->mem, NULL);
+    g->local_bytes -= rg->local;
+    rg->local = 0;
     return -1;
+}
+
+void janas_g_free_stage(struct janas_gpu *g, struct stage *s)
+{
+    if (s->buf)
+        g->vkDestroyBuffer(g->dev, s->buf, NULL);
+    if (s->mem)
+        g->vkFreeMemory(g->dev, s->mem, NULL);
+    g->local_bytes -= s->local;
+    memset(s, 0, sizeof(*s));
 }
 
 int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes)
@@ -1476,6 +1499,7 @@ int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes)
         return -1;
     }
     g->local_bytes += req.size;
+    s->local = req.size;
     s->addr = janas_g_buffer_address(g, s->buf);
     s->bytes = bytes;
     return 0;
@@ -1638,7 +1662,11 @@ int janas_gpu_import(struct janas_gpu *g, const void *p, size_t bytes)
         return import_refused(g, p, bytes, "buffer", r);
     VkMemoryRequirements req;
     g->vkGetBufferMemoryRequirements(g->dev, rg->buf, &req);
-    int t = janas_g_mem_type(g, hp.memoryTypeBits & req.memoryTypeBits, 0);
+    /* coherent only: the host writes these pages and reads what the GPU
+       wrote with no flush or invalidation in between (some ARM drivers
+       offer cached, non-coherent types: refused, the copy way instead) */
+    int t = janas_g_mem_type(g, hp.memoryTypeBits & req.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkImportMemoryHostPointerInfoEXT imp = {
         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -1679,6 +1707,7 @@ void janas_g_drop_region(struct janas_gpu *g, const void *host)
     struct region *rg = &g->reg[--g->n_reg];
     g->vkDestroyBuffer(g->dev, rg->buf, NULL);
     g->vkFreeMemory(g->dev, rg->mem, NULL);
+    g->local_bytes -= rg->local;
     memset(rg, 0, sizeof(*rg));
 }
 
@@ -1900,6 +1929,7 @@ static int b32_kind(int type)
            : type == JANAS_MXFP4  ? 4
            : type == JANAS_Q5_0   ? 5
            : type == JANAS_Q2_0   ? 6
+           : type == JANAS_NVFP4  ? 7
                                   : -1;
 }
 

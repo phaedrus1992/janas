@@ -39,6 +39,11 @@ static const struct janas_arch archs[] = {
      .shared_expert = 1,
      .vmap_mod = 1,
      .hc = 1},
+    /* NVIDIA's Nemotron-H with LatentMoE (Nemotron 3.5 Bolt) */
+    {.name = "nemotron_h_moe",
+     .rec = JANAS_REC_MAMBA2,
+     .no_qk_norm = 1,
+     .nh = 1},
     /* its scores are not scaled down, and an eight-bit key moves them: at
        eight bits llama.cpp agrees with its own f16 cache at 169 of 200 most
        likely tokens */

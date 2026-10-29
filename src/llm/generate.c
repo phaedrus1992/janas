@@ -480,6 +480,7 @@ void janas_llm_session_destroy(struct janas_llm_session *s)
 
 void janas_llm_session_reset(struct janas_llm_session *s)
 {
+    janas_llm_model_media_drop(s->m, 0); /* the pictures go with it */
     s->dpos_set = 0;
     s->n = s->n_kv = s->ret = s->call_start = 0;
     s->n_mdraft = 0;
@@ -653,6 +654,7 @@ int janas_llm_session_truncate(struct janas_llm_session *s, uint32_t n)
         return -1;
     janas_sampler_rewind(s->smp, s->n - s->ret); /* drawn, never returned */
     s->n = s->ret = n;
+    janas_llm_model_media_drop(s->m, n); /* pictures past the cut */
     if (s->n_kv > kv)
         s->n_kv = kv;
     if (s->call_start > s->n_kv)
@@ -725,6 +727,7 @@ int janas_llm_session_prefill_step(struct janas_llm_session *s)
         uint32_t most = janas_llm_model_max_block(m);
         if (b > most)
             b = most;
+        b = janas_llm_model_media_cut(m, p, b);
         if (janas_llm_model_forward(m, s->hist + p, b, p, s->logits, 0) != 0)
             return -1;
         s->call_start = p;

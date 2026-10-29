@@ -82,7 +82,8 @@ struct janas_npu {
     ze_command_queue_handle_t q;
     ze_graph_dditable_ext_t *g;
     uint16_t cmajor, cminor;
-    uint32_t driver_version;
+    uint32_t driver_version, vendor_id, device_id;
+    int driver_known; /* its version read: else no cache, which keys on it */
     char name[256], *cache;
     void *allocs[NPU_MAX_ALLOCS];
     int nallocs;
@@ -99,6 +100,7 @@ struct janas_npu {
     struct janas_npu_mm *ka;
     pthread_t ka_thread;
     int ka_started;
+    int ka_failed; /* once: what it made is freed with the NPU, not again */
     atomic_int ka_on, ka_stop;
     /* off, the thread waits here rather than wake every half millisecond:
        2000 times a second beside the cores writing a reply */
@@ -179,9 +181,13 @@ struct janas_npu *janas_npu_create(char *err, size_t err_len)
         goto fail;
     }
     memcpy(u->name, dp.name, sizeof u->name - 1);
+    u->vendor_id = dp.vendorId;
+    u->device_id = dp.deviceId;
     ze_driver_properties_t drp = {.stype = ZE_STYPE_DRIVER_PROPERTIES};
-    if (!u->zeDriverGetProperties(u->drv, &drp))
+    if (!u->zeDriverGetProperties(u->drv, &drp)) {
         u->driver_version = drp.driverVersion;
+        u->driver_known = 1;
+    }
     ze_simple_desc_t cd = {.stype = ZE_STYPE_CONTEXT_DESC};
     if (u->zeContextCreate(u->drv, &cd, &u->ctx)) {
         snprintf(err, err_len, "NPU context refused");
@@ -286,8 +292,9 @@ int janas_npu_set_cache(struct janas_npu *u, const char *dir)
     return u->cache ? 0 : -1;
 }
 
-/* the cache's file of a model: its SHA-256 with the driver's and the
-   compiler's versions */
+/* the cache's file of a model: its SHA-256 with the device's ids and the
+   driver's and the compiler's versions (a graph compiled for one NPU is
+   not for another) */
 static void cache_path(const struct janas_npu *u, const uint8_t *model,
                        size_t bytes, char *path, size_t len)
 {
@@ -295,6 +302,8 @@ static void cache_path(const struct janas_npu *u, const uint8_t *model,
     char hex[65];
     janas_sha256_init(&h);
     janas_sha256_update(&h, model, bytes);
+    janas_sha256_update(&h, &u->vendor_id, sizeof u->vendor_id);
+    janas_sha256_update(&h, &u->device_id, sizeof u->device_id);
     janas_sha256_update(&h, &u->driver_version, sizeof u->driver_version);
     janas_sha256_update(&h, &u->cmajor, sizeof u->cmajor);
     janas_sha256_update(&h, &u->cminor, sizeof u->cminor);
@@ -327,8 +336,11 @@ static void cache_store(struct janas_npu *u, ze_graph_handle_t graph,
     if (u->g->pfnGetNativeBinary(graph, &n, NULL) || !n)
         return;
     uint8_t *b = malloc(n);
+    /* its own name: two NPUs of a process (a model and its drafts) may
+       store the same graph at once */
+    static _Atomic unsigned seq;
     char tmp[4200];
-    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
+    snprintf(tmp, sizeof tmp, "%s.%d.%u.tmp", path, (int)getpid(), ++seq);
     FILE *f =
         b && !u->g->pfnGetNativeBinary(graph, &n, b) ? fopen(tmp, "wb") : NULL;
     if (f) {
@@ -509,7 +521,7 @@ static struct janas_npu_mm *from_ir(struct janas_npu *u, struct npu_ir *irp,
     double t0 = now();
     ze_result_t r = 1;
     char path[4096];
-    if (u->cache) {
+    if (u->cache && u->driver_known) {
         cache_path(u, model, bytes, path, sizeof path);
         size_t nb = 0;
         uint8_t *blob = read_file(path, &nb);
@@ -527,7 +539,7 @@ static struct janas_npu_mm *from_ir(struct janas_npu *u, struct npu_ir *irp,
     }
     if (r) {
         r = u->g->pfnCreate2(u->ctx, u->dev, &gd, &p->graph);
-        if (!r && u->cache)
+        if (!r && u->cache && u->driver_known)
             cache_store(u, p->graph, path);
     }
     free(model);
@@ -732,6 +744,11 @@ int janas_npu_keep_awake(struct janas_npu *u, int on)
     }
     if (!on)
         return 0;
+    if (u->ka_failed) {
+        atomic_store(&u->ka_on, 0);
+        return -1;
+    }
+    u->ka_failed = 1; /* until it is running */
     /* the tiny product, its fence moved to a queue of its own */
     char err[64];
     ze_command_queue_desc_t qd = {.stype = ZE_STYPE_COMMAND_QUEUE_DESC};
@@ -767,12 +784,15 @@ int janas_npu_keep_awake(struct janas_npu *u, int on)
     if (slot < 0 || (!registered && atexit(stop_all_awake)) ||
         pthread_create(&u->ka_thread, NULL, keep_awake, u)) {
         pthread_mutex_unlock(&awake_lock);
+        pthread_cond_destroy(&u->ka_cv);
+        pthread_mutex_destroy(&u->ka_mx);
         atomic_store(&u->ka_on, 0);
         return -1;
     }
     registered = 1;
     awake_npus[slot] = u;
     u->ka_started = 1;
+    u->ka_failed = 0;
     pthread_mutex_unlock(&awake_lock);
     return 0;
 }

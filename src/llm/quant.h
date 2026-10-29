@@ -101,6 +101,22 @@ extern const int8_t janas_mxfp4_values[16];
 float janas_e8m0_half(uint8_t e);
 
 /*
+ * NVFP4 (ggml's type 40, NVIDIA's 4-bit format): 64 weights in four
+ * sub-blocks of 16, each a 4-bit E2M1 code into janas_mxfp4_values (twice
+ * the format's values) times its sub-block's UE4M3 scale (four exponent
+ * bits, bias 7, three of mantissa; 0 and 0x7F read as zero). Sub-block s
+ * keeps its codes in qs[8 s .. 8 s + 7]: byte j holds weight 16 s + j low
+ * and 16 s + j + 8 high. Four blocks cover a Q8_K block.
+ */
+struct janas_block_nvfp4 {
+    uint8_t d[4]; /* UE4M3 */
+    uint8_t qs[32];
+};
+/* A UE4M3 scale times one half, as ggml's ggml_ue4m3_to_fp32 (the half
+   pairs with janas_mxfp4_values' doubled values) */
+float janas_ue4m3_half(uint8_t x);
+
+/*
  * Q5_1: 32 weights d * q + m, q of five bits: the low four as in Q4_0,
  * the fifth of weight l in bit l of qh (little-endian).
  */
@@ -296,6 +312,7 @@ _Static_assert(sizeof(struct janas_block_q5_1) == 24, "q5_1 block size");
 _Static_assert(sizeof(struct janas_block_q4_1) == 20, "q4_1 block size");
 _Static_assert(sizeof(struct janas_block_q5_0) == 22, "q5_0 block size");
 _Static_assert(sizeof(struct janas_block_q2_0) == 18, "q2_0 block size");
+_Static_assert(sizeof(struct janas_block_nvfp4) == 36, "nvfp4 block size");
 _Static_assert(sizeof(struct janas_block_iq3xxs) == 98, "iq3_xxs block size");
 _Static_assert(sizeof(struct janas_block_iq2xxs) == 66, "iq2_xxs block size");
 _Static_assert(sizeof(struct janas_block_iq2xs) == 74, "iq2_xs block size");
@@ -329,6 +346,7 @@ enum janas_qtype {
     JANAS_IQ1_M = 29, /* 56 */
     JANAS_IQ4_XS = 23,
     JANAS_MXFP4 = 39, /* sizes per 256 weights: 8 blocks, 136 bytes */
+    JANAS_NVFP4 = 40, /* 4 blocks of 64, 144 bytes */
     JANAS_Q2_0 = 42,  /* 4 blocks of 64, 72 bytes */
     /* Janas' own, outside the GGUF numbering: the high plane of a Q6_K row
        cut into bit planes. Its block size counts that plane alone; the other
@@ -384,8 +402,9 @@ float janas_dot(int type, const void *w, const struct janas_block_q8k *x,
 
 /*
  * One row of n weights (n a multiple of JANAS_QK) of a supported type into
- * floats. Aborts on an unsupported type, bit planes among them: check
- * janas_qtype_block_size() first. Every caller goes through here, so a type
+ * floats. Aborts on an unsupported type, bit planes among them (which
+ * janas_qtype_block_size() still sizes: the loaders refuse them for any
+ * resident tensor). Every caller goes through here, so a type
  * the engine reads in its products is read the same way when a row of it has
  * to be unpacked whole - a token embedding, say.
  */
@@ -588,6 +607,15 @@ void janas_mxfp4_dequantize(const struct janas_block_mxfp4 *x, float *y,
 float janas_mxfp4_dot(const struct janas_block_mxfp4 *w,
                       const struct janas_block_q8k *x, size_t nb);
 float janas_mxfp4_dot_ref(const struct janas_block_mxfp4 *w,
+                          const struct janas_block_q8k *x, size_t nb);
+/* NVFP4: as llama.cpp's product against Q8_0, sub-block by sub-block: a
+   lane per block of 32 activations, each sub-block's exact sum times its
+   scale and the block's */
+void janas_nvfp4_dequantize(const struct janas_block_nvfp4 *x, float *y,
+                            size_t n);
+float janas_nvfp4_dot(const struct janas_block_nvfp4 *w,
+                      const struct janas_block_q8k *x, size_t nb);
+float janas_nvfp4_dot_ref(const struct janas_block_nvfp4 *w,
                           const struct janas_block_q8k *x, size_t nb);
 void janas_iq4xs_dequantize(const struct janas_block_iq4xs *x, float *y,
                             size_t n);

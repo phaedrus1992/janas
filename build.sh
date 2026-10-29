@@ -59,8 +59,7 @@ Output
   src/services/<tool>/main.c becomes janas-<tool>, with
   the other .c files of its directory; the libraries of others in
   src/third_party/ go into the programs that use them; every other .c
-  under src/ goes into the library. Janet (src/janet/, Linux x86-64)
-  gives janet, janet-check, janet-mnist and janet-mnist-deep. The release build
+  under src/ goes into the library. The release build
   also links libjanas_llm.so and libjanas_mcp.so, which export the public
   APIs of include/janas/llm.h and include/janas/mcp.h and nothing else.
   On Linux src/node/ becomes janas.node, the module for Node.js, with the
@@ -194,9 +193,15 @@ fi
 AR="${AR:-ar}"
 LDSTATIC=()
 [ "$OS" = windows ] && LDSTATIC=(-static)
+# A text as a C string literal for -D: backslashes and quotes escaped,
+# anything but printable ASCII dropped (a tag's name, a tool's output)
+c_string() {
+    printf '"%s"' "$(printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' |
+        sed 's/[\\"]/\\&/g')"
+}
 # the version in reports (janas-bench)
 VERSION="$(git describe --always --dirty 2>/dev/null || echo unknown)"
-CFLAGS+=(-DJANAS_VERSION="\"$VERSION\"")
+CFLAGS+=(-DJANAS_VERSION="$(c_string "$VERSION")")
 
 # Throw away what this variant made, and only what this variant made: the
 # objects of the variant and the programs that carry its suffix. Release has
@@ -304,7 +309,7 @@ fi
 [ -z "$GPU_MISSING" ] ||
     echo "note: building without GPU support: it needs $GPU_MISSING"
 # the reason, for the engine to give when asked for the GPU
-[ -z "$GPU_MISSING" ] || CFLAGS+=(-DJANAS_GPU_WHY="\"$GPU_MISSING\"")
+[ -z "$GPU_MISSING" ] || CFLAGS+=(-DJANAS_GPU_WHY="$(c_string "$GPU_MISSING")")
 [ -z "$GLSLANG" ] || CFLAGS+=(-DJANAS_GPU_SPV -I"$SPV")
 
 # Web pages of the programs (src/<tool>/*.html) as C arrays, so that the
@@ -329,8 +334,10 @@ for html in src/*/*.html; do
 done
 CFLAGS+=(-I"$GEN")
 
-# one object, rebuilt when its source or any header is newer
-if ! headers_newest=$(find src include "$SPV" "$GEN" -name '*.h' -printf '%T@\n' |
+# one object, rebuilt when its source or any header (or .inc, such as the
+# server's routes.inc) is newer
+if ! headers_newest=$(find src include "$SPV" "$GEN" \( -name '*.h' -o \
+    -name '*.inc' \) -printf '%T@\n' |
     sort -n | tail -1) || [ -z "$headers_newest" ]; then
     echo "build.sh: cannot list the headers under src/ and include/" >&2
     exit 2
@@ -605,7 +612,11 @@ for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
             [ -n "$c" ] || continue
             obj=$(objname "$c")
             own+=("$obj")
-            compile "$c" "$obj" "${CFLAGS[@]}" "${TP_INC[@]}"
+            # the server's HTTPS reads Mbed TLS's headers, as the system's
+            extra=()
+            [ "$c" = src/server/tls.c ] &&
+                extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
+            compile "$c" "$obj" "${CFLAGS[@]}" "${TP_INC[@]}" "${extra[@]}"
         done < <(sort <<<"$own_list")
     fi
     echo "LD  $exe"

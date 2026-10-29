@@ -509,6 +509,16 @@ int32_t janas_mcp_open_url(const char *name, const char *url, int32_t n_headers,
                            const char *const *headers, int32_t seconds,
                            janas_mcp **out)
 {
+    return janas_mcp_open_url_policy(name, url, n_headers, headers, seconds,
+                                     NULL, out);
+}
+
+int32_t janas_mcp_open_url_policy(const char *name, const char *url,
+                                  int32_t n_headers, const char *const *headers,
+                                  int32_t seconds,
+                                  const struct janas_net_policy *policy,
+                                  janas_mcp **out)
+{
     if (!out || !url || n_headers < 0 || (n_headers > 0 && !headers))
         return janas_mcp_fail(JANAS_MCP_EINVAL, "invalid argument");
     *out = NULL;
@@ -522,6 +532,7 @@ int32_t janas_mcp_open_url(const char *name, const char *url, int32_t n_headers,
         janas_mcp_close(m);
         return janas_mcp_fail(JANAS_MCP_EINVAL, "%s", err);
     }
+    m->url.policy = policy;
     for (int32_t i = 0; i < n_headers; i++)
         if (!headers[i] || strpbrk(headers[i], "\r\n") ||
             !strchr(headers[i], ':')) {

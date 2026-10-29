@@ -85,7 +85,20 @@ struct layer {
     /* qwen4exp's sparse attention (model_qsa.c): the indexer's query and key
        projections (bf16) and their norms */
     const struct janas_jns_tensor *ix_q, *ix_k, *ix_qn, *ix_kn;
+    /* Nemotron-H (model_nh.c): what the layer is (JANAS_NH_*); a Mamba-2
+       mixer's conv bias, D, and its projections' scales (the file's
+       per-tensor ones of NVFP4); a mixture's experts (the router's rows),
+       their choice's bias, the latent projections, its shared expert
+       (up, down: relu^2, no gate) */
+    int nh_kind;
+    const float *conv_b, *ssm_dd;
+    float in_scale, out_scale2;
+    uint32_t n_exp;
+    const float *exp_bias;
+    const struct janas_jns_tensor *lat_down, *lat_up, *sh_up, *sh_down;
 };
+
+enum { JANAS_NH_MAMBA, JANAS_NH_ATTN, JANAS_NH_MOE };
 
 _Static_assert(JANAS_ATTN_MAX_BLOCK == JANAS_LLM_MAX_BLOCK, "block size");
 
@@ -155,6 +168,19 @@ struct janas_llm_model {
     uint32_t head_swa, n_rot_swa, n_kv_swa, window, hd_max, kvd_max;
     float rope_base_swa, softcap;
     const float *rope_freqs;
+    /* pictures in the sequence (model_media.c): where each begins, its
+       grid of tokens and their embeddings; the multimodal RoPE's sections
+       (rope.dimension_sections, Qwen3.5: 11, 11, 10; 0: none), which give
+       a picture's tokens their row and column as positions; both: its
+       tokens attend to one another both ways; att_last, a pass's last
+       positions seen (blk) when one is */
+    struct janas_media {
+        uint32_t at, nx, ny;
+        int both;
+        float *embd;
+    } *media;
+    uint32_t n_media, mrope[3];
+    uint32_t *att_last;
     /* Gemma 4's per-layer embeddings (0: none): ple_dim numbers per layer
        and token, from a table of their own read a row at a time from the
        file (ple_tok, never in memory) and a projection of the embedding
@@ -185,6 +211,23 @@ struct janas_llm_model {
        heads, n_vh value heads (n_vh / n_kh per key head), conv over the
        q|k|v channels */
     uint32_t d_conv, ds, n_kh, n_vh, d_inner, conv_ch, qkvz_dim;
+    /* the recurrent state of a layer, in uint16 units (each buffer of
+       ssm_buf holds n_rec of them): DeltaNet's n_vh heads of ds x ds at
+       sixteen bits; Mamba-2's (JANAS_REC_MAMBA2) n_vh heads of ssm_hd rows
+       of ds, in float, two units each */
+    size_t ssm_per;
+    uint32_t ssm_hd;
+    /* Nemotron-H's mixtures (model_nh.c, model_ffn.c): the latent width
+       (0: none), the weights' scale, and per call the experts' input and
+       where their weighted outputs go - d_model, xq and x, or the latent
+       ones; lat the latent input, lat_acc the sum, latq either quantized;
+       sh_h and sh_hq the shared expert's rows */
+    uint32_t moe_lat, moe_w;
+    float route_scale;
+    const struct janas_block_q8k *moe_xq;
+    float *moe_out, *lat, *lat_acc, *sh_h;
+    struct janas_block_q8k *latq, *sh_hq;
+    uint32_t sh_ff;
     int avx2; /* AVX2 and FMA: the vector kernels of this file */
     int f16c;
     int trace; /* JANAS_TRACE=1: print the state after every layer */
@@ -554,6 +597,19 @@ struct tok_job {
 };
 
 void janas_m_init_tuner(struct janas_llm_model *m);
+/* model_media.c: the embedding of a picture's token at sequence position
+   pos (NULL: not a picture's), the three RoPE positions of any (time, row,
+   column), and the pictures forgotten */
+const float *janas_m_media_row(const struct janas_llm_model *m, uint32_t pos);
+void janas_m_media_pos(const struct janas_llm_model *m, uint32_t pos,
+                       float p3[3]);
+void janas_m_media_free(struct janas_llm_model *m);
+/* 1 when a picture whose tokens attend both ways is among the n tokens
+   from pos0; then janas_m_media_last fills the last position each sees */
+int janas_m_media_both(const struct janas_llm_model *m, uint32_t pos0,
+                       uint32_t n);
+void janas_m_media_last(const struct janas_llm_model *m, uint32_t pos0,
+                        uint32_t n, uint32_t *last);
 /* Memory the GPU will import collapsed into 2 MB pages (Linux; see
    model_load.c), before the import pins it. */
 /* The Ana-Net probe (model_ana.c, JANAS_ANA_*): set up at load (0, or -1
@@ -736,7 +792,7 @@ int janas_m_assist_draft(struct janas_llm_model *m, int32_t token,
                          const float *h, uint32_t p, float *hnext, int32_t *out,
                          float *conf);
 int janas_m_ple_inputs(struct janas_llm_model *m, const int32_t *tokens,
-                       uint32_t n);
+                       uint32_t n, uint32_t pos0);
 /* y (n rows of rows) = scale w x (n rows of cols): w bf16, rows of cols,
    x already at bf16 (janas_m_round_bf16), as llama.cpp meets a bf16 matrix;
    each row and token one thread's, the same bits whatever the threads
@@ -817,6 +873,17 @@ void janas_m_qsa_shift(struct janas_llm_model *m, uint32_t keep, uint32_t drop,
                        uint32_t n_kv);
 /* which experts a moe_block call runs */
 enum { MOE_ALL, MOE_SHARED, MOE_ROUTED };
+
+/* Nemotron-H (model_nh.c, model_mamba.c) */
+int janas_m_nh_kind(struct janas_llm_model *m, uint32_t l);
+int janas_m_nh_params(struct janas_llm_model *m);
+int janas_m_nh_layer_load(struct janas_llm_model *m, uint32_t l,
+                          struct layer *ly, char *err, size_t err_len);
+int janas_m_nh_alloc(struct janas_llm_model *m);
+void janas_m_nh_free(struct janas_llm_model *m);
+int janas_m_nh_layers(struct janas_llm_model *m, uint32_t n, uint32_t pos0);
+void janas_m_mamba_layer(struct janas_llm_model *m, const struct layer *ly,
+                         uint32_t n);
 /* The router of layer l applied ahead to the state x (for the predictor
    probe, janas_llm_model_route_predictor): 0 or -1. */
 int janas_m_route_predict(struct janas_llm_model *m, uint32_t l, uint32_t n);

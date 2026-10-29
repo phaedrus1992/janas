@@ -18,7 +18,7 @@
 /* the kinds of product shader (gpu.c's prod_index) */
 #define N_PROD 15
 /* the kinds of b32_matvec.comp (gpu.c's b32_kind) */
-#define N_B32 7
+#define N_B32 8
 /* the 256-block types of iq2_matvec, iq3xxs_matvec, iq1_matvec and
    q2k_matvec.comp (gpu.c's iqk_index) */
 #define N_IQK 7
@@ -127,6 +127,7 @@ struct region {
        GPU writes there the CPU reads. 0: a copy in a card's own memory
        (copy_to_device), which the GPU's writes never leave */
     int host_shared;
+    VkDeviceSize local; /* of the card's own memory, given back with it */
 };
 
 struct stage {
@@ -135,7 +136,8 @@ struct stage {
     uint8_t *map;
     VkDeviceAddress addr;
     size_t bytes;
-    int coherent; /* else invalidated before the host reads it */
+    int coherent;       /* else invalidated before the host reads it */
+    VkDeviceSize local; /* of the card's own memory (janas_g_make_local) */
 };
 
 struct pending {
@@ -250,13 +252,16 @@ struct janas_gpu {
     struct region reg[MAX_REGIONS];
     int n_reg;
     struct stage xs, ys;
+    struct stage kas; /* the keep-alive's float: its own, never a stage in
+                         use (another thread writes it, unordered) */
     struct pending pend[MAX_PENDING];
     size_t n_pend;
     int busy, broken;
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     uint32_t sg;              /* subgroup size the shader runs with */
     int discrete;             /* weights copied to its memory, not shared */
-    VkDeviceSize local_bytes; /* taken of its own memory, never given back */
+    VkDeviceSize local_bytes; /* taken of its own memory, less what was
+                                 given back */
     int host_import;          /* VK_EXT_external_memory_host available */
     int sg_control; /* the size is required (else the device's fixed one) */
     uint32_t sg_min, sg_max; /* the sizes it may be given (sg_control) */
@@ -341,6 +346,9 @@ void janas_g_drop_region(struct janas_gpu *g, const void *host);
 int janas_g_mem_type(const struct janas_gpu *g, uint32_t bits,
                      VkMemoryPropertyFlags want);
 VkDeviceAddress janas_g_buffer_address(struct janas_gpu *g, VkBuffer b);
+/* A stage's buffer and memory freed, what it took of the card's own memory
+   given back; the stage zeroed. */
+void janas_g_free_stage(struct janas_gpu *g, struct stage *s);
 int janas_g_make_stage(struct janas_gpu *g, struct stage *s, size_t bytes,
                        int cached);
 VkResult janas_g_make_pipeline(struct janas_gpu *g, const uint32_t *code,

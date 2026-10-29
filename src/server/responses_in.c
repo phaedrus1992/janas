@@ -42,7 +42,8 @@ void resp_item_id(yyjson_mut_doc *d, yyjson_mut_val *item)
 
 /* The text of a content: a string, or its text parts joined. NULL with err
    set when it holds something else (an image, a file). */
-static char *content_text(yyjson_val *c, size_t *n, char *err, size_t el)
+static char *content_text(yyjson_val *c, size_t *n, struct srv_img **imgs,
+                          int *n_imgs, char *err, size_t el)
 {
     if (!c || yyjson_is_null(c)) {
         *n = 0;
@@ -61,13 +62,24 @@ static char *content_text(yyjson_val *c, size_t *n, char *err, size_t el)
     yyjson_arr_foreach(c, idx, max, p)
     {
         const char *t = yyjson_get_str(yyjson_obj_get(p, "type"));
+        int pic = imgs ? srv_image_part(p, t, imgs, n_imgs, err, el) : 0;
+        if (pic < 0)
+            return NULL;
+        if (pic)
+            continue;
         if (!t || (strcmp(t, "input_text") && strcmp(t, "output_text") &&
                    strcmp(t, "text") && strcmp(t, "refusal"))) {
-            snprintf(err, el, "only text parts are supported (got '%s')",
+            snprintf(err, el,
+                     "only text and picture parts are supported (got '%s')",
                      t ? t : "?");
             return NULL;
         }
-        total += yyjson_get_len(yyjson_obj_get(p, "text"));
+        yyjson_val *tx = srv_part_text(p, t);
+        if (tx && !yyjson_is_str(tx)) {
+            snprintf(err, el, "a part's text must be a string");
+            return NULL;
+        }
+        total += tx ? yyjson_get_len(tx) : 0;
     }
     char *s = malloc(total + 1);
     if (!s) {
@@ -77,9 +89,11 @@ static char *content_text(yyjson_val *c, size_t *n, char *err, size_t el)
     size_t w = 0;
     yyjson_arr_foreach(c, idx, max, p)
     {
-        yyjson_val *tx = yyjson_obj_get(p, "text");
-        memcpy(s + w, yyjson_get_str(tx) ? yyjson_get_str(tx) : "",
-               yyjson_get_len(tx));
+        yyjson_val *tx =
+            srv_part_text(p, yyjson_get_str(yyjson_obj_get(p, "type")));
+        if (!tx)
+            continue;
+        memcpy(s + w, yyjson_get_str(tx), yyjson_get_len(tx));
         w += yyjson_get_len(tx);
     }
     s[w] = 0;
@@ -160,9 +174,21 @@ int resp_items_to_msgs(struct srv_job *j, yyjson_val *items, char *err,
         if (!type || !strcmp(type, "message")) {
             const char *role = yyjson_get_str(yyjson_obj_get(it, "role"));
             size_t n;
-            char *t = content_text(yyjson_obj_get(it, "content"), &n, err, el);
-            if (!t)
+            struct srv_img *imgs = NULL;
+            int n_imgs = 0;
+            char *t = content_text(yyjson_obj_get(it, "content"), &n, &imgs,
+                                   &n_imgs, err, el);
+            if (!t) {
+                srv_imgs_free(imgs, n_imgs);
                 return -1;
+            }
+            if (n_imgs && (!role || strcmp(role, "user"))) {
+                free(t);
+                srv_imgs_free(imgs, n_imgs);
+                snprintf(err, el, "input[%zu]: pictures go in a user's message",
+                         idx);
+                return -1;
+            }
             int32_t rid =
                 !role                        ? -1
                 : !strcmp(role, "user")      ? JANAS_LLM_ROLE_USER
@@ -183,8 +209,13 @@ int resp_items_to_msgs(struct srv_job *j, yyjson_val *items, char *err,
                     goto oom;
                 continue;
             }
-            if (!resp_push(j, rid, t, n))
+            struct srv_msg *um = resp_push(j, rid, t, n);
+            if (!um) {
+                srv_imgs_free(imgs, n_imgs);
                 goto oom;
+            }
+            um->imgs = imgs;
+            um->n_imgs = n_imgs;
         } else if (!strcmp(type, "function_call")) {
             const char *name = yyjson_get_str(yyjson_obj_get(it, "name"));
             yyjson_val *a = yyjson_obj_get(it, "arguments");
@@ -204,7 +235,8 @@ int resp_items_to_msgs(struct srv_job *j, yyjson_val *items, char *err,
                 goto oom;
         } else if (!strcmp(type, "function_call_output")) {
             size_t n;
-            char *t = content_text(yyjson_obj_get(it, "output"), &n, err, el);
+            char *t = content_text(yyjson_obj_get(it, "output"), &n, NULL, NULL,
+                                   err, el);
             if (!t)
                 return -1;
             if (!resp_push(j, JANAS_LLM_ROLE_TOOL, t, n))
@@ -442,12 +474,19 @@ static int read_tools(struct srv_req *r, struct srv_job *j, yyjson_val *root,
         yyjson_arr_foreach(tools, idx, max, t)
         {
             const char *type = yyjson_get_str(yyjson_obj_get(t, "type"));
+            /* web_search (and its dated and preview names): the server
+               searches (responses_mcp.c) */
             if (!type ||
-                (strcmp(type, "function") != 0 && strcmp(type, "mcp") != 0)) {
+                (strcmp(type, "function") != 0 && strcmp(type, "mcp") != 0 &&
+                 strncmp(type, "web_search", 10) != 0 &&
+                 strcmp(type, "file_search") != 0 &&
+                 strcmp(type, "code_interpreter") != 0)) {
                 *ret = srv_reply_error(r, 400, "invalid_request_error",
                                        "unsupported_value",
-                                       "tools[%zu]: only functions and MCP "
-                                       "servers can be called here (got '%s').",
+                                       "tools[%zu]: only functions, MCP "
+                                       "servers, web_search, file_search and "
+                                       "code_interpreter can be called here "
+                                       "(got '%s').",
                                        idx, type ? type : "?");
                 return -1;
             }
@@ -642,6 +681,8 @@ int resp_read(struct srv_req *r, struct resp *x, int *ret)
     char err[256];
     int e = resp_items_to_msgs(j, yyjson_doc_get_root(cd), err, sizeof(err));
     yyjson_doc_free(cd);
+    if (e == 0) /* the pictures' bytes, before the engine has the job */
+        e = srv_images_fetch(r->srv, j, err, sizeof(err));
     if (e != 0) {
         bad(r, ret, err);
         goto out;

@@ -226,12 +226,18 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     pthread_cond_init(&p->wake_idle, NULL);
     for (int i = 1; i < n_threads; i++) {
         struct worker_arg *wa = malloc(sizeof(*wa));
-        if (!wa)
-            abort();
-        wa->p = p;
-        wa->tid = i;
-        if (pthread_create(&p->threads[i], NULL, worker, wa) != 0)
-            abort();
+        if (wa) {
+            wa->p = p;
+            wa->tid = i;
+        }
+        if (!wa || pthread_create(&p->threads[i], NULL, worker, wa) != 0) {
+            /* a library does not end its host: the threads started stop,
+               and the caller hears NULL */
+            free(wa);
+            p->n_threads = i;
+            janas_pool_destroy(p);
+            return NULL;
+        }
     }
     return p;
 }

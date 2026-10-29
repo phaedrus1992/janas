@@ -33,6 +33,7 @@
 #include "llm/quant.h"
 #include "llm/tokenizer.h"
 #include "llm/chat.h"
+#include "llm/vision.h"
 #include "llm/metrics.h"
 
 static _Thread_local char last_error[256];
@@ -329,7 +330,7 @@ static uint64_t npu_need(const struct janas_jns *j)
 }
 
 static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
-                     struct mem_need *e)
+                     uint32_t min_block, struct mem_need *e)
 {
     char arch[32] = "";
     janas_jns_meta_str(j, "general.architecture", arch, sizeof(arch));
@@ -399,7 +400,8 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
     snprintf(key, sizeof(key), "%.32s.attention.sliding_window", arch);
     if (janas_jns_meta_u32(j, key, &window) == 0 && window) {
         const char *rg = getenv("JANAS_SWA_RING");
-        ring = janas_attn_ring_positions(window, janas_llm_prefill_block(j));
+        ring = janas_attn_ring_positions(window,
+                                         janas_llm_prefill_block(j, min_block));
         if (ring >= n_ctx || (rg && atoi(rg) == 0))
             ring = 0;
     }
@@ -500,7 +502,7 @@ static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
     }
     snprintf(key, sizeof(key), "%.32s.expert_used_count", arch);
     janas_jns_meta_u32(j, key, &k_used);
-    uint64_t blk = janas_llm_prefill_block(j);
+    uint64_t blk = janas_llm_prefill_block(j, min_block);
     if (blk < 256)
         blk = 256;
     uint64_t scratch =
@@ -575,10 +577,11 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     janas_jns_meta_str(&j, "general.architecture", arch, sizeof(arch));
     int32_t rc = 0;
     /* byte-level BPE with Qwen's or Llama 3's pre-tokenizers, or Gemma 4's */
-    int known = (strcmp(kind, "gpt2") == 0 &&
-                 (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0 ||
-                  strcmp(pre, "llama-bpe") == 0)) ||
-                strcmp(kind, "gemma4") == 0;
+    int known =
+        (strcmp(kind, "gpt2") == 0 &&
+         (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0 ||
+          strcmp(pre, "llama-bpe") == 0 || strcmp(pre, "pixtral") == 0)) ||
+        strcmp(kind, "gemma4") == 0;
     if (!known)
         rc = janas_api_fail(JANAS_LLM_EMODEL, "tokenizer %s/%s not supported",
                             kind, pre);
@@ -587,7 +590,10 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     else
         rc = find_format(llm, &j);
     struct mem_need e;
-    mem_need(&j, p.n_ctx, p.mtp_path != NULL, &e);
+    /* a vision encoder beside it whose pictures attend both ways: the
+       prefill block holds a picture whole */
+    uint32_t pic_block = janas_api_picture_block(path);
+    mem_need(&j, p.n_ctx, p.mtp_path != NULL, pic_block, &e);
     janas_jns_close(&j);
     if (rc != 0) {
         janas_tokenizer_destroy(llm->tok);
@@ -683,8 +689,14 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         .expert_bits = p.expert_bits,
         .attn_scores = p.attn_scores,
         .head_bits = p.head_bits,
+        .min_quality = p.min_quality < JANAS_LLM_QUALITY_LOW ||
+                               p.min_quality > JANAS_LLM_QUALITY_HIGH
+                           ? JANAS_LLM_QUALITY_LOW
+                           : p.min_quality,
         .no_npu = no_npu,
-        .ple_ram = table_ram};
+        .ple_ram = table_ram,
+        .min_block = pic_block};
+    llm->path = strdup(path);
     llm->m = janas_llm_model_load(path, &mo, err, sizeof(err));
     if (!llm->m) {
         janas_tokenizer_destroy(llm->tok);
@@ -799,7 +811,10 @@ int32_t janas_llm_estimate(const char *path, const struct janas_llm_params *pp,
     if (janas_jns_open(path, &j, err, sizeof(err)) != 0)
         return janas_api_fail(JANAS_LLM_EOPEN, "%s: %s", path, err);
     struct mem_need e;
-    mem_need(&j, p.n_ctx, p.mtp_path != NULL, &e);
+    /* a vision encoder beside it whose pictures attend both ways: the
+       prefill block holds a picture whole */
+    uint32_t pic_block = janas_api_picture_block(path);
+    mem_need(&j, p.n_ctx, p.mtp_path != NULL, pic_block, &e);
     janas_jns_close(&j);
     if (fixed)
         *fixed = mem_fixed(&e, &p);
@@ -834,6 +849,8 @@ void janas_llm_close(janas_llm *llm)
     janas_llm_model_free(llm->draft);
     janas_llm_model_free(llm->m);
     janas_tokenizer_destroy(llm->tok);
+    janas_vision_close(llm->vis);
+    free(llm->path);
     free(llm);
 }
 

@@ -68,6 +68,8 @@ export interface OpenOptions {
     headBits?: 4 | 6;
     /** How the attention scores are computed: "exact", "fast" (sixteen-bit integers), "auto". */
     attention?: "auto" | "exact" | "fast";
+    /** The lowest quality the engine may choose to be faster where memory is short: "low" (default) the experts at four bits and the light ones not in memory left out, "medium" four bits only, "high" nothing lowered. expertBits and headBits win over it. */
+    quality?: "low" | "medium" | "high";
 }
 
 /** An open model. */

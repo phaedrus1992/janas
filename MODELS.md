@@ -165,6 +165,8 @@ f1b8111d3e49a0238fcaa77ec9ee24eb9805266b5e85bf8e54c12dedb02cf4ff  Qwen3-30B-A3B-
 
 **Gemma 4: E2B, E4B, 12B and 26B-A4B, and their assistants**, from [`unsloth/gemma-4-E2B-it-GGUF`](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF), [`unsloth/gemma-4-E4B-it-GGUF`](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF), [`unsloth/gemma-4-12b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) and [`unsloth/gemma-4-26B-A4B-it-GGUF`](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF). Each converted in one step, as it is kept here, and each converted twice on 27 September 2026: the same bytes. The assistant, Gemma's drafting model (the `mtp-` file, given to the chat with `--mtp`), converts with `gguf2jns` like the model. The 26B's feed-forwards are widened with zeros to a multiple of 256, which is why its file is larger than its GGUF.
 
+**NVIDIA Nemotron-3.5-Bolt-74B-A9B (24GB)**, from [`nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) (SHA-256 of the GGUF as published there, 91d63363...99af75), converted on 28 October 2026 by `gguf2jns` into a 22.0 GB file: its layers without experts (Mamba-2 and attention) get an empty slot, its experts no gate, and the table of experts is as wide as the layer with the most (496), the others' extra slots absent. Its licence is NVIDIA's OpenMDW-1.1 (on the model's page): until its terms are read for redistribution, nothing of it is published here; convert it yourself.
+
 ```
 740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8  gemma-4-E2B-it-Q4_K_M.gguf
 1f18e08878df41f377d563b38048d41841c7973ddea845cd9672fcf23cbd864b  gemma-4-e2b-it-q4km.jns   (gguf2jns)

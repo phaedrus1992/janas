@@ -39,8 +39,9 @@ static void open_drop(void *data)
 }
 
 static const char *const open_known[] = {
-    "context", "cacheGiB", "reserveGiB", "mtp",      "draft",     "mode",
-    "gpu",     "preload",  "expertBits", "headBits", "attention", NULL};
+    "context",   "cacheGiB", "reserveGiB", "mtp",        "draft",
+    "mode",      "gpu",      "preload",    "expertBits", "headBits",
+    "attention", "quality",  NULL};
 
 /* one of the strings, as its index; -1 after throwing */
 static int choice(napi_env env, napi_value o, const char *name,
@@ -66,6 +67,7 @@ static int open_options(napi_env env, napi_value o, struct open_job *oj)
     const char *w = "open";
     static const char *const modes[] = {"auto", "eco", "max", NULL};
     static const char *const attn[] = {"auto", "exact", "fast", NULL};
+    static const char *const quality[] = {"low", "medium", "high", NULL};
     int64_t i;
     double d;
     int b, r, k;
@@ -134,6 +136,10 @@ static int open_options(napi_env env, napi_value o, struct open_job *oj)
         oj->p.attn_scores = k == 1   ? JANAS_LLM_ATTN_EXACT
                             : k == 2 ? JANAS_LLM_ATTN_FAST
                                      : JANAS_LLM_ATTN_AUTO;
+    if ((r = choice(env, o, "quality", quality, &k)) < 0)
+        return -1;
+    if (r)
+        oj->p.min_quality = k; /* JANAS_LLM_QUALITY_*: low 0, high 2 */
     return 0;
 }
 

@@ -14,6 +14,7 @@
 #include "iq3xxs_grid.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,31 @@ float janas_e8m0_half(uint8_t e)
     float f;
     memcpy(&f, &bits, sizeof(f));
     return f;
+}
+
+static float ue4m3_value(uint8_t x)
+{
+    if (x == 0 || x == 0x7F)
+        return 0.0f;
+    int e = (x >> 3) & 15, man = x & 7;
+    float raw = e == 0 ? ldexpf((float)man, -9)
+                       : ldexpf(1.0f + (float)man / 8.0f, e - 7);
+    return raw * 0.5f;
+}
+
+/* all 256 bytes' values, made once */
+static float ue4m3_tab[256];
+static pthread_once_t ue4m3_once = PTHREAD_ONCE_INIT;
+static void ue4m3_init(void)
+{
+    for (int i = 0; i < 256; i++)
+        ue4m3_tab[i] = ue4m3_value((uint8_t)i);
+}
+
+float janas_ue4m3_half(uint8_t x)
+{
+    pthread_once(&ue4m3_once, ue4m3_init);
+    return ue4m3_tab[x];
 }
 
 int janas_mxfp4_to_q8_0(const uint8_t *in, struct janas_block_q8_0 *out,
@@ -837,6 +863,44 @@ float janas_mxfp4_dot_ref(const struct janas_block_mxfp4 *w,
                 nib_sum32(wk->qs, x[b].qs32 + 32 * k, janas_mxfp4_values);
             acc[k] =
                 fmaf(janas_e8m0_half(wk->e) * x[b].d32[k], (float)dot, acc[k]);
+        }
+    return ((acc[0] + acc[4]) + (acc[2] + acc[6])) +
+           ((acc[1] + acc[5]) + (acc[3] + acc[7]));
+}
+
+void janas_nvfp4_dequantize(const struct janas_block_nvfp4 *x, float *y,
+                            size_t n)
+{
+    for (size_t b = 0; b < n / 64; b++)
+        for (int k = 0; k < 4; k++, y += 16) {
+            float d = janas_ue4m3_half(x[b].d[k]);
+            for (int j = 0; j < 8; j++) {
+                y[j] = d * janas_mxfp4_values[x[b].qs[8 * k + j] & 15];
+                y[j + 8] = d * janas_mxfp4_values[x[b].qs[8 * k + j] >> 4];
+            }
+        }
+}
+
+/* The lane of a block of 32 activations takes its two sub-blocks in turn,
+   each its exact sum times the two scales. */
+float janas_nvfp4_dot_ref(const struct janas_block_nvfp4 *w,
+                          const struct janas_block_q8k *x, size_t nb)
+{
+    float acc[8] = {0};
+    for (size_t b = 0; b < nb; b++)
+        for (int k = 0; k < 8; k++) {
+            const struct janas_block_nvfp4 *wk = w + 4 * b + k / 2;
+            const int8_t *a = x[b].qs32 + 32 * k;
+            for (int h = 0; h < 2; h++) {
+                int s = 2 * (k % 2) + h;
+                const uint8_t *q = wk->qs + 8 * s;
+                int32_t dot = 0;
+                for (int j = 0; j < 8; j++)
+                    dot += janas_mxfp4_values[q[j] & 15] * a[16 * h + j] +
+                           janas_mxfp4_values[q[j] >> 4] * a[16 * h + j + 8];
+                acc[k] = fmaf(x[b].d32[k] * janas_ue4m3_half(wk->d[s]),
+                              (float)dot, acc[k]);
+            }
         }
     return ((acc[0] + acc[4]) + (acc[2] + acc[6])) +
            ((acc[1] + acc[5]) + (acc[3] + acc[7]));
@@ -1630,6 +1694,8 @@ static int use_tiles = 1;
 /* Resolved before main: the kernels are first called from pool threads. */
 __attribute__((constructor)) static void dot_kernels_init(void)
 {
+    /* NVFP4's scales, before any kernel reads them (not once a row) */
+    pthread_once(&ue4m3_once, ue4m3_init);
     for (int e = 0; e < 256; e++)
         e8m0_tab[e] = janas_e8m0_half((uint8_t)e);
     for (uint32_t i = 0; i < 256; i++) {
@@ -1729,6 +1795,139 @@ float janas_iq4xs_dot(const struct janas_block_iq4xs *w,
                       const struct janas_block_q8k *x, size_t nb)
 {
     return dotxs_impl(w, x, nb);
+}
+
+#if defined(__x86_64__)
+/* NVFP4 with AVX2: a block of 32 activations at a time, its two
+   sub-blocks' codes in their order (low nibbles then high, each sub-block's
+   eight bytes) through the table, sign and abs into maddubs; each
+   sub-block's exact sum, then the lane's two fmas of the reference, in its
+   order: the same bits. */
+__attribute__((target("avx2,fma"))) static float
+nvfp4_dot_avx2(const struct janas_block_nvfp4 *w,
+               const struct janas_block_q8k *x, size_t nb)
+{
+    const __m128i tbl = _mm_loadu_si128((const __m128i *)janas_mxfp4_values);
+    const __m128i m4 = _mm_set1_epi8(15);
+    const __m256i one = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps(); /* lane k: the reference's acc[k] */
+    for (size_t b = 0; b < nb; b++) {
+        const struct janas_block_nvfp4 *wb = w + 4 * b;
+        __m256i p[8];
+        for (int k = 0; k < 8; k++) {
+            __m128i q =
+                _mm_loadu_si128((const __m128i *)(wb[k / 2].qs + 16 * (k % 2)));
+            __m128i lo = _mm_shuffle_epi8(tbl, _mm_and_si128(q, m4));
+            __m128i hi =
+                _mm_shuffle_epi8(tbl, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+            __m256i wv = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi),
+                                          _mm_unpacklo_epi64(lo, hi));
+            __m256i av =
+                _mm256_loadu_si256((const __m256i *)(x[b].qs32 + 32 * k));
+            p[k] = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv),
+                                     _mm256_sign_epi8(av, wv)),
+                one);
+        }
+        /* each vector's two halves summed: [A0..A3 | B0..B3] for k 0-3,
+           A the first sub-block of block k, B the second */
+        __m256i h03 = _mm256_hadd_epi32(_mm256_hadd_epi32(p[0], p[1]),
+                                        _mm256_hadd_epi32(p[2], p[3]));
+        __m256i h47 = _mm256_hadd_epi32(_mm256_hadd_epi32(p[4], p[5]),
+                                        _mm256_hadd_epi32(p[6], p[7]));
+        __m256 ia =
+            _mm256_cvtepi32_ps(_mm256_permute2x128_si256(h03, h47, 0x20));
+        __m256 ib =
+            _mm256_cvtepi32_ps(_mm256_permute2x128_si256(h03, h47, 0x31));
+        __m256 d8 = _mm256_loadu_ps(x[b].d32);
+        __m256 sa = _mm256_set_ps(ue4m3_tab[wb[3].d[2]], ue4m3_tab[wb[3].d[0]],
+                                  ue4m3_tab[wb[2].d[2]], ue4m3_tab[wb[2].d[0]],
+                                  ue4m3_tab[wb[1].d[2]], ue4m3_tab[wb[1].d[0]],
+                                  ue4m3_tab[wb[0].d[2]], ue4m3_tab[wb[0].d[0]]);
+        __m256 sb = _mm256_set_ps(ue4m3_tab[wb[3].d[3]], ue4m3_tab[wb[3].d[1]],
+                                  ue4m3_tab[wb[2].d[3]], ue4m3_tab[wb[2].d[1]],
+                                  ue4m3_tab[wb[1].d[3]], ue4m3_tab[wb[1].d[1]],
+                                  ue4m3_tab[wb[0].d[3]], ue4m3_tab[wb[0].d[1]]);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(d8, sa), ia, acc);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(d8, sb), ib, acc);
+    }
+    return janas_hsum8(acc);
+}
+#endif
+
+#if defined(__x86_64__)
+/* The same on g vectors (up to 8) xs blocks apart: the weights decoded
+   once a block for all of them, each vector's arithmetic that of
+   nvfp4_dot_avx2: the same bits. */
+__attribute__((target("avx2,fma"))) static void
+nvfp4_dotn_avx2(const struct janas_block_nvfp4 *w,
+                const struct janas_block_q8k *x, size_t xs, int g, size_t nb,
+                float *r)
+{
+    const __m128i tbl = _mm_loadu_si128((const __m128i *)janas_mxfp4_values);
+    const __m128i m4 = _mm_set1_epi8(15);
+    const __m256i one = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int v = 0; v < g; v++)
+        acc[v] = _mm256_setzero_ps();
+    for (size_t b = 0; b < nb; b++) {
+        const struct janas_block_nvfp4 *wb = w + 4 * b;
+        __m256i wv[8], aw[8];
+        for (int k = 0; k < 8; k++) {
+            __m128i q =
+                _mm_loadu_si128((const __m128i *)(wb[k / 2].qs + 16 * (k % 2)));
+            __m128i lo = _mm_shuffle_epi8(tbl, _mm_and_si128(q, m4));
+            __m128i hi =
+                _mm_shuffle_epi8(tbl, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+            wv[k] = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi),
+                                     _mm_unpacklo_epi64(lo, hi));
+            aw[k] = _mm256_sign_epi8(wv[k], wv[k]);
+        }
+        __m256 sa = _mm256_set_ps(ue4m3_tab[wb[3].d[2]], ue4m3_tab[wb[3].d[0]],
+                                  ue4m3_tab[wb[2].d[2]], ue4m3_tab[wb[2].d[0]],
+                                  ue4m3_tab[wb[1].d[2]], ue4m3_tab[wb[1].d[0]],
+                                  ue4m3_tab[wb[0].d[2]], ue4m3_tab[wb[0].d[0]]);
+        __m256 sb = _mm256_set_ps(ue4m3_tab[wb[3].d[3]], ue4m3_tab[wb[3].d[1]],
+                                  ue4m3_tab[wb[2].d[3]], ue4m3_tab[wb[2].d[1]],
+                                  ue4m3_tab[wb[1].d[3]], ue4m3_tab[wb[1].d[1]],
+                                  ue4m3_tab[wb[0].d[3]], ue4m3_tab[wb[0].d[1]]);
+        for (int v = 0; v < g; v++) {
+            const struct janas_block_q8k *xb = x + (size_t)v * xs + b;
+            __m256i p[8];
+            for (int k = 0; k < 8; k++)
+                p[k] = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        aw[k], _mm256_sign_epi8(
+                                   _mm256_loadu_si256(
+                                       (const __m256i *)(xb->qs32 + 32 * k)),
+                                   wv[k])),
+                    one);
+            __m256i h03 = _mm256_hadd_epi32(_mm256_hadd_epi32(p[0], p[1]),
+                                            _mm256_hadd_epi32(p[2], p[3]));
+            __m256i h47 = _mm256_hadd_epi32(_mm256_hadd_epi32(p[4], p[5]),
+                                            _mm256_hadd_epi32(p[6], p[7]));
+            __m256 ia =
+                _mm256_cvtepi32_ps(_mm256_permute2x128_si256(h03, h47, 0x20));
+            __m256 ib =
+                _mm256_cvtepi32_ps(_mm256_permute2x128_si256(h03, h47, 0x31));
+            __m256 d8 = _mm256_loadu_ps(xb->d32);
+            acc[v] = _mm256_fmadd_ps(_mm256_mul_ps(d8, sa), ia, acc[v]);
+            acc[v] = _mm256_fmadd_ps(_mm256_mul_ps(d8, sb), ib, acc[v]);
+        }
+    }
+    for (int v = 0; v < g; v++)
+        r[v] = janas_hsum8(acc[v]);
+}
+#endif
+
+float janas_nvfp4_dot(const struct janas_block_nvfp4 *w,
+                      const struct janas_block_q8k *x, size_t nb)
+{
+#if defined(__x86_64__)
+    if (use_avx2_fma)
+        return nvfp4_dot_avx2(w, x, nb);
+#endif
+    return janas_nvfp4_dot_ref(w, x, nb);
 }
 
 float janas_mxfp4_dot(const struct janas_block_mxfp4 *w,
@@ -1901,6 +2100,8 @@ size_t janas_qtype_block_size(int type)
         return 8 * sizeof(struct janas_block_iq4nl);
     case JANAS_MXFP4:
         return 8 * sizeof(struct janas_block_mxfp4);
+    case JANAS_NVFP4:
+        return 4 * sizeof(struct janas_block_nvfp4);
     case JANAS_Q4_0:
         return 8 * sizeof(struct janas_block_q4_0);
     case JANAS_Q5_1:
@@ -1954,6 +2155,9 @@ void janas_dequantize(int type, const void *w, float *y, size_t n)
         return;
     case JANAS_MXFP4:
         janas_mxfp4_dequantize(w, y, n);
+        return;
+    case JANAS_NVFP4:
+        janas_nvfp4_dequantize(w, y, n);
         return;
     case JANAS_IQ4_XS:
         janas_iq4xs_dequantize(w, y, n);
@@ -2018,6 +2222,8 @@ float janas_dot(int type, const void *w, const struct janas_block_q8k *x,
         return janas_iq4nl_dot(w, x, nb);
     case JANAS_MXFP4:
         return janas_mxfp4_dot(w, x, nb);
+    case JANAS_NVFP4:
+        return janas_nvfp4_dot(w, x, nb);
     case JANAS_IQ4_XS:
         return janas_iq4xs_dot(w, x, nb);
     case JANAS_Q4_0:
@@ -2305,6 +2511,16 @@ void janas_dot_multi(int type, const void *w, const struct janas_block_q8k *x,
 {
     size_t v = 0;
 #if defined(__x86_64__)
+    if (type == JANAS_NVFP4 && use_avx2_fma) {
+        float r[8];
+        for (; v < nv; v += 8) {
+            int g = nv - v >= 8 ? 8 : (int)(nv - v);
+            nvfp4_dotn_avx2(w, x + v * x_stride, x_stride, g, nb, r);
+            for (int i = 0; i < g; i++)
+                out[(v + (size_t)i) * out_stride] = r[i];
+        }
+        return;
+    }
     if (use_avx2_fma && __builtin_cpu_supports("f16c") &&
         (type == JANAS_Q4_K || type == JANAS_Q6_K || type == JANAS_Q5_K ||
          type == JANAS_Q8_0 || type == JANAS_IQ4_NL || type == JANAS_IQ4_XS ||
@@ -2421,6 +2637,9 @@ size_t janas_qtype_row_bytes(int type, size_t n)
     case JANAS_MXFP4:
         sub = 32, bytes = sizeof(struct janas_block_mxfp4);
         break;
+    case JANAS_NVFP4:
+        sub = 64, bytes = sizeof(struct janas_block_nvfp4);
+        break;
     case JANAS_Q4_0:
         sub = 32, bytes = sizeof(struct janas_block_q4_0);
         break;
@@ -2450,6 +2669,14 @@ size_t janas_qtype_row_bytes(int type, size_t n)
 static void tail_group(int type, const void *row, size_t full, size_t row_bytes,
                        uint8_t *pad)
 {
+    /* a shape the type cannot end inside a group with (row_bytes 0, or
+       not past the whole groups): the loaders refuse it; a pad of zeros
+       here rather than a copy past the row */
+    size_t bs = janas_qtype_block_size(type);
+    if (row_bytes <= full || row_bytes - full > bs || bs > TAIL_GROUP) {
+        memset(pad, 0, TAIL_GROUP);
+        return;
+    }
     size_t tb = row_bytes - full;
     memcpy(pad, (const uint8_t *)row + full, tb);
     memset(pad + tb, 0, janas_qtype_block_size(type) - tb);

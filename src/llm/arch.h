@@ -12,9 +12,10 @@
 
 /* The recurrent layers, if any: Gated DeltaNet in two layouts. */
 enum janas_rec {
-    JANAS_REC_NONE, /* attention in every layer */
-    JANAS_REC_NEXT, /* qwen3next: q|k|v|z and b|a from two fused matrices */
-    JANAS_REC_Q35   /* qwen35: q|k|v, z, alpha, beta from four */
+    JANAS_REC_NONE,  /* attention in every layer */
+    JANAS_REC_NEXT,  /* qwen3next: q|k|v|z and b|a from two fused matrices */
+    JANAS_REC_Q35,   /* qwen35: q|k|v, z, alpha, beta from four */
+    JANAS_REC_MAMBA2 /* nemotron_h_moe: Mamba-2 (model_mamba.c) */
 };
 
 struct janas_arch {
@@ -46,6 +47,12 @@ struct janas_arch {
        at the layers the file names, the DeltaNet's output gated by a
        sigmoid instead of SiLU, and the attention's sparse selection */
     int hc;
+    /* Nemotron-H (nemotron_h_moe, model_nh.c): each layer one part, its
+       norm and residual of its own - a Mamba-2 mixer, an attention without
+       RoPE or a mixture - the mixture's experts in a latent space (down
+       from d_model before them, up after), relu^2 without a gate, routed
+       by sigmoids with a bias for the choice */
+    int nh;
 };
 
 /* The architecture called name, or NULL if Janas does not know it. */

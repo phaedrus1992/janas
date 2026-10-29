@@ -40,6 +40,12 @@ enum PowerMode explicit
     Max = JANAS_LLM_MODE_MAX   '' whatever is fastest
 end enum
 
+enum Quality explicit '' the lowest the engine goes on its own
+    Low = JANAS_LLM_QUALITY_LOW       '' fastest where memory is short
+    Medium = JANAS_LLM_QUALITY_MEDIUM '' experts at four bits, none left out
+    High = JANAS_LLM_QUALITY_HIGH     '' nothing lowered
+end enum
+
 enum AttentionMode explicit
     Auto = JANAS_LLM_ATTN_AUTO
     Exact = JANAS_LLM_ATTN_EXACT '' the query as it is, summed in floating point

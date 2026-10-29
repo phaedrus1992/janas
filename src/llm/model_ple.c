@@ -356,7 +356,7 @@ static void product(struct janas_llm_model *m, const struct janas_jns_tensor *t,
  * normalized, plus the table's row times sqrt(ple_dim), all over sqrt(2).
  */
 int janas_m_ple_inputs(struct janas_llm_model *m, const int32_t *tokens,
-                       uint32_t n)
+                       uint32_t n, uint32_t pos0)
 {
     uint32_t dm = m->d_model, P = m->ple_dim, W = m->n_layer * P;
     float *xb = m->xn; /* the embeddings at bf16 */
@@ -381,12 +381,15 @@ int janas_m_ple_inputs(struct janas_llm_model *m, const int32_t *tokens,
     uint8_t *raw = (uint8_t *)(m->ple_row + W); /* the row as read */
     float es = sqrtf((float)P), is2 = 1.0f / sqrtf(2.0f);
     for (uint32_t j = 0; j < n; j++) {
-        off_t at =
-            (off_t)(m->ple_tok->offset + (uint64_t)tokens[j] * row_bytes);
+        /* a picture's token takes the padding's row (id 0), as both the
+           reference and llama.cpp do */
+        int32_t tok =
+            m->n_media && janas_m_media_row(m, pos0 + j) ? 0 : tokens[j];
+        off_t at = (off_t)(m->ple_tok->offset + (uint64_t)tok * row_bytes);
         const uint8_t *src = raw;
         if (m->ple_ram) /* the table in memory (janas_llm_options) */
             src = (const uint8_t *)data(m, m->ple_tok) +
-                  (uint64_t)tokens[j] * row_bytes;
+                  (uint64_t)tok * row_bytes;
         for (size_t done = 0; !m->ple_ram && done < row_bytes;) {
             ssize_t r =
                 pread(m->j.fd, raw + done, row_bytes - done, at + (off_t)done);

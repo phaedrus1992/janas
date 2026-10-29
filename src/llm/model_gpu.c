@@ -453,8 +453,7 @@ static int sync_state(struct janas_llm_model *m, int to_device)
     }
     if (m->a->rec) {
         size_t L = JANAS_LLM_MAX_BLOCK,
-               sb = 2 * (size_t)m->n_rec * m->n_vh * m->ds * m->ds *
-                    sizeof(uint16_t),
+               sb = 2 * (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t),
                cb = 2 * (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
                     sizeof(float),
                lm = (size_t)m->n_rec * L * m->conv_ch * sizeof(float),
@@ -524,8 +523,7 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
     if (!janas_gpu_shares_host(m->gpu) && !m->gtok_dev) {
         if (m->a->rec && !m->gtok_rec_in) {
             size_t L = JANAS_LLM_MAX_BLOCK,
-                   sb = 2 * (size_t)m->n_rec * m->n_vh * m->ds * m->ds *
-                        sizeof(uint16_t),
+                   sb = 2 * (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t),
                    cb = 2 * (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
                         sizeof(float),
                    lm = (size_t)m->n_rec * L * m->conv_ch * sizeof(float),
@@ -848,6 +846,9 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
                       int all, float *logits)
 {
     if (m->gtok_state < 0)
+        return -1;
+    /* a picture whose tokens attend both ways: the CPU's attention */
+    if (m->n_media && janas_m_media_both(m, pos, n))
         return -1;
     /* JANAS_GPU_TOKEN=1: tokens, and blocks with JANAS_GPU_BLOCK=1. With the
        fast prompt a prompt's blocks (from JANAS_GPU_FAST_N tokens) come

@@ -239,6 +239,9 @@ static int check_model(const struct janas_gpu *g,
     /* feed-forwards may end inside a group of 256 (qwen4exp's 640): their
        down matrices in blocks of 32, checked by janas_gpu_can and
        check_ffn */
+    /* its shaders add in clusters of 8 lanes and use the row shaders */
+    if (g->sg < 8)
+        return fail(err, len, "subgroups of fewer than 8 lanes");
     if (md->dm % JANAS_QK || qd % JANAS_QK || md->ff % 32 || md->dm > 8192 ||
         qd > 8192 || md->hd > 512 || md->hd % 16 || md->n_rot > md->hd ||
         md->n_kv == 0 || md->n_head % md->n_kv)
@@ -256,7 +259,10 @@ static int check_model(const struct janas_gpu *g,
                           : 0;
         if (!ga || ly->hd > md->hd || ly->hd % 16 || ly->n_rot > ly->hd ||
             ly->n_rot % 2 || ly->n_kv > md->n_kv ||
-            ga * ATT_RUN > ATT_MAXS_G(ga) || ly->cap == 0 ||
+            ga * ATT_RUN > ATT_MAXS_G(ga) ||
+            /* sixteen-bit values: a thread 8 numbers of the G heads, at
+               most 256 threads (attn_decode.comp's SH would be 0) */
+            (md->kv16 && ga * ly->hd > 2048) || ly->cap == 0 ||
             ly->cap > md->cap ||
             (ly->swa ? ly->n_rot > md->n_rot_swa : ly->n_rot > md->n_rot) ||
             (md->kv16 && (md->ix_heads || md->n_rec)))
@@ -371,8 +377,7 @@ static int make_buf(struct janas_gpu *g, struct janas_gpu_tok *t, size_t bytes)
     if (janas_g_make_local(g, &d, bytes) != 0)
         return janas_g_make_stage(g, &t->buf, bytes, 1);
     if (janas_g_make_stage(g, &t->mirror, bytes, 1) != 0) {
-        g->vkDestroyBuffer(g->dev, d.buf, NULL);
-        g->vkFreeMemory(g->dev, d.mem, NULL);
+        janas_g_free_stage(g, &d);
         return -1;
     }
     t->buf = d;
@@ -552,7 +557,9 @@ struct janas_gpu_tok *janas_gpu_tok_create(struct janas_gpu *g,
         t->mvid_n = mv ? (uint32_t)atoi(mv) : (uint32_t)nb;
         if (t->mvid_n > nb)
             t->mvid_n = (uint32_t)nb;
-        size_t nt = np / 16, nm = (size_t)t->mvid_n * md->k / MVID_NV;
+        /* the tables for a whole block by rows, whatever mvid_n: Q5_1 and
+           Q8_0, which have no tiles, go by rows at any size */
+        size_t nt = np / 16, nm = (size_t)nb * md->k / MVID_NV;
         if (nm > nt)
             nt = nm;
         t->o_tab1 = take(&at, (t->tiles1 + 2 * (nt + ne)) * 16);
@@ -770,6 +777,8 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
                     g->vkFreeCommandBuffers(g->dev, g->cp, 1, &t->cb[n][a][h]);
                 janas_gt_free_segments(g, t, &t->seg_cb[n][a][h]);
             }
+    if (t->cb_rows)
+        g->vkFreeCommandBuffers(g->dev, g->cp, 1, &t->cb_rows);
     VkPipeline p[18] = {t->p_nq, t->p_qk, t->p_at, t->p_am, t->p_gc,  t->p_gs,
                         t->p_gl, t->p_gr, t->p_gg, t->p_tk, t->p_ga,  t->p_cb,
                         t->p_sm, t->p_gb, t->p_gx, t->p_pl, t->p_at2, t->p_pa};
@@ -791,14 +800,8 @@ void janas_gpu_tok_destroy(struct janas_gpu *g, struct janas_gpu_tok *t)
         if (s[i])
             g->vkDestroyShaderModule(g->dev, s[i], NULL);
     }
-    if (t->buf.buf)
-        g->vkDestroyBuffer(g->dev, t->buf.buf, NULL);
-    if (t->buf.mem)
-        g->vkFreeMemory(g->dev, t->buf.mem, NULL);
-    if (t->mirror.buf)
-        g->vkDestroyBuffer(g->dev, t->mirror.buf, NULL);
-    if (t->mirror.mem)
-        g->vkFreeMemory(g->dev, t->mirror.mem, NULL);
+    janas_g_free_stage(g, &t->buf);
+    janas_g_free_stage(g, &t->mirror);
     free(t);
 }
 

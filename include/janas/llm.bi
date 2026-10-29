@@ -41,6 +41,13 @@ const JANAS_LLM_MODE_AUTO = 0
 const JANAS_LLM_MODE_ECO  = 1
 const JANAS_LLM_MODE_MAX  = 2
 
+'' the lowest quality the engine may choose on its own to be faster where
+'' memory is short (min_quality): low lowers the experts' bits and leaves
+'' out light ones not in memory, medium only the bits, high neither
+const JANAS_LLM_QUALITY_LOW    = 0
+const JANAS_LLM_QUALITY_MEDIUM = 1
+const JANAS_LLM_QUALITY_HIGH   = 2
+
 '' how the attention scores are computed: the query as it is, or to sixteen
 '' bits with an exact integer sum (about twice as fast, an error of 3e-5)
 const JANAS_LLM_ATTN_AUTO  = 0
@@ -64,6 +71,8 @@ type janas_llm_params
     reserve_bytes as ulongint '' memory left to other programs (0: a fifth)
     head_bits   as long      '' 4: a six-bit output head read at four
                               '' (faster, less exact); 0 or 6: as in the file
+    min_quality as long      '' JANAS_LLM_QUALITY_* (0: low, the engine's
+                              '' choice); expert_bits and head_bits win
 end type
 
 type janas_llm_chat_params
@@ -278,6 +287,12 @@ declare function janas_llm_chat_system(byval c as janas_llm_chat ptr, _
 declare function janas_llm_chat_prepare(byval c as janas_llm_chat ptr, _
                                         byval done as long ptr, _
                                         byval total as long ptr) as long
+'' A picture (the bytes of a PNG or a JPEG) for the next user message, sent
+'' or added: read now by the model's vision encoder (a <model>.vision.jns
+'' beside the model), placed before the message's text.
+declare function janas_llm_chat_image(byval c as janas_llm_chat ptr, _
+                                      byval data_ as const any ptr, _
+                                      byval n as longint) as long
 declare function janas_llm_chat_send(byval c as janas_llm_chat ptr, _
                                      byval text as const zstring ptr, _
                                      byval length as long) as long
@@ -419,10 +434,122 @@ declare function janas_llm_chat_reset(byval c as janas_llm_chat ptr) as long
 declare function janas_llm_chat_stats(byval c as const janas_llm_chat ptr, _
                                       byval s as janas_llm_chat_stats ptr) as long
 
+
+'' Speech to text: a Whisper model (a .jns made by tools/hf2jns_whisper),
+'' apart from the chat models. A recording - the bytes of a WAV, FLAC,
+'' MP3, Ogg, M4A, AAC or WebM file - is transcribed, or translated into
+'' English; then its text, language and segments are read. One thread at
+'' a time.
+type janas_llm_speech as any
+
+type janas_llm_speech_params
+    size      as ulong   '' sizeof(janas_llm_speech_params)
+    threads   as long    '' 0: one a performance core
+    vad_model as const zstring ptr '' Silero VAD for chunking; NULL:
+                                   '' silero-vad.jns beside the model
+    speaker_model as const zstring ptr '' WeSpeaker for diarization; NULL:
+                                       '' wespeaker-resnet34.jns beside it
+end type
+
+type janas_llm_transcribe_params
+    size        as ulong   '' sizeof(janas_llm_transcribe_params)
+    translate   as long    '' 1: into English
+    language    as const zstring ptr '' "it" or "italian"; NULL: found out
+    prompt      as const zstring ptr '' text said before, names; or NULL
+    seed        as ulongint '' of the sampling
+    temperature as single  '' 0: the likeliest words (a higher one only
+                           '' where they loop or are unlikely); up to 1
+    words       as long    '' 1: the words' times too
+    on_segment  as sub cdecl(byval user as any ptr, byval segment as long)
+                           '' each segment once final; or NULL
+    user        as any ptr
+    stop        as long ptr '' nonzero stops it between windows; or NULL
+    chunking    as long    '' 0 whole, 1 auto, 2 the voice activity below
+    vad_threshold  as single '' 0.5
+    vad_prefix_ms  as long   '' 300
+    vad_silence_ms as long   '' 200
+    diarize        as long   '' 1: who speaks when (turns)
+    n_speakers     as long   '' known speakers, at most 8
+    speaker_names     as const zstring const ptr ptr
+    speaker_refs      as const any const ptr ptr '' their recordings
+    speaker_ref_bytes as const longint ptr
+end type
+
+declare sub janas_llm_speech_params_default(byval p as janas_llm_speech_params ptr)
+declare function janas_llm_speech_open(byval path as const zstring ptr, _
+                                       byval p as const janas_llm_speech_params ptr, _
+                                       byval out as janas_llm_speech ptr ptr) as long
+declare sub janas_llm_speech_close(byval s as janas_llm_speech ptr)
+declare sub janas_llm_transcribe_params_default(byval p as janas_llm_transcribe_params ptr)
+declare function janas_llm_speech_transcribe(byval s as janas_llm_speech ptr, _
+                                             byval dat as const any ptr, _
+                                             byval n as longint, _
+                                             byval p as const janas_llm_transcribe_params ptr) as long
+declare function janas_llm_speech_text(byval s as const janas_llm_speech ptr, _
+                                       byval buf as zstring ptr, _
+                                       byval cap as long, _
+                                       byval length as long ptr) as long
+declare function janas_llm_speech_language(byval s as const janas_llm_speech ptr, _
+                                           byval buf as zstring ptr, _
+                                           byval cap as long, _
+                                           byval length as long ptr) as long
+declare function janas_llm_speech_language_name(byval code as const zstring ptr) _
+    as const zstring ptr
+declare function janas_llm_speech_duration(byval s as const janas_llm_speech ptr) as double
+declare function janas_llm_speech_segments(byval s as const janas_llm_speech ptr) as long
+declare function janas_llm_speech_segment(byval s as const janas_llm_speech ptr, _
+                                          byval i as long, _
+                                          byval start as double ptr, _
+                                          byval end_ as double ptr, _
+                                          byval buf as zstring ptr, _
+                                          byval cap as long, _
+                                          byval length as long ptr) as long
+declare function janas_llm_speech_segment_info(byval s as const janas_llm_speech ptr, _
+                                               byval i as long, _
+                                               byval avg_logprob as single ptr, _
+                                               byval no_speech_prob as single ptr, _
+                                               byval temperature as single ptr, _
+                                               byval compression_ratio as single ptr, _
+                                               byval ids as long ptr, _
+                                               byval max as long, _
+                                               byval n as long ptr) as long
+declare function janas_llm_speech_segment_logprobs(byval s as const janas_llm_speech ptr, _
+                                                   byval i as long, _
+                                                   byval lp as single ptr, _
+                                                   byval max as long, _
+                                                   byval n as long ptr) as long
+declare function janas_llm_speech_token(byval s as const janas_llm_speech ptr, _
+                                        byval id as long, _
+                                        byval buf as zstring ptr, _
+                                        byval cap as long, _
+                                        byval length as long ptr) as long
+declare function janas_llm_speech_token_is_text(byval s as const janas_llm_speech ptr, _
+                                                byval id as long) as long
+declare function janas_llm_speech_words(byval s as const janas_llm_speech ptr) as long
+declare function janas_llm_speech_turns(byval s as const janas_llm_speech ptr) as long
+declare function janas_llm_speech_turn(byval s as const janas_llm_speech ptr, _
+                                       byval i as long, _
+                                       byval start as double ptr, _
+                                       byval end_ as double ptr, _
+                                       byval speaker as zstring ptr, _
+                                       byval speaker_cap as long, _
+                                       byval speaker_len as long ptr, _
+                                       byval buf as zstring ptr, _
+                                       byval cap as long, _
+                                       byval length as long ptr) as long
+declare function janas_llm_speech_word(byval s as const janas_llm_speech ptr, _
+                                       byval i as long, _
+                                       byval start as double ptr, _
+                                       byval end_ as double ptr, _
+                                       byval probability as single ptr, _
+                                       byval buf as zstring ptr, _
+                                       byval cap as long, _
+                                       byval length as long ptr) as long
+
 end extern
 
 '' The parameter blocks carry their own size, and every call checks it, so a
 '' header out of step with the library is refused instead of misread. On
-'' x86-64 the sizes are 64, 80 and 192 bytes (22 Oct 2026), the C header's
-'' field for field; a program can see for itself with sizeof() and with
-'' janas_llm_abi_version().
+'' x86-64 the sizes are 64, 80 and 192 bytes (22 Oct 2026), 24 and 112 for
+'' speech's (29 Oct 2026), the C header's field for field; a program can see
+'' for itself with sizeof() and with janas_llm_abi_version().

@@ -349,10 +349,42 @@ void mcpc_close_services(void)
     opened_prefix = NULL;
 }
 
+/* Does p clash with a server's prefix: the same, or one the start of the
+   other ("a__" and "a__b__"), so that a tool name would go to the wrong
+   server? */
+static int prefix_clash(const char *p)
+{
+    for (size_t i = 0; i < n_servers; i++) {
+        size_t a = strlen(p), b = strlen(servers[i].prefix);
+        if (strncmp(p, servers[i].prefix, a < b ? a : b) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The name's prefix, made unique among the servers': a.b and a_b both
+   come out a_b__, the second a_b_2__ */
+static char *unique_prefix(const char *name)
+{
+    char *base = prefix_of(name);
+    if (!base || !prefix_clash(base))
+        return base;
+    size_t n = strlen(base) - 2; /* without its "__" */
+    char *p = malloc(n + 16);
+    for (int k = 2; p && k < 100000; k++) {
+        snprintf(p, n + 16, "%.*s_%d__", (int)n, base, k);
+        if (!prefix_clash(p))
+            break;
+    }
+    free(base);
+    return p;
+}
+
 static int add_server(const char *line, janas_mcp *m, int own)
 {
+    /* the prefix against the servers as they are, before the table moves */
+    char *name = strdup(line), *prefix = unique_prefix(line);
     struct server *g = realloc(servers, (n_servers + 1) * sizeof(*g));
-    char *name = strdup(line), *prefix = prefix_of(line);
     if (!g || !name || !prefix) {
         if (g)
             servers = g;

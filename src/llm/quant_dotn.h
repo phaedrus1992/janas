@@ -2545,6 +2545,8 @@ DOTN(b32g_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
                         kb2;
                     DOTN(q2_0_unpack)(blk->qs, &lo[j], &hi[j]);
                     k->d[2 * kb2][j] = k->d[2 * kb2 + 1][j] = _cvtsh_ss(blk->d);
+                    /* no minimum, but b32g_tile loads the row of them */
+                    k->m[2 * kb2][j] = k->m[2 * kb2 + 1][j] = 0.0f;
                 }
                 DOTN(gemm_t8)(lo, k->qs[2 * kb2]);
                 DOTN(gemm_t8)(hi, k->qs[2 * kb2 + 1]);
@@ -2559,6 +2561,7 @@ DOTN(b32g_fill)(const int TY, const uint8_t *const *w, size_t b0, int n,
                 r[j] = DOTN(b32g_unpack)(TY, blk);
                 if (TY == JANAS_MXFP4) {
                     k->d[kb][j] = e8m0_tab[blk[0]];
+                    k->m[kb][j] = 0.0f;
                 } else {
                     uint16_t d, m = 0;
                     memcpy(&d, blk, 2);

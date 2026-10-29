@@ -114,6 +114,7 @@ struct janas_expert_cache {
     int outstanding; /* begin called, finish not yet (caller thread only) */
     int stop;
     int batch_rc;
+    int lost; /* a request found no slot for an expert: finish() fails it */
 
     /*
      * Reads ahead (janas_expert_cache_prefetch), two sets: the engine reads
@@ -478,9 +479,12 @@ static void layout(const struct janas_jns *j, uint32_t n_layer, uint32_t n_main,
         if (b > *m)
             *m = b;
     }
-    /* one size for all, the largest */
+    /* one size for all, the largest (a file whose every slot is empty:
+       none to hold) */
     uint64_t one = main > wide ? main : wide;
-    size_t n = (size_t)(budget / one);
+    size_t n = one ? (size_t)(budget / one) : 0;
+    if (!one)
+        one = 1;
     *o = (struct layout){.slot = one, .n_slots = n < keys ? n : keys};
     if (wide <= main || main == 0)
         return;
@@ -565,6 +569,10 @@ part_create(const struct janas_jns *j, uint32_t first, uint32_t n_layer,
     c->lhead = malloc(((size_t)n_layer + 1) * sizeof(int32_t));
     c->ltail = malloc(((size_t)n_layer + 1) * sizeof(int32_t));
     c->pf_flag = calloc(n_slots, 1);
+    /* before any way out: janas_expert_cache_destroy destroys them */
+    pthread_mutex_init(&c->api_lock, NULL);
+    pthread_mutex_init(&c->lock, NULL);
+    pthread_cond_init(&c->cond, NULL);
     if (c->fd < 0 || !c->arena || !c->where || !c->key || !c->prev ||
         !c->next || !c->stamp || !c->jobs || !c->lprev || !c->lnext ||
         !c->lhead || !c->ltail || !c->pf_flag) {
@@ -588,9 +596,6 @@ part_create(const struct janas_jns *j, uint32_t first, uint32_t n_layer,
     if (!arena && getenv("JANAS_ARENA_HUGE") &&
         atoi(getenv("JANAS_ARENA_HUGE")) > 0)
         madvise(c->arena, arena_bytes, MADV_HUGEPAGE);
-    pthread_mutex_init(&c->api_lock, NULL);
-    pthread_mutex_init(&c->lock, NULL);
-    pthread_cond_init(&c->cond, NULL);
     /*
      * Asynchronous reads, where the kernel has io_uring: for the batches it
      * is good at (see by_ring), begin() queues them itself, a system call,
@@ -715,9 +720,9 @@ void janas_expert_cache_destroy(struct janas_expert_cache *c)
         pthread_cond_broadcast(&c->cond);
         pthread_mutex_unlock(&c->lock);
         pthread_join(c->coordinator, NULL);
-        pthread_mutex_destroy(&c->lock);
-        pthread_cond_destroy(&c->cond);
     }
+    pthread_mutex_destroy(&c->lock);
+    pthread_cond_destroy(&c->cond);
     janas_uring_destroy(c->ring);
     pthread_mutex_destroy(&c->api_lock);
     if (c->fd >= 0)
@@ -747,13 +752,26 @@ size_t janas_expert_cache_slots(const struct janas_expert_cache *c)
     return c->n_slots;
 }
 
-static const uint32_t *sort_counts;
-
-static int by_count(const void *a, const void *b)
+static int by_key(const void *a, const void *b)
 {
-    uint32_t x = sort_counts[*(const uint32_t *)a];
-    uint32_t y = sort_counts[*(const uint32_t *)b];
-    return (x > y) - (x < y); /* ascending: the most frequent loaded last */
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* order's n keys by ascending counts[key] (the most frequent loaded last),
+   ties by key; with nothing shared between callers, as two caches may sort
+   at once. Left as it is without memory for the sort. */
+static void sort_by_count(uint32_t *order, size_t n, const uint32_t *counts)
+{
+    uint64_t *k = n ? malloc(n * sizeof(*k)) : NULL;
+    if (!k)
+        return;
+    for (size_t i = 0; i < n; i++)
+        k[i] = (uint64_t)counts[order[i]] << 32 | order[i];
+    qsort(k, n, sizeof(*k), by_key);
+    for (size_t i = 0; i < n; i++)
+        order[i] = (uint32_t)k[i];
+    free(k);
 }
 
 /*
@@ -838,9 +856,8 @@ int janas_expert_cache_warm_background(struct janas_expert_cache *c,
     for (size_t k = 0; k < n_keys; k++)
         if (c->warm_counts[k])
             c->warm_order[n++] = (uint32_t)k;
-    sort_counts = c->warm_counts;
-    qsort(c->warm_order, n, sizeof(uint32_t), by_count);
-    /* by_count puts the least used first: read the most used first here */
+    sort_by_count(c->warm_order, n, c->warm_counts);
+    /* the least used come first: read the most used first here */
     for (size_t i = 0; i < n / 2; i++) {
         uint32_t t = c->warm_order[i];
         c->warm_order[i] = c->warm_order[n - 1 - i];
@@ -983,8 +1000,7 @@ int janas_expert_cache_warm(struct janas_expert_cache *c,
     for (size_t k = 0; k < n_keys; k++)
         if (counts[k])
             order[n++] = (uint32_t)k;
-    sort_counts = counts;
-    qsort(order, n, sizeof(uint32_t), by_count);
+    sort_by_count(order, n, counts);
     size_t first = n > c->n_slots ? n - c->n_slots : 0;
     int rc = 0;
     for (size_t i = first; i < n && rc == 0; i++) {
@@ -1169,14 +1185,25 @@ static int begin_req(struct janas_expert_cache *c, uint32_t layer,
                 continue;
             }
             s[i] = load(c, layer, ids[i]);
+            if (s[i] == NONE) {
+                /* every free slot held by reads ahead: settled, and
+                   free to go */
+                for (int p = 0; p < 2; p++)
+                    pf_settle(c, p);
+                s[i] = load(c, layer, ids[i]);
+            }
             c->st.misses++;
             queued++;
         }
     c->st.requests += n;
+    int lost = 0;
+    for (size_t i = 0; i < n; i++)
+        lost |= s[i] == NONE;
     for (size_t i = 0; i < n; i++)
         slots[i] =
             s[i] != NONE ? c->arena + (size_t)s[i] * c->slot_bytes : NULL;
     c->outstanding = 1;
+    c->lost = lost; /* a slot not found is NULL, never to be read */
     if (start_jobs(c) != 0)
         c->batch_rc = -1; /* finish() reports it, and waits all the same */
     return queued;
@@ -1221,9 +1248,11 @@ int janas_expert_cache_finish(struct janas_expert_cache *c)
     }
     double t0 = now();
     int rc = wait_jobs(c);
-    if (c->via_ring && c->batch_rc) /* the submission itself failed */
+    if ((c->via_ring && c->batch_rc) || c->lost) /* the submission itself
+                                                     failed, or a slot */
         rc = -1;
     c->batch_rc = 0;
+    c->lost = 0;
     c->outstanding = 0;
     c->st.wait_seconds += now() - t0;
     pthread_mutex_unlock(&c->api_lock);

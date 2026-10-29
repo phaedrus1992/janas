@@ -296,6 +296,8 @@ int janas_gt_rec_attn(struct janas_gpu *g, struct janas_gpu_tok *t,
     if (md->gated_q) {
         size_t rb =
             (size_t)(md->dm / JANAS_QK) * janas_qtype_block_size(ly->wq.type);
+        if (!rb) /* a repacked type (JANAS_GPU_REPACK): no rows to cut */
+            return -1;
         for (uint32_t h = 0; h < md->n_head; h++) {
             struct janas_matvec_task q = ly->wq, gt = ly->wq;
             q.rows = gt.rows = hd;

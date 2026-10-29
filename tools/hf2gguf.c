@@ -499,6 +499,8 @@ static int n_gts;
 
 static void add(const char *name, const char *hf, int src, uint32_t heads)
 {
+    if (n_gts == (int)(sizeof(gts) / sizeof(gts[0])))
+        die("too many tensors (more than 1,024)", name);
     struct gt *g = &gts[n_gts++];
     memset(g, 0, sizeof(*g));
     snprintf(g->name, sizeof(g->name), "%s", name);

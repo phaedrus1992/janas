@@ -167,9 +167,9 @@ static const char **read_words(const char *path, char **text)
         fprintf(stderr, "janas-nsm: %s: %s\n", path, strerror(errno));
         exit(1);
     }
-    size_t n = 0;
+    size_t n = 0; /* lines end in \n, \r or both: as many as either */
     for (size_t i = 0; i < len; i++)
-        n += (*text)[i] == '\n';
+        n += (*text)[i] == '\n' || (*text)[i] == '\r';
     const char **w = calloc(n + 2, sizeof(*w));
     size_t k = 0;
     for (char *p = strtok(*text, "\r\n"); p && w; p = strtok(NULL, "\r\n"))

@@ -144,6 +144,8 @@ void janas_llm_chat_destroy(janas_llm_chat *c)
         free(c->memo[i].ids);
     }
     free(c->rtext);
+    janas_api_pics_free(c->pics, c->n_pics);
+    free(c->idpics);
     free(c);
 }
 
@@ -515,6 +517,7 @@ static int recap(janas_llm_chat *c)
         memcpy(keep, c->ids, n_keep * sizeof(int32_t));
     }
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     int err = 0;
     if (!c->closed)
         err |= janas_api_add_special(c, c->llm->im_end);
@@ -619,6 +622,7 @@ int32_t janas_llm_chat_prepare(janas_llm_chat *c, int32_t *done, int32_t *total)
         if (janas_llm_session_length(c->s) > 0 || c->replying)
             return 0; /* the conversation has started */
         c->n_ids = c->n_text = 0;
+        c->n_idpics = 0;
         int err = janas_api_begin_sequence(c);
         if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA ||
             janas_api_think_note(c))
@@ -848,6 +852,7 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
     }
     janas_api_reply_clear(c);
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     int err = ans.oom;
     /* (ans is freed once written, below) */
     if (gemma_answers) {
@@ -888,7 +893,8 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
         err |= janas_api_add_special(c, c->llm->im_end) ||
                janas_api_end_turn_nl(c);
     } else {
-        err |= janas_api_add_message(c, "user", text, n);
+        /* the pictures queued: before the text, as the template has it */
+        err |= janas_api_add_user(c, text, n, c->pics, c->n_pics);
     }
     err |= janas_api_flush_text(c);
     size_t reply_off = c->n_ids;
@@ -934,6 +940,16 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
         c->replying = 0;
         return janas_api_fail(JANAS_LLM_EFULL,
                               "the context is full (%u tokens)", c->llm->n_ctx);
+    }
+    /* the pictures' embeddings where their tokens are */
+    if (c->n_idpics) {
+        int bad = janas_api_media_register(c, at, 0);
+        c->n_idpics = 0;
+        janas_api_pics_free(c->pics, c->n_pics);
+        c->pics = NULL;
+        c->n_pics = 0;
+        if (bad)
+            return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
     }
     if (janas_api_begin_reply(c, at + (uint32_t)reply_off,
                               at + (uint32_t)c->n_ids, at) != 0)

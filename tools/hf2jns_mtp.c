@@ -76,7 +76,7 @@ static _Noreturn void die(const char *msg, const char *arg)
 struct st_file {
     FILE *f;
     char *json;
-    uint64_t data_start;
+    uint64_t data_start, size; /* size: of the file */
 };
 
 struct st_tensor {
@@ -96,6 +96,9 @@ static void st_open(struct st_file *s, const char *path)
         die("cannot read the header of", path);
     s->json[n] = 0;
     s->data_start = 8 + n;
+    if (fseeko(s->f, 0, SEEK_END) != 0 || ftello(s->f) < (off_t)s->data_start)
+        die("cannot read", path);
+    s->size = (uint64_t)ftello(s->f);
 }
 
 /* Parses the entry of one tensor: {"dtype":"BF16","shape":[..],
@@ -118,22 +121,36 @@ static int st_find(const struct st_file *s, const char *name,
     if (!dt || !sh || !of || dt > end || sh > end || of > end ||
         !strstr(dt, "\"BF16\"") || strstr(dt, "\"BF16\"") > end)
         return -1;
+    /* what the file says is input: every field inside the entry, a shape
+       of one to four numbers, the data inside the file */
     sh = strchr(sh, '[');
+    of = strchr(of, '[');
+    if (!sh || !of || sh > end || of > end)
+        return -1;
     t->dims = 0;
-    for (const char *q = sh + 1; *q && *q != ']' && t->dims < 4;) {
+    const char *q = sh + 1;
+    while (*q == ' ')
+        q++;
+    while (*q >= '0' && *q <= '9' && t->dims < 4) {
         t->shape[t->dims++] = strtoull(q, (char **)&q, 10);
         while (*q == ',' || *q == ' ')
             q++;
     }
-    of = strchr(of, '[');
-    char *q;
-    t->begin = strtoull(of + 1, &q, 10);
-    while (*q == ',' || *q == ' ')
-        q++;
-    t->end = strtoull(q, NULL, 10);
+    if (*q != ']' || t->dims == 0)
+        return -1;
+    char *r;
+    t->begin = strtoull(of + 1, &r, 10);
+    while (*r == ',' || *r == ' ')
+        r++;
+    t->end = strtoull(r, NULL, 10);
     uint64_t count = 1;
     for (int i = 0; i < t->dims; i++)
-        count *= t->shape[i];
+        if (t->shape[i] == 0 ||
+            __builtin_mul_overflow(count, t->shape[i], &count))
+            return -1;
+    if (count > UINT64_MAX / 2 || t->end < t->begin ||
+        t->end > s->size - s->data_start)
+        return -1;
     return t->end - t->begin == 2 * count ? 0 : -1;
 }
 
@@ -216,6 +233,10 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
     struct st_tensor t;
     uint64_t n;
     float *x = st_load(src, &n, &t);
+    if (t.dims > 2)
+        die("a tensor of more than two dimensions", src);
+    if (n_outs == (int)(sizeof(outs) / sizeof(outs[0])))
+        die("too many tensors in the block", src);
     struct out_tensor *o = &outs[n_outs++];
     snprintf(o->name, sizeof(o->name), "%s", dst);
     o->type = kind;
@@ -228,6 +249,8 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
         o->data = to_q4k(pool, x, o->dims[1], o->dims[0], &o->bytes);
     } else if (kind == T_F16) {
         uint16_t *h = malloc(n * 2);
+        if (!h)
+            die("out of memory", NULL);
         for (uint64_t i = 0; i < n; i++)
             h[i] = janas_fp32_to_fp16(x[i]);
         o->data = (uint8_t *)h;
@@ -237,6 +260,8 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
             for (uint64_t i = 0; i < n; i++)
                 x[i] += 1.0f;
         o->data = malloc(n * 4);
+        if (!o->data)
+            die("out of memory", NULL);
         memcpy(o->data, x, n * 4);
         o->bytes = n * 4;
     }
@@ -583,6 +608,8 @@ int main(int argc, char **argv)
     uint64_t tbl_len =
         tensor_dir + sizeof(struct janas_jns_tensor) * n_outs - layer_table;
     uint8_t *tbl = calloc(1, tbl_len);
+    if (!tbl)
+        die("out of memory", NULL);
     memcpy(tbl, &ly, sizeof(ly));
     memcpy(tbl + (expert_table - layer_table), slot_off, 8 * (size_t)n_exp);
     memcpy(tbl + (expert_sums - layer_table), sums, 8 * (size_t)n_exp);

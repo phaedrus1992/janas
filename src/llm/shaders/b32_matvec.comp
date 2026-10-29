@@ -9,7 +9,12 @@
 // 12 and their negatives), 5 Q5_0 (22 bytes: d, qh, the nibbles; q - 16),
 // 6 Q2_0 (18 bytes for 64 weights: d, then two bits a weight, weight i in
 // bits 2 (i % 4) of byte i / 4; q - 1: each half of a block one block of
-// 32 here, with the block's d). As the CPU computes them (nib_dot_ref,
+// 32 here, with the block's d), 7 NVFP4 (36 bytes for 64 weights: four
+// UE4M3 scales, one a sub-block of 16, then sub-block s's codes in bytes
+// 8s to 8s + 7, low nibbles its first eight weights, high ones the next
+// eight, through MXFP4's table; each half of a block one block of 32
+// here, its two sub-blocks' dots each in its own fma, the first first, as
+// janas_nvfp4_dot_ref). As the CPU computes them (nib_dot_ref,
 // janas_mxfp4_dot_ref, dm_dot_ref, janas_q5_0_dot_ref and
 // janas_q2_0_dot_ref in quant.c): each block's integer dot in one fma into
 // the accumulator of its position in the group of eight, the minimum of
@@ -47,7 +52,8 @@ const bool ID = (KID & 256u) != 0u;
 const uint NX = (20u + SG - 1u) / SG;
 /* bytes of a block of 32 weights (Q2_0: half a block), and of a group of
    eight in words */
-const uint S = KIND == 6u ? 9u
+const uint S = KIND == 7u ? 18u
+             : KIND == 6u ? 9u
              : KIND == 5u ? 22u
              : KIND == 4u ? 17u
              : KIND == 3u ? 24u
@@ -55,7 +61,7 @@ const uint S = KIND == 6u ? 9u
                           : 18u;
 const uint GW = 2u * S;
 const bool DM = KIND == 2u || KIND == 3u;
-const bool TAB = KIND == 1u || KIND == 4u; /* levels through a table */
+const bool TAB = KIND == 1u || KIND == 4u || KIND == 7u; /* a table */
 const bool FIVE = KIND == 3u || KIND == 5u; /* a fifth bit in qh */
 /* the constant folded out of the weights' integer dot */
 const int OFF = KIND == 0u ? 8 : KIND == 5u ? 16 : KIND == 6u ? 1 : 0;
@@ -74,6 +80,16 @@ layout(push_constant) uniform P {
 const int IQ4[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                             1, 13, 25, 38, 53, 69, 89, 113);
 const int MX[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+/* a UE4M3 byte as NVFP4's scale, times one half (quant.c
+   janas_ue4m3_half): exact */
+float ue4m3_half(uint x)
+{
+    if (x == 0u || x == 0x7fu)
+        return 0.0;
+    int e = int((x >> 3) & 15u), man = int(x & 7u);
+    return e == 0 ? ldexp(float(man), -10) : ldexp(float(8 + man), e - 11);
+}
 
 /* an E8M0 byte as MXFP4's scale, 2^(e - 128) (quant.c janas_e8m0_half) */
 float e8m0_half(uint e)
@@ -127,7 +143,8 @@ void main()
 {
     if (gl_LocalInvocationID.x < 16u)
         T[gl_LocalInvocationID.x] =
-            uint(KIND == 4u ? MX[gl_LocalInvocationID.x] : IQ4[gl_LocalInvocationID.x]) & 0xffu;
+            uint(KIND == 4u || KIND == 7u ? MX[gl_LocalInvocationID.x]
+                                          : IQ4[gl_LocalInvocationID.x]) & 0xffu;
     barrier();
     uvec2 pw = p.w, px = p.x, py = p.y;
     uint nv = p.nv, xs = p.xs, ys = p.ys, v0 = gl_WorkGroupID.x * NV;
@@ -179,9 +196,15 @@ void main()
         for (uint k = 0; k < 8u; k++) {
             /* the block's first byte, and that of its 16 bytes of quants
                (Q2_0: of the 8 of its half) */
-            uint B = KIND == 6u ? 18u * (k / 2u) : S * k;
-            uint qb = KIND == 6u ? B + 2u + 8u * (k % 2u) : B + S - 16u;
-            if (KIND == 4u) {
+            uint B = KIND == 6u || KIND == 7u ? 2u * S * (k / 2u) : S * k;
+            uint qb = KIND == 6u   ? B + 2u + 8u * (k % 2u)
+                      : KIND == 7u ? B + 4u + 16u * (k % 2u)
+                                   : B + S - 16u;
+            if (KIND == 7u) { /* the half's two sub-blocks' scales */
+                uint sb = B + 2u * (k % 2u);
+                d[k] = ue4m3_half((wg[sb >> 2] >> (8u * (sb & 3u))) & 0xffu);
+                m[k] = ue4m3_half((wg[sb >> 2] >> (8u * (sb & 3u) + 8u)) & 0xffu);
+            } else if (KIND == 4u) {
                 d[k] = e8m0_half((wg[B >> 2] >> (8u * (B & 3u))) & 0xffu);
                 m[k] = 0.0;
             } else {
@@ -213,6 +236,15 @@ void main()
                     h |= spread5((qh >> (16u + 4u * i)) & 15u);
                 }
                 q[i] = l;
+                if (KIND == 7u) {
+                    /* NVFP4: words 0-1 the first sub-block, low then high
+                       nibbles; words 2-3 the second */
+                    if (i == 0u) { lo[k].x = l; lo[k].z = h; }
+                    if (i == 1u) { lo[k].y = l; lo[k].w = h; }
+                    if (i == 2u) { hi[k].x = l; hi[k].z = h; }
+                    if (i == 3u) { hi[k].y = l; hi[k].w = h; }
+                    continue;
+                }
                 if (i == 0u) { lo[k].x = l; hi[k].x = h; }
                 if (i == 1u) { lo[k].y = l; hi[k].y = h; }
                 if (i == 2u) { lo[k].z = l; hi[k].z = h; }
@@ -241,6 +273,15 @@ void main()
             uvec4 b0 = bc(xr, 16u), b1 = bc(xr, 17u);
             uint bw[8] = uint[8](b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w);
             for (uint k = 0; k < 8u; k++) {
+                if (KIND == 7u) {
+                    if (k < nk) {
+                        acc[v][k] = fma(d[k] * d32[k], float(dp4(lo[k], bc(xr, 2u * k))),
+                                        acc[v][k]);
+                        acc[v][k] = fma(m[k] * d32[k], float(dp4(hi[k], bc(xr, 2u * k + 1u))),
+                                        acc[v][k]);
+                    }
+                    continue;
+                }
                 int dot = dp4(lo[k], bc(xr, 2u * k)) + dp4(hi[k], bc(xr, 2u * k + 1u));
                 /* the block's activation sum: bsums32 of its two halves */
                 int asum = bitfieldExtract(int(bw[k]), 0, 16) + bitfieldExtract(int(bw[k]), 16, 16);

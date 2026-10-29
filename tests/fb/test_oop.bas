@@ -28,8 +28,18 @@ end sub
 #assert sizeof(janas_llm_chat_params) = 80
 #assert sizeof(janas_llm_chat_stats) = 192
 #assert offsetof(janas_llm_params, reserve_bytes) = 48
+#assert offsetof(janas_llm_params, min_quality) = 60
 #assert offsetof(janas_llm_chat_params, max_reasoning) = 72
 #assert offsetof(janas_llm_chat_stats, reasoning_cut) = 188
+#assert sizeof(janas_llm_speech_params) = 24
+#assert sizeof(janas_llm_transcribe_params) = 112
+#assert offsetof(janas_llm_transcribe_params, speaker_names) = 88
+#assert offsetof(janas_llm_transcribe_params, chunking) = 64
+#assert offsetof(janas_llm_transcribe_params, seed) = 24
+#assert offsetof(janas_llm_transcribe_params, temperature) = 32
+#assert offsetof(janas_llm_transcribe_params, words) = 36
+#assert offsetof(janas_llm_transcribe_params, on_segment) = 40
+#assert offsetof(janas_llm_transcribe_params, stop) = 56
 #endif
 
 check(Janas.Model.AbiVersion() = JANAS_LLM_ABI, "the library's ABI")
@@ -52,6 +62,9 @@ scope '' the options, with the library's defaults
           "the default files and GPU")
     oo.CacheGiB = 2
     check(oo.cache_bytes = 2147483648ull, "CacheGiB")
+    check(oo.min_quality = Janas.Quality.Low, "the default quality")
+    oo.min_quality = Janas.Quality.High
+    check(oo.min_quality = JANAS_LLM_QUALITY_HIGH, "Quality.High")
     dim as Janas.ReplyStats st
     check(st.size = sizeof(janas_llm_chat_stats), "ReplyStats.size")
     check(st.TokensPerSecond() = 0 andalso st.FinishText() = "" andalso _

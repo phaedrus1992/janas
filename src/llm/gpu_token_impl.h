@@ -186,10 +186,11 @@ _Static_assert(sizeof(struct push_at) <= JANAS_G_PUSH_BYTES, "push size");
 #define ATT_MAXS_G(g) ((g) * ATT_RUN > ATT_MAXS ? (g) * ATT_RUN : ATT_MAXS)
 /* The query heads a workgroup of the attention takes, of the gt that share
    a KV head of hd numbers: all of them, or (Gemma 4's full layers, 16 of
-   512) the most of a divisor of gt that its shared memory holds; 0: none */
+   512) the most of a divisor of gt that its shared memory holds, at most
+   16 (the query scales' array, sqs); 0: none */
 static inline uint32_t janas_gt_att_g(uint32_t gt, uint32_t hd)
 {
-    for (uint32_t g = gt; g >= 1; g--)
+    for (uint32_t g = gt < 16 ? gt : 16; g >= 1; g--)
         if (gt % g == 0 && g * hd <= ATT_MAXQ_G(g))
             return g;
     return 0;
