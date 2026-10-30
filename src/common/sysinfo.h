@@ -58,4 +58,10 @@ uint64_t janas_mem_available(void);
 /* Installed memory, in bytes (0 if unknown). */
 uint64_t janas_mem_total(void);
 
+/* The process's resident memory now, in bytes (0 if unknown). */
+uint64_t janas_rss_bytes(void);
+
+/* The level-2 cache of the first CPU, in bytes (0 if unknown). */
+size_t janas_l2_bytes(void);
+
 #endif

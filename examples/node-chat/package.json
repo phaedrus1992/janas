@@ -1,0 +1,20 @@
+{
+  "name": "janas-chat-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A chat in TypeScript on Janas-LLM inside Node.js: the model in the server's process, its replies streamed to the browser",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && tsc -p tsconfig.web.json",
+    "check": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "start": "node dist/node/server/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^7.0.2"
+  }
+}

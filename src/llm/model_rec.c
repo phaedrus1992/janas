@@ -58,7 +58,7 @@ static void conv_head_ref(struct janas_llm_model *m, const float *wt,
             float s = 0.0f;
             for (uint32_t i = 0; i < dc; i++)
                 s += win[i] * wt[(size_t)i * cc + c];
-            m->conv_out[(size_t)t * cc + c] = s / (1.0f + expf(-s));
+            m->conv_out[(size_t)t * cc + c] = s / (1.0f + janas_expf(-s));
             for (uint32_t i = 0; i + 1 < dc; i++)
                 win[i] = win[i + 1];
         }
@@ -127,7 +127,8 @@ static void conv_worker(void *arg, int tid, int n_threads)
     struct janas_llm_model *m = a->m;
     uint32_t cc = m->conv_ch, ds = m->ds, kd = m->n_kh * ds;
     size_t sz = (size_t)m->n_rec * (m->d_conv - 1) * cc;
-    float *src = m->conv_buf + (size_t)m->src * sz +
+    float *src = m->conv_buf +
+                 (size_t)(m->rec_cont ? 1 - m->src : m->src) * sz +
                  (size_t)a->ly->slot * (m->d_conv - 1) * cc;
     float *dst = m->conv_buf + (size_t)(1 - m->src) * sz +
                  (size_t)a->ly->slot * (m->d_conv - 1) * cc;
@@ -173,11 +174,13 @@ static void rec_worker(void *arg, int tid, int n_threads)
         uint32_t h = it / blocks, r0 = it % blocks * SSM_ROWS;
         uint32_t g = m->vmap_mod ? h % m->n_kh : h / rf;
         size_t off = (((size_t)a->ly->slot * nv + h) * ds + r0) * ds;
-        uint16_t *M = m->ssm_buf + (size_t)m->src * sz + off;
+        uint16_t *M =
+            m->ssm_buf + (size_t)(m->rec_cont ? 1 - m->src : m->src) * sz + off;
         uint16_t *D = m->ssm_buf + (size_t)(1 - m->src) * sz + off;
         for (uint32_t t = 0; t < m->replay + a->n; t++) {
             if (t == m->replay) {
-                memcpy(D, M, (size_t)SSM_ROWS * ds * sizeof(uint16_t));
+                if (M != D) /* not a call going on from the one before */
+                    memcpy(D, M, (size_t)SSM_ROWS * ds * sizeof(uint16_t));
                 M = D;
             }
             const float *co = m->conv_out + (size_t)t * cc;
@@ -194,9 +197,11 @@ static void rec_worker(void *arg, int tid, int n_threads)
 }
 
 #if defined(__x86_64__)
-/* rms_norm(o) * w * SiLU(z), in place, n a multiple of 8. */
+/* rms_norm(o) * w * SiLU(z), in place, n a multiple of 8; with sig, times
+   sigmoid(z) instead (qwen4exp) */
 __attribute__((target("avx2,fma"))) static void
-gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps)
+gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps,
+          int sig)
 {
     __m256 acc = _mm256_setzero_ps();
     for (uint32_t i = 0; i < n; i += 8) {
@@ -207,13 +212,21 @@ gate_avx2(float *o, const float *z, const float *w, uint32_t n, float eps)
     for (uint32_t i = 0; i < n; i += 8) {
         __m256 v = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(o + i), sc),
                                  _mm256_loadu_ps(w + i));
-        _mm256_storeu_ps(o + i,
-                         _mm256_mul_ps(v, janas_silu8(_mm256_loadu_ps(z + i))));
+        __m256 zv = _mm256_loadu_ps(z + i);
+        /* sigmoid(z) as silu's: 1 / (1 + e^-z) */
+        __m256 g =
+            sig ? _mm256_div_ps(_mm256_set1_ps(1.0f),
+                                _mm256_add_ps(_mm256_set1_ps(1.0f),
+                                              janas_exp8(_mm256_sub_ps(
+                                                  _mm256_setzero_ps(), zv))))
+                : janas_silu8(zv);
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(v, g));
     }
 }
 #endif
 
-/* 3. RMS norm (ssm_norm) of each head's output, gated by SiLU(z): item =
+/* 3. RMS norm (ssm_norm) of each head's output, gated by SiLU(z) - by
+      sigmoid(z) in qwen4exp, the one difference from Qwen3.5's - item =
       (token, value head). */
 static void gate_worker(void *arg, int tid, int n_threads)
 {
@@ -233,22 +246,57 @@ static void gate_worker(void *arg, int tid, int n_threads)
                       ds * rf + r * ds;
 #if defined(__x86_64__)
         if (m->avx2) {
-            gate_avx2(o, z, w, ds, m->eps);
+            gate_avx2(o, z, w, ds, m->eps, m->a->hc);
             continue;
         }
 #endif
         rms_norm(o, o, w, ds, m->eps);
         for (uint32_t i = 0; i < ds; i++)
-            o[i] *= z[i] / (1.0f + expf(-z[i]));
+            o[i] *= m->a->hc ? 1.0f / (1.0f + janas_expf(-z[i]))
+                             : z[i] / (1.0f + janas_expf(-z[i]));
     }
+}
+
+/* Qwen3.5's betas then alphas: item = token, each dot as one thread alone
+   would make it (the same bits whatever the threads) */
+struct ba_job {
+    struct janas_llm_model *m;
+    const struct layer *ly;
+    const float *xn;
+    uint32_t n;
+};
+
+static void ba_worker(void *arg, int tid, int n_threads)
+{
+    struct ba_job *b = arg;
+    struct janas_llm_model *m = b->m;
+    uint32_t dm = m->d_model, nv = m->n_vh;
+    const float *wb = b->ly->ssm_beta, *wa = b->ly->ssm_alpha;
+    for (uint32_t j = (uint32_t)tid; j < b->n; j += (uint32_t)n_threads)
+        for (uint32_t h = 0; h < nv; h++) {
+            const float *xj = b->xn + (size_t)j * dm;
+            m->ba[(size_t)j * 2 * nv + h] =
+                janas_dot_f32(wb + (size_t)h * dm, xj, dm);
+            m->ba[(size_t)j * 2 * nv + nv + h] =
+                janas_dot_f32(wa + (size_t)h * dm, xj, dm);
+        }
+}
+
+void janas_m_rec_ba(struct janas_llm_model *m, const struct layer *ly,
+                    const float *xn, uint32_t n)
+{
+    struct ba_job b = {m, ly, xn, n};
+    if (n < 2)
+        ba_worker(&b, 0, 1);
+    else
+        janas_pool_run(m->compute, ba_worker, &b);
 }
 
 /* Gated DeltaNet layer on the normalized block in xn / xq; added to x. */
 void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                        uint32_t n)
 {
-    uint32_t dm = m->d_model, ds = m->ds, nv = m->n_vh, rf = nv / m->n_kh;
-    uint32_t kd = m->n_kh * ds, cc = m->conv_ch, gsz = 2 * ds + 2 * ds * rf;
+    uint32_t dm = m->d_model, nv = m->n_vh, cc = m->conv_ch;
     size_t nbi = m->d_inner / JANAS_QK;
     double ta = now();
     if (m->a->rec == JANAS_REC_Q35) {
@@ -269,17 +317,9 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                                           .cols = dm,
                                           .n_vec = n,
                                           .y_stride = m->qkvz_dim}};
-        janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, t, 2);
+        janas_m_products(m, janas_m_gpu(m, 0), t, 2);
         /* beta then alpha per head, as in the grouped layout's order */
-        const float *wb = ly->ssm_beta, *wa = ly->ssm_alpha;
-        for (uint32_t j = 0; j < n; j++)
-            for (uint32_t h = 0; h < nv; h++) {
-                const float *xj = m->xn + (size_t)j * dm;
-                m->ba[(size_t)j * 2 * nv + h] =
-                    janas_dot_f32(wb + (size_t)h * dm, xj, dm);
-                m->ba[(size_t)j * 2 * nv + nv + h] =
-                    janas_dot_f32(wa + (size_t)h * dm, xj, dm);
-            }
+        janas_m_rec_ba(m, ly, m->xn, n);
     } else if (ly->ssm_qkv) {
         /* qwen3next as llama.cpp writes it since 2026: q|k|v and z as for
            qwen35, the betas and alphas fused and grouped as before */
@@ -306,7 +346,7 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                                           .rows = 2 * nv,
                                           .cols = dm,
                                           .n_vec = n}};
-        janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, t, 3);
+        janas_m_products(m, janas_m_gpu(m, 0), t, 3);
     } else {
         struct janas_matvec_task t[2] = {{.type = (int)ly->ssm_in->type,
                                           .w = data(m, ly->ssm_in),
@@ -322,8 +362,33 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
                                           .rows = 2 * nv,
                                           .cols = dm,
                                           .n_vec = n}};
-        janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, t, 2);
+        janas_m_products(m, janas_m_gpu(m, 0), t, 2);
     }
+    janas_m_rec_core(m, ly, n, ta);
+    double tc = now();
+    for (uint32_t j = 0; j < n; j++)
+        janas_q8k_quantize(m->att + (size_t)j * m->d_inner, m->attq + j * nbi,
+                           m->d_inner);
+    struct janas_matvec_task to = {.type = (int)ly->ssm_out->type,
+                                   .w = data(m, ly->ssm_out),
+                                   .x = m->attq,
+                                   .y = m->xn,
+                                   .rows = dm,
+                                   .cols = m->d_inner,
+                                   .n_vec = n};
+    janas_m_products(m, janas_m_gpu(m, 0), &to, 1);
+    trace_row(m, "ssm_out", m->xn + (size_t)(n - 1) * dm, dm);
+    for (uint32_t i = 0; i < n * dm; i++)
+        m->x[i] += m->xn[i];
+    trace_row(m, "residual", m->x + (size_t)(n - 1) * dm, dm);
+    m->phase[JANAS_PH_WO] += now() - tc;
+}
+
+void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
+                      uint32_t n, double ta)
+{
+    uint32_t ds = m->ds, nv = m->n_vh, rf = nv / m->n_kh;
+    uint32_t kd = m->n_kh * ds, cc = m->conv_ch, gsz = 2 * ds + 2 * ds * rf;
     /* per key head g the projection holds q, k, the values and the z gates
        of its rf value heads, then per g: rf betas and rf alphas */
     const float *dt = f32(m, ly->dt_bias), *A = f32(m, ly->ssm_a);
@@ -345,9 +410,9 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
             memcpy(mx, src, (size_t)cc * sizeof(float));
             for (uint32_t h = 0; h < nv; h++) {
                 float al = b[nv + h] + dt[h];
-                float sp = al > 20.0f ? al : log1pf(expf(al));
+                float sp = al > 20.0f ? al : janas_softplusf(al);
                 m->beta[(size_t)(a + j) * nv + h] = sigmoid(b[h]);
-                m->decay[(size_t)(a + j) * nv + h] = expf(sp * A[h]);
+                m->decay[(size_t)(a + j) * nv + h] = janas_expf(sp * A[h]);
             }
             continue;
         }
@@ -364,9 +429,9 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
             for (uint32_t r = 0; r < rf; r++) {
                 uint32_t h = g * rf + r;
                 float al = b[2 * g * rf + rf + r] + dt[h];
-                float sp = al > 20.0f ? al : log1pf(expf(al));
+                float sp = al > 20.0f ? al : janas_softplusf(al);
                 m->beta[(size_t)(a + j) * nv + h] = sigmoid(b[2 * g * rf + r]);
-                m->decay[(size_t)(a + j) * nv + h] = expf(sp * A[h]);
+                m->decay[(size_t)(a + j) * nv + h] = janas_expf(sp * A[h]);
             }
         }
     }
@@ -418,22 +483,5 @@ void janas_m_rec_layer(struct janas_llm_model *m, const struct layer *ly,
         memcpy(lb, m->beta + (size_t)a * nv, (size_t)n * nv * sizeof(float));
         memcpy(ld, m->decay + (size_t)a * nv, (size_t)n * nv * sizeof(float));
     }
-    double tc = now();
-    m->phase[JANAS_PH_SSM] += tc - tb;
-    for (uint32_t j = 0; j < n; j++)
-        janas_q8k_quantize(m->att + (size_t)j * m->d_inner, m->attq + j * nbi,
-                           m->d_inner);
-    struct janas_matvec_task to = {.type = (int)ly->ssm_out->type,
-                                   .w = data(m, ly->ssm_out),
-                                   .x = m->attq,
-                                   .y = m->xn,
-                                   .rows = dm,
-                                   .cols = m->d_inner,
-                                   .n_vec = n};
-    janas_gpu_matvec_group(janas_m_gpu(m, 0), m->compute, &to, 1);
-    trace_row(m, "ssm_out", m->xn + (size_t)(n - 1) * dm, dm);
-    for (uint32_t i = 0; i < n * dm; i++)
-        m->x[i] += m->xn[i];
-    trace_row(m, "residual", m->x + (size_t)(n - 1) * dm, dm);
-    m->phase[JANAS_PH_WO] += now() - tc;
+    m->phase[JANAS_PH_SSM] += now() - tb;
 }

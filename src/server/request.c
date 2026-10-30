@@ -70,10 +70,21 @@ void srv_parsed_free(struct srv_parsed *pr)
     pr->metadata = pr->messages = NULL;
 }
 
+/* A text part's text: "refusal" for a refusal (its OpenAI field), else "text";
+   NULL when absent. */
+yyjson_val *srv_part_text(yyjson_val *part, const char *type)
+{
+    yyjson_val *tx = NULL;
+    if (type && !strcmp(type, "refusal"))
+        tx = yyjson_obj_get(part, "refusal");
+    return tx ? tx : yyjson_obj_get(part, "text");
+}
+
 /* The text of a message's content: a string, or the text parts of an array
    joined; NULL content is empty. Anything else (images, audio) refused. */
 static int content_text(struct srv_perr *e, struct srv_parsed *pr,
-                        yyjson_val *c, int i, char **out, size_t *n)
+                        yyjson_val *c, int i, char **out, size_t *n,
+                        struct srv_img **imgs, int *n_imgs)
 {
     if (!c || yyjson_is_null(c)) {
         *out = srv_dup_n("", 0);
@@ -95,12 +106,25 @@ static int content_text(struct srv_perr *e, struct srv_parsed *pr,
     yyjson_arr_foreach(c, idx, max, part)
     {
         const char *type = yyjson_get_str(yyjson_obj_get(part, "type"));
+        char why[200];
+        int pic = srv_image_part(part, type, imgs, n_imgs, why, sizeof why);
+        if (pic < 0)
+            return srv_pfail(pr,
+                             BAD("invalid_value", "messages[%d]: %s.", i, why));
+        if (pic)
+            continue;
         if (!type || (strcmp(type, "text") != 0 && strcmp(type, "refusal")))
             return srv_pfail(pr, BAD("unsupported_content",
-                                     "messages[%d]: only text parts are "
-                                     "supported (got '%s').",
+                                     "messages[%d]: only text and picture "
+                                     "parts are supported (got '%s').",
                                      i, type ? type : "?"));
-        total += yyjson_get_len(yyjson_obj_get(part, "text"));
+        yyjson_val *tx = srv_part_text(part, type);
+        if (tx && !yyjson_is_str(tx))
+            return srv_pfail(pr, BAD("invalid_value",
+                                     "messages[%d]: a part's text must be "
+                                     "a string.",
+                                     i));
+        total += tx ? yyjson_get_len(tx) : 0;
     }
     char *t = malloc(total + 1);
     if (!t)
@@ -108,9 +132,11 @@ static int content_text(struct srv_perr *e, struct srv_parsed *pr,
     size_t w = 0;
     yyjson_arr_foreach(c, idx, max, part)
     {
-        yyjson_val *tx = yyjson_obj_get(part, "text");
-        memcpy(t + w, yyjson_get_str(tx) ? yyjson_get_str(tx) : "",
-               yyjson_get_len(tx));
+        yyjson_val *tx =
+            srv_part_text(part, yyjson_get_str(yyjson_obj_get(part, "type")));
+        if (!tx)
+            continue;
+        memcpy(t + w, yyjson_get_str(tx), yyjson_get_len(tx));
         w += yyjson_get_len(tx);
     }
     t[w] = 0;
@@ -214,8 +240,21 @@ static int read_messages(struct srv_perr *e, struct srv_parsed *pr,
                 pr, BAD("invalid_value", "messages[%d] has no role.", i));
         char *t;
         size_t tn;
-        if (content_text(e, pr, yyjson_obj_get(m, "content"), i, &t, &tn))
+        struct srv_img *imgs = NULL;
+        int n_imgs = 0;
+        if (content_text(e, pr, yyjson_obj_get(m, "content"), i, &t, &tn, &imgs,
+                         &n_imgs)) {
+            srv_imgs_free(imgs, n_imgs);
             return -1;
+        }
+        if (n_imgs && strcmp(role, "user")) {
+            free(t);
+            srv_imgs_free(imgs, n_imgs);
+            return srv_pfail(pr, BAD("invalid_value",
+                                     "messages[%d]: pictures go in a user's "
+                                     "message.",
+                                     i));
+        }
         if (strcmp(role, "system") == 0 || strcmp(role, "developer") == 0) {
             char *s = realloc(sys->text, sys->n + tn + 3);
             if (!s) {
@@ -249,6 +288,8 @@ static int read_messages(struct srv_perr *e, struct srv_parsed *pr,
         x->role = role_id;
         x->text = t;
         x->n = tn;
+        x->imgs = imgs;
+        x->n_imgs = n_imgs;
         if (role_id == JANAS_LLM_ROLE_ASSISTANT &&
             read_calls(e, pr, m, x, i) != 0)
             return -1;

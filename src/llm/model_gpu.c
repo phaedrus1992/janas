@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/aligned.h"
 #include "expert_cache.h"
 #include "gpu.h"
 #include "gpu_token.h"
@@ -26,18 +27,69 @@
 
 #include "model_impl.h"
 
+int janas_m_gpu_whole(void)
+{
+    static int whole = -1;
+    if (whole < 0) {
+        const char *w = getenv("JANAS_GPU_WHOLE");
+        whole = w ? atoi(w) > 0 : 1;
+    }
+    return whole;
+}
+
+int janas_m_gpu_tier(const struct janas_llm_model *m)
+{
+    return m->n_expert > 1 && m->gpu && !m->gpu_off &&
+           !janas_gpu_shares_host(m->gpu) && janas_m_gpu_whole() &&
+           !(getenv("JANAS_GPU_TIER") && atoi(getenv("JANAS_GPU_TIER")) == 0);
+}
+
 /* Why a model is not for the token on the GPU, NULL if it is. */
 static const char *not_for_gpu(const struct janas_llm_model *m)
 {
-    if (!m->gpu || m->gpu_off || !janas_gpu_shares_host(m->gpu))
-        return "no GPU reading the host's memory";
+    if (!m->gpu || m->gpu_off)
+        return "no GPU";
+    /* a card with memory of its own: the state copied there and back
+       (sync_state); not yet qwen4exp's rings and indexer, which the CPU's
+       passes read in between */
+    if (!janas_gpu_shares_host(m->gpu) && (m->a->hc || m->ix_heads))
+        return "qwen4exp's streams on a card with memory of its own";
     /* qwen3.5: its recurrent layers and gated queries; an MTP block or a
        drafting model gets the final hidden states */
     int q35 = m->a->rec == JANAS_REC_Q35 && m->a->attn_gate;
-    if ((m->a->rec && !q35) || (m->a->attn_gate && !q35) || m->a->swa ||
-        m->a->sandwich || m->a->gelu || m->kv16 || m->softcap > 0.0f ||
-        m->ple_dim)
+    /* qwen4exp: qwen3.5's layers inside its streams (model_hc.c), with its
+       mixes in bf16 as the file has them, or their down and up rewritten
+       as Q8_0 (JANAS_HC_MIX=q8) */
+    /* Gemma 4's dense layers (sliding windows, sandwich norms, GELU,
+       sixteen-bit keys and values, the soft cap on the CPU after); not yet
+       its per-layer embeddings (E2B, E4B) */
+    if ((m->a->rec && !q35) || (m->a->attn_gate && !q35))
         return "an architecture the token's shaders do not take yet";
+    /* per-layer embeddings: the branch's matrices f32, as E2B's and E4B's */
+    for (uint32_t l = 0; m->ple_dim && l < m->n_layer; l++)
+        if (m->layers[l].ple_gate->type != 0 ||
+            m->layers[l].ple_proj->type != 0)
+            return "per-layer embeddings of a type the token's shaders do "
+                   "not take";
+    if (m->a->hc) {
+        int mt = m->hc_quant[0] ? JANAS_Q8_0 : 30; /* down and up's */
+        for (uint32_t l = 0; l <= m->n_layer; l++)
+            for (int k = 0; k < (l < m->n_layer ? 2 : 1); k++) {
+                const struct layer *ly = l < m->n_layer ? &m->layers[l] : NULL;
+                const struct janas_jns_tensor *t[3] = {
+                    ly ? ly->hc_down[k] : m->hco_down,
+                    ly ? ly->hc_up[k] : m->hco_up,
+                    ly ? ly->hc_inject[k] : NULL};
+                for (int i = 0; i < 3; i++)
+                    if ((i < 2 || ly) &&
+                        (!t[i] || (int)t[i]->type != (i < 2 ? mt : 30)))
+                        return "mixes of the streams of a type the GPU does "
+                               "not take";
+            }
+        if (m->ng_layer < m->n_layer &&
+            m->layers[m->ng_layer].ng_value->type != 30)
+            return "n-gram values not in bf16";
+    }
     if (!m->cache)
         return "no feed-forward weights";
     if (m->n_expert > 1) {
@@ -54,7 +106,10 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
                  held = janas_expert_cache_slots(m->cache);
         if (e && atoi(e) <= 0)
             return "a mixture, JANAS_GPU_MOE=0";
-        if (!e && held * 2 < all) {
+        /* a card with memory of its own: its tier of experts, the CPU
+           computing those not in it */
+        int tier = janas_m_gpu_tier(m);
+        if (!e && !tier && held * 2 < all) {
             static char why[128];
             snprintf(why, sizeof why,
                      "a mixture whose cache holds %.0f%% of its experts, "
@@ -65,7 +120,7 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
         /* nor experts whose down matrices are plain Q6_K (q6k_mmid.comp):
            Qwen3-Coder-30B-A3B read a prompt of 1,024 tokens at 116.9
            tokens/s instead of 131.5 (10 Oct 2026) */
-        if (!e && m->j.layers[0].m[JANAS_JNS_DOWN].type == JANAS_Q6_K)
+        if (!e && !tier && m->j.layers[0].m[JANAS_JNS_DOWN].type == JANAS_Q6_K)
             return "a mixture whose experts' down matrices are plain Q6_K, "
                    "slower whole on the GPU (JANAS_GPU_MOE=1 takes it)";
         /* a mixture: the router's choice whole (no expert left out for
@@ -76,10 +131,11 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
         if (janas_expert_cache_slots(m->cache) < m->n_expert)
             return "an expert cache smaller than a layer's experts";
         for (uint32_t l = 0; l < m->n_layer; l++)
-            if (m->layers[l].exp_scale || !m->layers[l].router16)
+            if (!m->layers[l].router16 ||
+                (m->layers[l].exp_scale && !m->layers[l].pre_norm2))
                 return "a mixture the token's shaders do not take yet";
     }
-    if (m->arena_gpu != 1 || m->arena_stale)
+    if (!janas_m_gpu_tier(m) && (m->arena_gpu != 1 || m->arena_stale))
         return "the feed-forward weights are not on the GPU";
     for (uint32_t l = 0; l < m->n_layer; l++) {
         const struct layer *ly = &m->layers[l];
@@ -89,10 +145,11 @@ static const char *not_for_gpu(const struct janas_llm_model *m)
                 return "a layer the token's shaders do not take yet";
             continue;
         }
-        if (ly->swa || !ly->wk || !ly->wv || !ly->q_norm || !ly->k_norm ||
-            ly->post_attn || ly->post_ffn || ly->pre_norm2 ||
-            m->kv_ring[ly->slot] || ly->hd != m->head_dim ||
-            ly->n_kv != m->n_head_kv || ly->n_rot != m->n_rot)
+        /* not yet: a layer that reads another's keys and values (Gemma 4's
+           E2B, E4B), Gemma 4's mixture */
+        int shared = m->n_kv_layers && l >= m->n_kv_layers;
+        if ((!ly->wk && !shared) || (ly->pre_norm2 && !m->a->swa) ||
+            (!ly->wv && !m->a->swa))
             return "a layer the token's shaders do not take yet";
     }
     return NULL;
@@ -242,14 +299,13 @@ static int repack(struct janas_llm_model *m, int tiles)
 }
 
 /* A mixture's experts for the GPU (gpu_token.h fetch): read into the cache
-   if they are not in it. */
+   if they are not in it - more than 256 too (a block of 256 tokens of prose
+   asked qwen4exp's first layer for 368 of its 512) */
 static int gtok_fetch(void *ctx, uint32_t layer, const uint32_t *ids, size_t n,
                       const uint8_t **slots)
 {
     struct janas_llm_model *m = ctx;
-    if (n > janas_expert_cache_slots(m->cache))
-        return -1;
-    return janas_expert_cache_fetch(m->cache, layer, ids, n, slots);
+    return janas_expert_cache_fetch_many(m->cache, layer, ids, n, slots);
 }
 
 /* ... and the router's choice, for those who watch it and for the counts
@@ -273,6 +329,24 @@ static void gtok_routed(void *ctx, uint32_t layer, uint32_t n, uint32_t k,
 
 /* ... and the experts of a layer read ahead, all of them (a prompt's block
    asks for nearly all), where the cache can read ahead */
+/* ... the experts not in the card's tier, on the CPU (gpu_token.h
+   cpu_rows) ... */
+static int gtok_cpu_rows(void *ctx, uint32_t layer, uint32_t n, const float *xn,
+                         uint32_t nd, const uint32_t *ids,
+                         const uint8_t *const *slots, const uint32_t *ra,
+                         const uint32_t *rb, const uint32_t *tok, float *out)
+{
+    return janas_m_expert_rows(ctx, layer, n, xn, nd, ids, slots, ra, rb, tok,
+                               out);
+}
+
+/* ... whether someone watches the router's choices */
+static int gtok_watched(void *ctx)
+{
+    const struct janas_llm_model *m = ctx;
+    return m->route_fn != NULL;
+}
+
 static void gtok_prefetch(void *ctx, uint32_t layer)
 {
     struct janas_llm_model *m = ctx;
@@ -282,11 +356,157 @@ static void gtok_prefetch(void *ctx, uint32_t layer)
     janas_expert_cache_prefetch(m->cache, layer, ids, m->n_expert, m->n_expert);
 }
 
+/* qwen4exp's streams for the GPU: the mixes, the n-gram layer (its ring
+   imported once), the attention's inputs for the indexer (allocated and
+   imported once). 0, or -1. */
+static int hc_build(struct janas_llm_model *m, char *err, size_t len)
+{
+    struct janas_gpu_tok_model *md = &m->gtok_md;
+    size_t hd = (size_t)m->hc_n * m->d_model;
+    md->hc = m->hc_n;
+    md->hc_rank = m->hc_rank;
+    md->hc_q8 = m->hc_quant[0] != 0;
+    md->hco_norm = f32(m, m->hco_norm);
+    md->hco_down = data(m, m->hco_down);
+    md->hco_up = data(m, m->hco_up);
+    if (m->ng_layer < m->n_layer) {
+        size_t hb = ((size_t)m->ng_cap * hd * 4 + 4095) & ~(size_t)4095;
+        if (!m->gtok_ng_in) {
+            if (janas_gpu_import(m->gpu, m->ng_hist, hb) != 0) {
+                snprintf(err, len, "the n-gram ring cannot be imported");
+                return -1;
+            }
+            m->gtok_ng_in = 1;
+        }
+        md->ng_layer = m->ng_layer;
+        md->ng_kernel = m->ng_kernel;
+        md->ng_len = m->ng_len;
+        md->ng_cap = m->ng_cap;
+        md->ng_hist = m->ng_hist;
+        md->ng_emb = m->ng_emb;
+    }
+    if (m->ix_heads && m->n_attn) {
+        size_t ab =
+            ((size_t)m->n_attn * JANAS_GPU_TOK_BLOCK * m->d_model * 4 + 4095) &
+            ~(size_t)4095;
+        if (!m->gtok_att_in) {
+            m->gtok_att_in = janas_aligned_alloc(4096, ab);
+            if (!m->gtok_att_in ||
+                janas_gpu_import(m->gpu, m->gtok_att_in, ab) != 0) {
+                janas_aligned_free(m->gtok_att_in);
+                m->gtok_att_in = NULL;
+                snprintf(err, len, "no room for the indexer's inputs");
+                return -1;
+            }
+        }
+        md->att_in = m->gtok_att_in;
+        /* the sparse attention on the GPU: the indexer's keys where it
+           reads them, the cos and sin of a piece's positions */
+        uint32_t r = m->ix_ratio, d = m->ix_dim;
+        size_t nbk = (m->n_ctx + r - 1) / r,
+               rb = ((size_t)m->n_attn * m->n_ctx * d * 2 + 4095) &
+                    ~(size_t)4095,
+               pb = ((size_t)m->n_attn * nbk * d * 4 + 4095) & ~(size_t)4095;
+        if (!m->gtok_ix_in) {
+            if (janas_gpu_import(m->gpu, m->ix_raw, rb) != 0 ||
+                janas_gpu_import(m->gpu, m->ix_pool, pb) != 0) {
+                snprintf(err, len, "the indexer's keys cannot be imported");
+                return -1;
+            }
+            m->gtok_ix_in = 1;
+        }
+        if (!m->gtok_ix_rope)
+            m->gtok_ix_rope = malloc(
+                ((size_t)JANAS_GPU_TOK_BLOCK + JANAS_GPU_TOK_BLOCK / r + 2) *
+                m->n_rot * sizeof(float));
+        if (!m->gtok_ix_rope) {
+            snprintf(err, len, "out of memory");
+            return -1;
+        }
+        md->ix_heads = m->ix_heads;
+        md->ix_dim = d;
+        md->ix_top = m->ix_top;
+        md->ix_ratio = r;
+        md->ix_rope = m->gtok_ix_rope;
+    }
+    return 0;
+}
+
+/* The token's state between the host and the GPU's copy (to_device 1:
+   there; 0: back): each attention layer's KV rows and scales, the
+   recurrent states and their log. 0, or -1. */
+static int sync_state(struct janas_llm_model *m, int to_device)
+{
+    struct janas_gpu *g = m->gpu;
+    for (uint32_t l = 0; l < m->n_layer; l++) {
+        const struct layer *ly = &m->layers[l];
+        if (ly->rec)
+            continue;
+        uint32_t s = ly->slot;
+        size_t kb = m->kv_off[s + 1] - m->kv_off[s],
+               sb = (m->ks_off[s + 1] - m->ks_off[s]) * sizeof(float);
+        if (janas_gpu_sync(g, m->kcache + m->kv_off[s], kb, to_device) != 0 ||
+            janas_gpu_sync(g, m->vcache + m->kv_off[s], kb, to_device) != 0 ||
+            janas_gpu_sync(g, m->kscale + m->ks_off[s], sb, to_device) != 0 ||
+            janas_gpu_sync(g, m->vscale + m->ks_off[s], sb, to_device) != 0)
+            return -1;
+    }
+    if (m->a->rec) {
+        size_t L = JANAS_LLM_MAX_BLOCK,
+               sb = 2 * (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t),
+               cb = 2 * (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
+                    sizeof(float),
+               lm = (size_t)m->n_rec * L * m->conv_ch * sizeof(float),
+               lb = (size_t)m->n_rec * L * m->n_vh * sizeof(float);
+        if (janas_gpu_sync(g, m->ssm_buf, sb, to_device) != 0 ||
+            janas_gpu_sync(g, m->conv_buf, cb, to_device) != 0 ||
+            janas_gpu_sync(g, m->log_mixed, lm, to_device) != 0 ||
+            janas_gpu_sync(g, m->log_beta, lb, to_device) != 0 ||
+            janas_gpu_sync(g, m->log_decay, lb, to_device) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+void janas_m_gtok_host(struct janas_llm_model *m, int write)
+{
+    if (!m->gtok_dev)
+        return;
+    if (m->gtok_where == JANAS_GT_DEV) {
+        m->gtok_pull++;
+        if (sync_state(m, 0) != 0) {
+            /* the GPU's copy cannot come back: the CPU's state is not
+               this conversation's any more; the GPU left out from here */
+            fprintf(stderr, "janas: the GPU's state could not be read back\n");
+            m->gtok_state = -1;
+        }
+        m->gtok_where = JANAS_GT_SAME;
+    }
+    if (write)
+        m->gtok_where = JANAS_GT_HOST;
+}
+
+/* A mixture's tier of experts in the card's memory (0: none): the room the
+   card has left, less some for the token's buffers made before it;
+   JANAS_GPU_TIER_MB=<n> asks for n MiB (on an integrated GPU as a card of
+   its own, JANAS_GPU_COPY=1, 1 GiB unless asked) */
+static size_t tier_bytes(const struct janas_llm_model *m)
+{
+    if (!janas_m_gpu_tier(m))
+        return 0;
+    const char *e = getenv("JANAS_GPU_TIER_MB");
+    if (e && atol(e) > 0)
+        return (size_t)atol(e) << 20;
+    size_t room = janas_gpu_local_room(m->gpu), keep = (size_t)1 << 30;
+    if (!room)
+        return keep;
+    return room > keep ? room - keep : 0;
+}
+
 /* The layers described for the GPU, the KV cache imported: 0, or -1. */
 static int build(struct janas_llm_model *m, char *err, size_t len)
 {
-    uint32_t dm = m->d_model, hd = m->head_dim, qd = m->n_head * hd,
-             kvd = m->n_head_kv * hd;
+    uint32_t dm = m->d_model;
     if (!m->gtok_kv) {
         if (janas_gpu_import(m->gpu, m->kcache, m->kv_bytes) != 0 ||
             janas_gpu_import(m->gpu, m->vcache, m->kv_bytes) != 0 ||
@@ -296,6 +516,34 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             return -1;
         }
         m->gtok_kv = 1;
+    }
+    /* on a card with memory of its own the recurrent states and their log
+       too (an integrated GPU was given them with the engine's buffers),
+       and the state is the host's until the first pass on the GPU */
+    if (!janas_gpu_shares_host(m->gpu) && !m->gtok_dev) {
+        if (m->a->rec && !m->gtok_rec_in) {
+            size_t L = JANAS_LLM_MAX_BLOCK,
+                   sb = 2 * (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t),
+                   cb = 2 * (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
+                        sizeof(float),
+                   lm = (size_t)m->n_rec * L * m->conv_ch * sizeof(float),
+                   lb = (size_t)m->n_rec * L * m->n_vh * sizeof(float);
+#define PAGES(b) (((b) + 4095) & ~(size_t)4095)
+            if (janas_gpu_import(m->gpu, m->ssm_buf, PAGES(sb)) != 0 ||
+                janas_gpu_import(m->gpu, m->conv_buf, PAGES(cb)) != 0 ||
+                janas_gpu_import(m->gpu, m->log_mixed, PAGES(lm)) != 0 ||
+                janas_gpu_import(m->gpu, m->log_beta, PAGES(lb)) != 0 ||
+                janas_gpu_import(m->gpu, m->log_decay, PAGES(lb)) != 0) {
+                snprintf(err, len,
+                         "the recurrent states cannot be copied "
+                         "to the GPU");
+                return -1;
+            }
+#undef PAGES
+            m->gtok_rec_in = 1;
+        }
+        m->gtok_dev = 1;
+        m->gtok_where = JANAS_GT_HOST;
     }
     free(m->gtok_layers);
     m->gtok_layers = calloc(m->n_layer, sizeof(*m->gtok_layers));
@@ -316,8 +564,25 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             snprintf(err, len, "the feed-forward of layer %u unreadable", l);
             return -1;
         }
-        g->attn_norm = f32(m, ly->attn_norm);
-        g->ffn_norm = f32(m, ly->ffn_norm);
+        if (!m->a->hc) {
+            g->attn_norm = f32(m, ly->attn_norm);
+            g->ffn_norm = f32(m, ly->ffn_norm);
+        } else {
+            for (int k = 0; k < 2; k++) {
+                g->hc_norm[k] = f32(m, ly->hc_norm[k]);
+                g->hc_down[k] = data(m, ly->hc_down[k]);
+                g->hc_up[k] = data(m, ly->hc_up[k]);
+                g->hc_inject[k] = data(m, ly->hc_inject[k]);
+            }
+            if (l == m->ng_layer) {
+                g->ng_key = task_of(m, ly->ng_key, m->hc_n * dm, dm);
+                g->ng_value = data(m, ly->ng_value);
+                g->ng_nk = f32(m, ly->ng_nkey);
+                g->ng_nq = f32(m, ly->ng_nquery);
+                g->ng_nc = f32(m, ly->ng_nconv);
+                g->ng_conv = ly->ng_conv;
+            }
+        }
         if (ly->rec) {
             g->rec = 1;
             g->slot = ly->slot;
@@ -331,12 +596,43 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
             g->ssm_a = f32(m, ly->ssm_a);
             g->ssm_norm = f32(m, ly->ssm_norm);
         } else {
-            g->q_norm = f32(m, ly->q_norm);
-            g->k_norm = f32(m, ly->k_norm);
+            /* the layer's own geometry (Gemma 4's two kinds) */
+            uint32_t qd = m->n_head * ly->hd, kvd = ly->n_kv * ly->hd;
+            g->hd = ly->hd;
+            g->n_kv = ly->n_kv;
+            g->n_rot = ly->n_rot;
+            g->swa = ly->swa;
+            g->cap = m->kv_cap[ly->slot];
+            g->ring = m->kv_ring[ly->slot];
+            g->window = ly->swa ? m->window : 0;
+            g->post_attn = ly->post_attn ? f32(m, ly->post_attn) : NULL;
+            g->post_ffn = ly->post_ffn ? f32(m, ly->post_ffn) : NULL;
+            g->out_scale = ly->out_scale;
+            g->slot = ly->slot; /* its KV slot: att_in's row (qwen4exp) */
+            g->q_norm = ly->q_norm ? f32(m, ly->q_norm) : NULL; /* llama */
+            g->k_norm = ly->k_norm ? f32(m, ly->k_norm) : NULL;
             g->wq = task_of(m, ly->wq, m->a->attn_gate ? 2 * qd : qd, dm);
-            g->wk = task_of(m, ly->wk, kvd, dm);
-            g->wv = task_of(m, ly->wv, kvd, dm);
+            /* none (type 0): another layer's keys and values (Gemma 4's
+               E2B, E4B); V is K (its full layers) */
+            if (ly->wk)
+                g->wk = task_of(m, ly->wk, kvd, dm);
+            if (ly->wv)
+                g->wv = task_of(m, ly->wv, kvd, dm);
+            if (m->ple_dim) {
+                g->ple_gate = f32(m, ly->ple_gate);
+                g->ple_proj = f32(m, ly->ple_proj);
+                g->ple_post = f32(m, ly->ple_post);
+            }
             g->wo = task_of(m, ly->wo, dm, qd);
+            if (m->ix_heads && ly->ix_q) {
+                size_t nbk = (m->n_ctx + m->ix_ratio - 1) / m->ix_ratio;
+                g->ix_q = data(m, ly->ix_q);
+                g->ix_k = data(m, ly->ix_k);
+                g->ix_qn = f32(m, ly->ix_qn);
+                g->ix_kn = f32(m, ly->ix_kn);
+                g->ix_raw = m->ix_raw + (size_t)ly->slot * m->n_ctx * m->ix_dim;
+                g->ix_pool = m->ix_pool + (size_t)ly->slot * nbk * m->ix_dim;
+            }
         }
         for (int p = 0; p < 3; p++) {
             const struct janas_jns_matrix *mx = &jl->m[p];
@@ -370,19 +666,40 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
                         .rows = ly->sh_mx[p].rows,
                         .cols = ly->sh_mx[p].cols};
             }
+            /* Gemma 4's: the shared expert a dense branch of its own,
+               normalized, not in the experts' sum */
+            if (ly->pre_norm2) {
+                g->dn_gate = g->sh_gate_w;
+                g->dn_up = g->sh_up;
+                g->dn_down = g->sh_down;
+                g->sh_gate_w = g->sh_up = g->sh_down =
+                    (struct janas_matvec_task){0};
+                g->pre_norm2 = f32(m, ly->pre_norm2);
+                g->post_norm1 = f32(m, ly->post_norm1);
+                g->post_norm2 = f32(m, ly->post_norm2);
+                g->rscale = ly->router_scale;
+                g->exp_scale = ly->exp_scale;
+            }
         }
         /* a mixture: its experts' width, and its shared expert's (the
            feed-forward the token's buffers are made for) */
-        uint32_t lff =
-            moe && g->sh_gate_w.type ? g->sh_gate_w.rows : g->gate.rows;
+        uint32_t lff = moe && g->sh_gate_w.type ? g->sh_gate_w.rows
+                       : moe && g->dn_gate.type ? g->dn_gate.rows
+                                                : g->gate.rows;
         if (l == 0) {
             ff = lff;
             eff = g->gate.rows;
         }
-        if (lff != ff || g->gate.rows != eff || g->up.rows != eff ||
-            g->down.cols != eff ||
-            (moe && g->sh_gate_w.type &&
-             (g->sh_up.rows != ff || g->sh_down.cols != ff))) {
+        /* a dense model's widths may differ layer by layer (Gemma 4's
+           E2B): the token's buffers for the widest */
+        if (!moe && g->up.rows == g->gate.rows &&
+            g->down.cols == g->gate.rows) {
+            if (lff > ff)
+                ff = eff = lff;
+        } else if (lff != ff || g->gate.rows != eff || g->up.rows != eff ||
+                   g->down.cols != eff ||
+                   (moe && g->sh_gate_w.type &&
+                    (g->sh_up.rows != ff || g->sh_down.cols != ff))) {
             snprintf(err, len, "feed-forwards of different widths");
             return -1;
         }
@@ -400,20 +717,42 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         snprintf(err, len, "no attention layer");
         return -1;
     }
+    /* the token's buffers for the largest of any layer: Gemma 4's full
+       layers' heads, its sliding ones' KV heads; the full layers' cache */
+    uint32_t hd = m->a->swa ? m->hd_max : m->head_dim, nkv = m->n_head_kv,
+             room = 0;
+    for (uint32_t l = 0; l < m->n_layer; l++) {
+        const struct janas_gpu_tok_layer *g = &m->gtok_layers[l];
+        if (g->rec)
+            continue;
+        if (g->n_kv > nkv)
+            nkv = g->n_kv;
+        /* a ring holds the window before a block's first token and the
+           block */
+        if (g->ring && (!room || g->cap - g->window + 1 < room))
+            room = g->cap - g->window + 1;
+    }
     m->gtok_md = (struct janas_gpu_tok_model){
         .n_layer = m->n_layer,
         .dm = dm,
         .n_head = m->n_head,
-        .n_kv = m->n_head_kv,
+        .n_kv = nkv,
         .hd = hd,
         .n_rot = m->n_rot,
         .ff = ff,
         .n_vocab = m->n_vocab,
-        .cap = m->kv_cap[m->layers[a0].slot],
+        .cap = m->a->swa ? m->n_ctx : m->kv_cap[m->layers[a0].slot],
         .eps = m->eps,
-        .attn_scale = 1.0f / sqrtf((float)hd),
+        /* Gemma 4: the q and k norms scale the scores */
+        .attn_scale = m->a->swa ? 1.0f : 1.0f / sqrtf((float)hd),
+        .gelu = m->a->gelu,
+        .kv16 = m->kv16,
+        .vnorm = m->a->swa,
+        .n_rot_swa = m->a->swa ? m->n_rot_swa : 0,
+        .ring_room = room,
+        .ple_dim = m->ple_dim,
         .layers = m->gtok_layers,
-        .out_norm = f32(m, m->out_norm),
+        .out_norm = m->a->hc ? NULL : f32(m, m->out_norm),
         .output = task_of(m, m->output, m->n_vocab, dm),
         .gated_q = m->a->attn_gate,
         .n_rec = m->a->rec ? m->n_rec : 0,
@@ -438,7 +777,14 @@ static int build(struct janas_llm_model *m, char *err, size_t len)
         .prefetch = moe && janas_expert_cache_can_prefetch(m->cache)
                         ? gtok_prefetch
                         : NULL,
-        .ctx = m};
+        .tier_bytes = tier_bytes(m),
+        .slot_bytes = janas_expert_cache_slot_bytes(m->cache),
+        .cpu_rows = gtok_cpu_rows,
+        .watched = moe ? gtok_watched : NULL,
+        .ctx = m,
+        .ng_layer = m->n_layer};
+    if (m->a->hc && hc_build(m, err, len) != 0)
+        return -1;
     free(m->gblk_layers);
     m->gblk_layers = NULL;
     if (!moe && getenv("JANAS_GPU_REPACK") &&
@@ -501,6 +847,9 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
 {
     if (m->gtok_state < 0)
         return -1;
+    /* a picture whose tokens attend both ways: the CPU's attention */
+    if (m->n_media && janas_m_media_both(m, pos, n))
+        return -1;
     /* JANAS_GPU_TOKEN=1: tokens, and blocks with JANAS_GPU_BLOCK=1. With the
        fast prompt a prompt's blocks (from JANAS_GPU_FAST_N tokens) come
        here by themselves, JANAS_GPU_BLOCK=0 aside: the whole block in one
@@ -516,8 +865,8 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
         tok = e && atoi(e) > 0;
         blocks = b ? atoi(b) > 0 : -1; /* -1: not said */
     }
-    int prompt =
-        janas_gpu_fast_prompt() && n >= JANAS_GPU_FAST_N && blocks != 0;
+    int prompt = janas_gpu_fast_prompt() && !m->prompts_off_gpu && !m->lp_cpu &&
+                 n >= JANAS_GPU_FAST_N && blocks != 0;
     /* A short pass (a chain of drafts to verify) where the tuner chose the
        GPU for it: the whole pass in one submission, the CPU idle, rather
        than the products by groups beside the CPU - on the development
@@ -535,7 +884,14 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
        attention sum in its own order; 13 Oct 2026). */
     int short_pass = shorts_on() && m->gpu_use && n >= 2 &&
                      n <= JANAS_LLM_MAX_BLOCK && m->n_expert <= 1;
-    if (!prompt && !short_pass && !(tok && (n == 1 || blocks > 0)))
+    /* a card with memory of its own, the model on it: every pass there,
+       tokens, drafts and blocks, the CPU's work and the copies over the
+       bus between them gone (an Arc B580 read a prompt at 15.8 tokens/s
+       with the products shared with the CPU, issue #43); JANAS_GPU_WHOLE=0
+       as on an integrated GPU */
+    int whole = janas_m_gpu_whole() && m->gpu &&
+                !janas_gpu_shares_host(m->gpu) && !m->lp_cpu;
+    if (!prompt && !short_pass && !whole && !(tok && (n == 1 || blocks > 0)))
         return -1;
     /* a recurrent model: the GPU replays first what forward() asks (the
        m->replay tokens of the last call that were kept, at most
@@ -574,6 +930,13 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
     uint32_t half = m->n_rot / 2;
     if (all && n > janas_gpu_tok_block_at(m->gtok, &m->gtok_md, pos))
         return -1;
+    /* the state the CPU changed last: to the GPU's copy first */
+    if (m->gtok_dev && m->gtok_where == JANAS_GT_HOST) {
+        if (sync_state(m, 1) != 0)
+            return -1;
+        m->gtok_push++;
+        m->gtok_where = JANAS_GT_SAME;
+    }
     /* the recurrent state: the first piece from half src to the other,
        the later ones on that one in place; each piece at least the
        convolution's rows of state long. The first replays, every piece of
@@ -582,11 +945,26 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
     uint32_t src = m->src, dst = 1 - m->src, rows = m->a->rec ? m->d_conv : 1;
     int logged = m->a->rec && n <= JANAS_LLM_MAX_BLOCK;
     float *hid = m->mtp || m->asst ? m->hid : NULL;
+    size_t hw = (size_t)(m->hc_n ? m->hc_n : 1) * m->d_model; /* hidden's */
+    /* qwen4exp's n-gram embeddings: the block's rows of the table */
+    if (m->hc_n && janas_m_hc_ng_begin(m, m->gtok_tokens, n, pos) != 0)
+        return -1;
     for (uint32_t j = 0, k; j < n; j += k) {
         uint32_t nb = janas_gpu_tok_block_at(m->gtok, &m->gtok_md, pos + j);
         k = n - j < nb ? n - j : nb;
         if (n - j - k > 0 && n - j - k + 1 < rows)
             k -= rows; /* the last piece long enough */
+        m->gtok_md.ng_emb = m->ng_emb + (size_t)j * m->d_model;
+        if (m->ple_dim) /* Gemma 4's per-layer inputs */
+            m->gtok_md.ple_in = m->ple + (size_t)j * m->n_layer * m->ple_dim;
+        if (m->a->swa) { /* Gemma 4's sliding layers' RoPE tables */
+            m->gtok_md.cs_swa =
+                m->rope_cos_swa + (size_t)j * (m->n_rot_swa / 2);
+            m->gtok_md.sn_swa =
+                m->rope_sin_swa + (size_t)j * (m->n_rot_swa / 2);
+        }
+        if (m->gtok_md.ix_heads)
+            janas_m_qsa_rope(m, m->gtok_ix_rope, pos + j, k);
         int rc = janas_gpu_tok_run(
             m->gpu, m->gtok, &m->gtok_md, m->x + (size_t)j * m->d_model,
             m->rope_cos + (size_t)j * half, m->rope_sin + (size_t)j * half,
@@ -594,12 +972,38 @@ int janas_m_gpu_token(struct janas_llm_model *m, uint32_t pos, uint32_t n,
             j + k < n ? 2
             : all     ? 1
                       : 0,
-            logits, hid ? hid + (size_t)j * m->d_model : NULL, j ? dst : src,
-            dst, j ? 0 : m->replay, logged ? j : UINT32_MAX);
+            logits, hid ? hid + (size_t)j * hw : NULL, j ? dst : src, dst,
+            j ? 0 : m->replay, logged ? j : UINT32_MAX);
         /* -2, or any failure after a first piece that replayed: the base
            was updated in place, the CPU cannot replay on it again */
-        if (rc != 0)
+        if (rc != 0) {
+            /* a block back to the CPU (its experts not all in the cache at
+               once, say): said where asked */
+            if (getenv("JANAS_GPU_VERBOSE"))
+                fprintf(stderr,
+                        "janas: the whole token on the GPU failed at position "
+                        "%u (%u tokens), the CPU's\n",
+                        pos + j, k);
+            /* the GPU's copy is not the host's any more: sent again
+               before the next pass there */
+            if (m->gtok_dev)
+                m->gtok_where = JANAS_GT_HOST;
             return rc == -2 || (j && m->replay) ? -2 : -1;
+        }
+        if (m->gtok_dev)
+            m->gtok_where = JANAS_GT_DEV;
+        m->gtok_runs[n == 1 ? 0 : n <= 16 ? 1 : 2]++;
+        /* qwen4exp: the indexer's keys of the piece's positions, from each
+           attention layer's input the GPU kept */
+        for (uint32_t l = 0; m->gtok_att_in && l < m->n_layer; l++)
+            if (!m->layers[l].rec)
+                janas_m_qsa_keys(m, &m->layers[l],
+                                 m->gtok_att_in + (size_t)m->layers[l].slot *
+                                                      JANAS_GPU_TOK_BLOCK *
+                                                      m->d_model,
+                                 k, pos + j);
     }
+    if (m->hc_n)
+        m->ng_hi = pos + n;
     return 0;
 }

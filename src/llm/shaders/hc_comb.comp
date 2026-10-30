@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's streams after a sublayer (model_hc.c combine_worker): each of
+// a token's hc streams += the sublayer's output (out, d floats a token)
+// times 2 sigmoid(inject_c / hc) (inj: hc a token). With init 1, every
+// stream set to out instead (the embeddings, before the first layer). A
+// thread per number of the hc x d (x) and token (y).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
+
+layout(push_constant) uniform P { uvec2 res, out_, inj; uint d, hc, init; } p;
+
+void main()
+{
+    uint e = gl_GlobalInvocationID.x, j = gl_WorkGroupID.y, hd = p.hc * p.d;
+    if (e >= hd)
+        return;
+    uint c = e / p.d, i = e % p.d;
+    float b = R(p.out_).v[j * p.d + i];
+    F S = F(p.res);
+    if (p.init != 0u) {
+        S.v[j * hd + e] = b;
+        return;
+    }
+    float w = 2.0 / (1.0 + exp(-R(p.inj).v[j * p.hc + c] / float(p.hc)));
+    S.v[j * hd + e] += b * w;
+}

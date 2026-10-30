@@ -60,9 +60,17 @@ void janas_tuner_init(struct janas_tuner *t, const struct janas_tune_cand *c,
 /* GPU candidates: only when allowed, and for one token only where the
    GPU takes single-token products (elsewhere they would differ only by the
    power its keep-alive costs) */
+/* the user's choice of devices for the class allows this candidate */
+static int allowed(const struct janas_tuner *t, int cls, int i)
+{
+    int combo = (t->cand[i].gpu ? 1 : 0) | (t->cand[i].npu ? 2 : 0);
+    return !t->allowed[cls] || (t->allowed[cls] >> combo & 1);
+}
+
 static int usable(const struct janas_tuner *t, int cls, int i)
 {
-    return (!t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one))) &&
+    return allowed(t, cls, i) && (!t->cand[i].npu || cls == 2) &&
+           (!t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one))) &&
            (!t->cls[cls].threads || t->cand[i].threads == t->cls[cls].threads);
 }
 
@@ -72,7 +80,8 @@ static int usable(const struct janas_tuner *t, int cls, int i)
    can move them */
 static int retryable(const struct janas_tuner *t, int cls, int i)
 {
-    return !t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one));
+    return allowed(t, cls, i) && (!t->cand[i].npu || cls == 2) &&
+           (!t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one)));
 }
 
 /* The default of a class: its own, or once the threads are settled the
@@ -80,10 +89,27 @@ static int retryable(const struct janas_tuner *t, int cls, int i)
 static int class_def(const struct janas_tuner *t, int cls)
 {
     int def = t->cls[cls].def;
+    /* the user's devices: the allowed candidate of the default's threads
+       (or the settled ones), else the first allowed */
+    if (!allowed(t, cls, def)) {
+        int th = t->cls[cls].threads ? t->cls[cls].threads
+                                     : t->cand[def].threads,
+            first = -1;
+        for (int i = 0; i < t->n_cand; i++)
+            if (allowed(t, cls, i) && (!t->cand[i].npu || cls == 2)) {
+                if (t->cand[i].threads == th)
+                    return i;
+                if (first < 0)
+                    first = i;
+            }
+        if (first >= 0)
+            return first;
+    }
     if (!t->cls[cls].threads || t->cand[def].threads == t->cls[cls].threads)
         return def;
     for (int i = 0; i < t->n_cand; i++)
-        if (!t->cand[i].gpu && t->cand[i].threads == t->cls[cls].threads)
+        if (!t->cand[i].gpu && !t->cand[i].npu && allowed(t, cls, i) &&
+            t->cand[i].threads == t->cls[cls].threads)
             return i;
     return def;
 }
@@ -100,6 +126,23 @@ static void settle_threads(struct janas_tuner *t, int cls)
     if (tracing())
         fprintf(stderr, "tune class %d pass %u: threads settled on %d\n", cls,
                 t->cls[cls].passes, t->cls[cls].threads);
+}
+
+const char *janas_tune_devices(const struct janas_tune_cand *c)
+{
+    return c->gpu && c->npu ? " + GPU + NPU"
+           : c->gpu         ? " + GPU"
+           : c->npu         ? " + NPU"
+                            : "";
+}
+
+void janas_tuner_allow(struct janas_tuner *t, int cls, int mask)
+{
+    if (cls < 0 || cls >= JANAS_TUNE_CLASSES)
+        return;
+    t->allowed[cls] = mask;
+    /* the default among the allowed (a fixed tuner runs it as it is) */
+    t->cls[cls].def = class_def(t, cls);
 }
 
 void janas_tuner_force(struct janas_tuner *t, int cand)
@@ -139,6 +182,7 @@ int janas_tuner_best(const struct janas_tuner *t, int cls)
 
 int janas_tuner_pick(struct janas_tuner *t, int cls)
 {
+    t->trying = 0;
     if (t->forced >= 0) {
         t->cls[cls].passes++;
         return t->forced;
@@ -155,8 +199,10 @@ int janas_tuner_pick(struct janas_tuner *t, int cls)
         if (usable(t, cls, i) &&
             (least < 0 || t->cls[cls].tried[i] < t->cls[cls].tried[least]))
             least = i;
-    if (least >= 0 && t->cls[cls].tried[least] < TRIES)
+    if (least >= 0 && t->cls[cls].tried[least] < TRIES) {
+        t->trying = 1;
         return least;
+    }
     /*
      * Exploit, trying the longest untried alternative now and then, to
      * follow the machine's state. A try is a pass run slower on purpose, so
@@ -183,6 +229,7 @@ int janas_tuner_pick(struct janas_tuner *t, int cls)
         if (old >= 0) {
             t->cls[cls].retry_best = best;
             t->cls[cls].retry_cand = old;
+            t->trying = 1;
             return old;
         }
     }
@@ -227,8 +274,8 @@ void janas_tuner_record(struct janas_tuner *t, int cls, int cand,
                     "%d threads%s %.2f ms: %s (%u in a row by other "
                     "threads)\n",
                     cls, t->cls[cls].passes, t->cand[cand].threads,
-                    t->cand[cand].gpu ? " + GPU" : "", 1e3 * sec_per_token,
-                    t->cand[rb].threads, t->cand[rb].gpu ? " + GPU" : "",
+                    janas_tune_devices(&t->cand[cand]), 1e3 * sec_per_token,
+                    t->cand[rb].threads, janas_tune_devices(&t->cand[rb]),
                     1e3 * t->cls[cls].cost[rb], won ? "won" : "lost",
                     (unsigned)t->cls[cls].other_wins);
         if (other && won &&
@@ -261,7 +308,7 @@ void janas_tuner_record(struct janas_tuner *t, int cls, int cand,
                     "tune class %d pass %u: %d threads%s %.2f ms against a "
                     "mean of %.2f: a try now\n",
                     cls, t->cls[cls].passes, t->cand[cand].threads,
-                    t->cand[cand].gpu ? " + GPU" : "", 1e3 * sec_per_token,
+                    janas_tune_devices(&t->cand[cand]), 1e3 * sec_per_token,
                     1e3 * *c);
     }
     /* a plain mean over the first tries, then a moving average */
@@ -390,7 +437,7 @@ void janas_tuner_report(const struct janas_tuner *t, char *buf, size_t len)
         int b = janas_tuner_best(t, k);
         w += (size_t)snprintf(buf + w, len - w, "%s%s: %d threads%s",
                               o ? "; " : "", name[k], t->cand[b].threads,
-                              t->cand[b].gpu ? " + GPU" : "");
+                              janas_tune_devices(&t->cand[b]));
         if (t->cls[k].tried[b] >= TRIES && w < len)
             w += (size_t)snprintf(buf + w, len - w, " (%.1f ms/token)",
                                   1e3 * t->cls[k].cost[b]);

@@ -95,6 +95,10 @@ int resp_mcp_owns(const struct resp *x, const char *name);
 /* The job is over: its MCP calls run or held for approval; 1 when a next
    round was submitted (x->j is the new job), 0 when the response is over. */
 int resp_mcp_round(struct resp *x);
+/* The url_citation annotations of an output text: each [n] it holds that
+   names a source the web_search calls found (responses_mcp.c). */
+void resp_web_annotate(yyjson_mut_doc *d, yyjson_mut_val *arr,
+                       const struct resp *x, const char *text, size_t n);
 void resp_mcp_free(struct resp_mcp *mc);
 /* Stops the MCP calls running for x, from another thread. */
 void resp_mcp_cancel(struct resp_mcp *mc);
@@ -103,8 +107,9 @@ void resp_mcp_cancel(struct resp_mcp *mc);
    behind; -1 (nothing changed) when x was cancelled or the queue is full. */
 int resp_adopt(struct resp *x, struct srv_job *nj);
 
-/* conversations.c: items added to a conversation (a JSON array); 0, or -1
-   when there is no such conversation (or memory). */
+/* conversations.c: items added to a conversation (a JSON array text): 0,
+   -1 no such conversation, -2 memory (or not an array), -3 it would grow
+   past SRV_STORE_DOC_MAX. */
 int conv_append(struct srv *srv, const char *conv, const char *items_json);
 /* Its items, as a JSON array text (NULL: no such conversation). */
 char *conv_items(struct srv *srv, const char *conv);
