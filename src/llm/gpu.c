@@ -258,6 +258,7 @@ static int pick_device(struct janas_gpu *g, uint32_t *family, char *err,
             g->host_import =
                 has_extension(g, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
             g->discrete = type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+            g->has_f64 = f2.features.shaderFloat64; /* gpu_fma.c */
             if (!g->discrete && !g->host_import)
                 REJECT("integrated, without VK_EXT_external_memory_host")
             /* the subgroup size the shader is built for: 8 where the size can
@@ -409,10 +410,14 @@ static VkResult make_pipeline(struct janas_gpu *g, const uint32_t *code,
                               VkPipeline *pipe, uint32_t kind, uint32_t nv,
                               uint32_t sg)
 {
+    /* the _xfma variant where the driver splits fma() (gpu_fma.c); made[]
+       keeps code, the name janas_gpu_last_shader looks up */
+    size_t mb = bytes;
+    const uint32_t *mc = janas_g_spv(g, code, &mb);
     VkShaderModuleCreateInfo smi = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = bytes,
-        .pCode = code};
+        .codeSize = mb,
+        .pCode = mc};
     VkResult r = g->vkCreateShaderModule(g->dev, &smi, NULL, sm);
     if (r != VK_SUCCESS)
         return r;
@@ -577,8 +582,12 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
         .pNext = &f13,
         .bufferDeviceAddress = VK_TRUE};
     const char *ext[] = {VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+    VkPhysicalDeviceFeatures2 f2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &f12,
+        .features = {.shaderFloat64 = g->has_f64 ? VK_TRUE : VK_FALSE}};
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                              .pNext = &f12,
+                              .pNext = &f2,
                               .queueCreateInfoCount = 1,
                               .pQueueCreateInfos = &qci,
                               .enabledExtensionCount = g->host_import ? 1 : 0,
@@ -593,6 +602,26 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
     VK_DEVICE_FUNCS(LOAD_D)
 #undef LOAD_D
     g->vkGetDeviceQueue(g->dev, family, 0, &g->queue);
+    VkCommandPoolCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = family};
+    VkCommandBufferAllocateInfo cba = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1};
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (g->vkCreateCommandPool(g->dev, &cpci, NULL, &g->cp) != VK_SUCCESS ||
+        (cba.commandPool = g->cp,
+         g->vkAllocateCommandBuffers(g->dev, &cba, &g->cb) != VK_SUCCESS) ||
+        g->vkCreateFence(g->dev, &fci, NULL, &g->fence) != VK_SUCCESS ||
+        janas_g_make_stage(g, &g->xs, X_STAGE_BYTES,
+                           !getenv("JANAS_GPU_XCOH")) != 0 ||
+        janas_g_make_stage(g, &g->ys, Y_STAGE_BYTES, 1) != 0 ||
+        janas_g_make_stage(g, &g->ts, 64 << 10, 1) != 0) {
+        snprintf(err, err_len, "cannot create the GPU buffers");
+        goto fail;
+    }
 
     VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
                                .size = JANAS_G_PUSH_BYTES};
@@ -601,8 +630,13 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &pcr};
     if ((r = g->vkCreatePipelineLayout(g->dev, &pli, NULL, &g->pl)) !=
-            VK_SUCCESS ||
-        (r = janas_g_make_pipeline(g, janas_spv_q4k_matvec,
+        VK_SUCCESS) {
+        set_err(err, err_len, "cannot create the shaders", r);
+        goto fail;
+    }
+    /* before any shader is built: whether they need their _xfma variants */
+    janas_g_fma_probe(g);
+    if ((r = janas_g_make_pipeline(g, janas_spv_q4k_matvec,
                                    sizeof(janas_spv_q4k_matvec), &g->sm,
                                    &g->pipe, 0)) != VK_SUCCESS ||
         (r = janas_g_make_pipeline(g, janas_spv_q6k_matvec,
@@ -908,26 +942,6 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
             set_err(err, err_len, "cannot create the shaders", r);
             goto fail;
         }
-    VkCommandPoolCreateInfo cpci = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = family};
-    VkCommandBufferAllocateInfo cba = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1};
-    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (g->vkCreateCommandPool(g->dev, &cpci, NULL, &g->cp) != VK_SUCCESS ||
-        (cba.commandPool = g->cp,
-         g->vkAllocateCommandBuffers(g->dev, &cba, &g->cb) != VK_SUCCESS) ||
-        g->vkCreateFence(g->dev, &fci, NULL, &g->fence) != VK_SUCCESS ||
-        janas_g_make_stage(g, &g->xs, X_STAGE_BYTES,
-                           !getenv("JANAS_GPU_XCOH")) != 0 ||
-        janas_g_make_stage(g, &g->ys, Y_STAGE_BYTES, 1) != 0 ||
-        janas_g_make_stage(g, &g->ts, 64 << 10, 1) != 0) {
-        snprintf(err, err_len, "cannot create the GPU buffers");
-        goto fail;
-    }
     pthread_mutex_init(&g->qlock, NULL);
     const char *ka = getenv("JANAS_GPU_KEEPALIVE_US");
     g->keep_us = ka ? (unsigned)atoi(ka) : 500;

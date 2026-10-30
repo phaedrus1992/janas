@@ -315,6 +315,9 @@ struct janas_gpu {
        got wrong whatever the shader, and a line for the user */
     int off_types[16], n_off;
     char check_note[256];
+    /* gpu_fma.c: shaders with float64 (shaderFloat64), and the _xfma
+       variants taken because this driver splits fma() */
+    int has_f64, xfma;
 };
 
 /* The products checked against the CPU's when the GPU opens, and the
@@ -322,6 +325,13 @@ struct janas_gpu {
 void janas_g_selfcheck(struct janas_gpu *g);
 /* Whether the check left the type out. */
 int janas_g_type_off(const struct janas_gpu *g, int type);
+/* Whether this driver rounds fma() once, as the CPU does: if not, the
+   shaders' _xfma variants from then on (g->xfma), when the device has
+   float64 and they pass the same probe (gpu_fma.c). Needs g->cb. */
+void janas_g_fma_probe(struct janas_gpu *g);
+/* The SPIR-V to build for code: its _xfma variant where g->xfma. */
+const uint32_t *janas_g_spv(const struct janas_gpu *g, const uint32_t *code,
+                            size_t *bytes);
 /* A buffer in the device's own memory (no host mapping), for shaders and
    copies; 0, or -1. */
 int janas_g_make_local(struct janas_gpu *g, struct stage *s, size_t bytes);

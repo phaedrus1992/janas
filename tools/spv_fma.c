@@ -14,6 +14,11 @@
  * to move a block's scale in one expert in eighty (24 Oct 2026). The
  * shaders write fma() where the CPU fuses, so every one of them is meant
  * as one operation.
+ *
+ * Every OpFConvert too: undecorated, NIR takes double(float(i)) for
+ * double(i), the integer's float rounding lost (nir_opt_algebraic's
+ * ~f2f64(i2f32(a)) -> i2f64(a)), and the _xfma variants (shaders/xfma.glsl)
+ * came out off the CPU's on Q6_K_P's large sums (30 Oct 2026).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +29,7 @@ enum {
     OP_EXT_INST_IMPORT = 11,
     OP_EXT_INST = 12,
     OP_DECORATE = 71,
+    OP_FCONVERT = 115,
     OP_TYPE_FIRST = 19, /* OpTypeVoid .. OpTypeForwardPointer: after the */
     OP_TYPE_LAST = 39,  /* annotations, so the new ones go before them */
     GLSL_FMA = 50,
@@ -51,8 +57,8 @@ int main(int argc, char **argv)
         return 1;
     }
     fclose(f);
-    /* the GLSL.std.450 set, the Fma results, those already decorated, and
-       where the types start */
+    /* the GLSL.std.450 set, the Fma and FConvert results, those already
+       decorated, and where the types start */
     uint32_t glsl = 0, *fma = malloc(n * 4), nf = 0;
     uint8_t *done = calloc(w[3], 1); /* w[3]: the ids' bound */
     size_t types = 0;
@@ -67,8 +73,9 @@ int main(int argc, char **argv)
         if (op == OP_EXT_INST_IMPORT && wc >= 3 &&
             strncmp((const char *)&w[i + 2], "GLSL.std.450", 13) == 0)
             glsl = w[i + 1];
-        if (op == OP_EXT_INST && wc >= 5 && w[i + 3] == glsl &&
-            w[i + 4] == GLSL_FMA)
+        if ((op == OP_EXT_INST && wc >= 5 && w[i + 3] == glsl &&
+             w[i + 4] == GLSL_FMA) ||
+            (op == OP_FCONVERT && wc == 4))
             fma[nf++] = w[i + 2];
         if (op == OP_DECORATE && wc >= 3 && w[i + 2] == DEC_NO_CONTRACTION &&
             w[i + 1] < w[3])
@@ -87,8 +94,8 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(o,
-            "#pragma once\n/* %s, its %u fma() NoContraction (spv_fma) "
-            "*/\nconst uint32_t %s[] = {\n",
+            "#pragma once\n/* %s, its %u fma() and float conversions "
+            "NoContraction (spv_fma) */\nconst uint32_t %s[] = {\n",
             argv[1], nf, argv[2]);
     size_t col = 0;
 #define PUT(x) fprintf(o, "%s0x%08x,", col++ % 8 ? "" : "\n\t", (unsigned)(x))

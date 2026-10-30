@@ -149,9 +149,10 @@ static int check_one(struct janas_gpu *g, struct janas_pool *pool,
 /* The cache's key for this device and driver, and its file. */
 static void cache_key(const struct janas_gpu *g, char *key, size_t len)
 {
-    snprintf(key, len, "%04x:%04x:%08x:sg%u:%s:%s", g->vendor_id, g->device_id,
-             g->driver_version, g->sg,
-             janas_gpu_shares_host(g) ? "shared" : "copy", JANAS_VERSION);
+    snprintf(key, len, "%04x:%04x:%08x:sg%u:%s:%s%s", g->vendor_id,
+             g->device_id, g->driver_version, g->sg,
+             janas_gpu_shares_host(g) ? "shared" : "copy", JANAS_VERSION,
+             g->xfma ? ":xfma" : "");
 }
 
 /* What a saved check says: 1 found (switches and types applied). */
