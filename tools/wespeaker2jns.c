@@ -46,7 +46,7 @@ static void read_tensor(struct pb m)
     memset(t, 0, sizeof *t);
     int num, wt, type = 0, r;
     uint64_t v;
-    struct pb s, raw = {0, 0};
+    struct pb s = {0, 0}, raw = {0, 0};
     while ((r = field(&m, &num, &wt, &v, &s)) == 1) {
         if (num == 1 && wt == 0 && t->n_dims < 4)
             t->dims[t->n_dims++] = v;
@@ -104,7 +104,7 @@ static void read_node(struct pb m)
 {
     int num, wt;
     uint64_t v;
-    struct pb s, ins[4], op = {0, 0};
+    struct pb s = {0, 0}, ins[4], op = {0, 0};
     int n_ins = 0, kernel = 0, stride = 1, pad = 0;
     while (field(&m, &num, &wt, &v, &s) == 1) {
         if (num == 1 && wt == 2 && n_ins < 4)

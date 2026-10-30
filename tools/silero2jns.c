@@ -47,7 +47,7 @@ static void read_tensor(struct pb m)
     memset(t, 0, sizeof *t);
     int num, wt, type = 0;
     uint64_t v;
-    struct pb s, raw = {0, 0}, fl = {0, 0};
+    struct pb s = {0, 0}, raw = {0, 0}, fl = {0, 0};
     int r;
     while ((r = field(&m, &num, &wt, &v, &s)) == 1) {
         if (num == 1 && wt == 0 && t->n_dims < 4)
@@ -128,7 +128,7 @@ static void read_graph(struct pb g, int keep)
 {
     int num, wt;
     uint64_t v;
-    struct pb s;
+    struct pb s = {0, 0};
     while (field(&g, &num, &wt, &v, &s) == 1) {
         if (num == 1 && wt == 2)
             read_node(s, keep);
@@ -193,7 +193,7 @@ int main(int argc, char **argv)
     struct pb m = {buf, buf + n};
     int num, wt, r;
     uint64_t v;
-    struct pb s;
+    struct pb s = {0, 0};
     while ((r = field(&m, &num, &wt, &v, &s)) == 1)
         if (num == 7 && wt == 2) /* ModelProto.graph */
             read_graph(s, 0);
