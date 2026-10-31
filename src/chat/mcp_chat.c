@@ -53,9 +53,10 @@ static const struct {
                "electricity, the cheapest fuel near a place"},
     {"quakes", "earthquakes: the latest near a place or where the user is, "
                "the strongest in the world, one in detail"},
-    {"system", "this computer: how it is (memory, processor, disks, "
-               "battery, temperatures), what fills a folder, the programs "
-               "running, the errors, the updates, the network"},
+    {"system", "this computer itself, when the user asks about it: how it "
+               "is (memory, processor, disks, battery, temperatures), what "
+               "fills a folder, the programs running, the errors, the "
+               "updates, the network"},
     {"weather", "the weather now and the forecast, the sea and its waves, "
                 "weather warnings"},
     {"wiki", "Wikipedia, when the user asks for it: a page shown to the "
@@ -75,6 +76,7 @@ static const struct {
 #define OPEN_TOOL "janas__open_service"
 static int deferred = 1;
 static unsigned opened_gen; /* changes when a service is opened or all closed */
+static const char *opened_prefix; /* of the service opened last */
 
 static struct server *servers;
 static size_t n_servers;
@@ -210,8 +212,10 @@ static void catalog(FILE *f)
           "listed here: to use a service, call " OPEN_TOOL " with its name, "
           "by yourself whenever a question is on its subject (the user need "
           "not name it), then call the tools it gives you; an open service "
-          "stays open for the conversation. Never name the services or the "
-          "tools in your reply. The services:\n",
+          "stays open for the conversation. Most questions need none - "
+          "writing, code, explanations, what you know: answer those "
+          "yourself, without opening a service. Never name the services or "
+          "the tools in your reply. The services:\n",
           f);
     for (size_t i = 0; i < n_servers; i++) {
         if (!servers[i].own)
@@ -265,18 +269,33 @@ static int open_service(const char *args, char **text)
     len = 0;
     janas_mcp_tools(s->m, s->prefix, -1, NULL, 0, &len);
     char *t = malloc((size_t)len + 1);
-    if (t &&
-        janas_mcp_tools(s->m, s->prefix, -1, t, len + 1, &len) == JANAS_MCP_OK)
+    if (t && janas_mcp_tools(s->m, s->prefix, -1, t, len + 1, &len) ==
+                 JANAS_MCP_OK) {
+        /* as the system message lists tools, one a line in <tools>: given
+           them as one array in the text, Qwen3.8-Flash-Next opened the
+           service again and again instead of calling them (22 Oct 2026) */
         janas_buf_printf(&o,
                          "The service %s is open. Its tools, to call as "
-                         "any other:\n%s\n\nNow call the one that "
-                         "answers the user's question: do not answer "
-                         "before it has, and never make up what it "
-                         "would say.",
-                         s->name, t);
+                         "any other:\n\n<tools>",
+                         s->name);
+        struct janas_json_doc *td = janas_json_parse(t, (size_t)len, NULL, 0);
+        const struct janas_json *a = td ? janas_json_root(td) : NULL;
+        if (a && a->type == JANAS_JSON_ARRAY)
+            for (const struct janas_json *it = a->child; it; it = it->next) {
+                janas_buf_puts(&o, "\n");
+                janas_json_write(&o, it);
+            }
+        else
+            janas_buf_printf(&o, "\n%s", t);
+        janas_json_free(td);
+        janas_buf_puts(&o, "\n</tools>\n\nNow call the one that answers "
+                           "the user's question: do not answer before it "
+                           "has, and never make up what it would say.");
+    }
     free(t);
     s->opened = 1;
     opened_gen++;
+    opened_prefix = s->prefix;
     *text = o.oom ? NULL : o.p;
     if (o.oom)
         janas_buf_free(&o);
@@ -286,6 +305,11 @@ static int open_service(const char *args, char **text)
 unsigned mcpc_opened(void)
 {
     return opened_gen;
+}
+
+const char *mcpc_opened_prefix(void)
+{
+    return opened_prefix;
 }
 
 char *mcpc_opened_tools(void)
@@ -322,12 +346,45 @@ void mcpc_close_services(void)
     for (size_t i = 0; i < n_servers; i++)
         servers[i].opened = 0;
     opened_gen++;
+    opened_prefix = NULL;
+}
+
+/* Does p clash with a server's prefix: the same, or one the start of the
+   other ("a__" and "a__b__"), so that a tool name would go to the wrong
+   server? */
+static int prefix_clash(const char *p)
+{
+    for (size_t i = 0; i < n_servers; i++) {
+        size_t a = strlen(p), b = strlen(servers[i].prefix);
+        if (strncmp(p, servers[i].prefix, a < b ? a : b) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The name's prefix, made unique among the servers': a.b and a_b both
+   come out a_b__, the second a_b_2__ */
+static char *unique_prefix(const char *name)
+{
+    char *base = prefix_of(name);
+    if (!base || !prefix_clash(base))
+        return base;
+    size_t n = strlen(base) - 2; /* without its "__" */
+    char *p = malloc(n + 16);
+    for (int k = 2; p && k < 100000; k++) {
+        snprintf(p, n + 16, "%.*s_%d__", (int)n, base, k);
+        if (!prefix_clash(p))
+            break;
+    }
+    free(base);
+    return p;
 }
 
 static int add_server(const char *line, janas_mcp *m, int own)
 {
+    /* the prefix against the servers as they are, before the table moves */
+    char *name = strdup(line), *prefix = unique_prefix(line);
     struct server *g = realloc(servers, (n_servers + 1) * sizeof(*g));
-    char *name = strdup(line), *prefix = prefix_of(line);
     if (!g || !name || !prefix) {
         if (g)
             servers = g;

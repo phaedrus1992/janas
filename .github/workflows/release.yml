@@ -27,6 +27,7 @@ env:
   VULKAN_HEADERS_TAG: vulkan-sdk-1.4.363.0
   VULKAN_HEADERS_COMMIT: 6802bb4733b63ed5efd3adb308a6c885ef180ea1
   PACKAGE: janas-linux-x86_64
+  DIAG: janas-diag-linux-x86_64
 
 jobs:
   linux-x86_64:
@@ -68,9 +69,9 @@ jobs:
           set -euo pipefail
           B=bin/x86_64-linux
           P="$PACKAGE/janas"
-          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
+          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs" "$P/node"
           for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
+                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck gpu_check; do
             install -m 755 "$B/$f" "$P/"
           done
           for s in src/services/*/; do
@@ -83,6 +84,9 @@ jobs:
           sed -E 's#\(([a-z]+)/README\.md\)#(janas-\1.md)#g' \
             src/services/README.md > "$P/services/README.md"
           install -m 755 "$B/libjanas_llm.so" "$B/libjanas_mcp.so" "$P/lib/"
+          # the library as a module for Node.js, with its types for TypeScript
+          install -m 755 "$B/janas.node" "$P/node/"
+          install -m 644 "$B/janas.d.ts" "$P/node/"
           install -m 644 include/janas/* "$P/include/janas/"
           install -m 644 docs/*.md "$P/docs/"
           install -m 644 dist/README.md "$P/README.md"
@@ -90,6 +94,13 @@ jobs:
           # nothing but programs, libraries and text: no script of any kind
           if find "$P" -type f \( -name '*.sh' -o -name '*.py' \) | grep -q .; then
             echo "a script in the package"; exit 1
+          fi
+          # the module, as packed, loads where the runner has Node.js
+          if command -v node >/dev/null; then
+            node -e 'const j = require(process.argv[1]);
+              if (j.abiVersion() !== 1) process.exit(1);
+              console.log("janas.node " + j.version + " loads in Node " + process.version)' \
+              "$(realpath "$P/node/janas.node")"
           fi
           # the newest C library the programs ask for
           find "$P" -type f -perm -u+x ! -name '*.so' -print0 |
@@ -101,6 +112,23 @@ jobs:
           sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256"
           cat "$PACKAGE.tar.gz.sha256"
 
+      - name: Pack the diagnostics
+        run: |
+          set -euo pipefail
+          # vkcheck and gpu_check alone, for a tester who only has to tell
+          # whether the GPU works: no model, no engine, a few megabytes
+          B=bin/x86_64-linux
+          D="$DIAG/janas-diag"
+          mkdir -p "$D"
+          install -m 755 "$B/vkcheck" "$B/gpu_check" "$D/"
+          install -m 644 dist/README-diag.md "$D/README.md"
+          install -m 644 LICENSE "$D/"
+          (cd "$D" && find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS)
+          tar -C "$DIAG" -czf "$DIAG.tar.gz" janas-diag
+          sha256sum "$DIAG.tar.gz" > "$DIAG.tar.gz.sha256"
+          cat "$DIAG.tar.gz.sha256"
+
       - name: Keep the package (run by hand)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
@@ -109,6 +137,8 @@ jobs:
           path: |
             ${{ env.PACKAGE }}.tar.gz
             ${{ env.PACKAGE }}.tar.gz.sha256
+            ${{ env.DIAG }}.tar.gz
+            ${{ env.DIAG }}.tar.gz.sha256
 
       - name: Publish the release (a tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -117,8 +147,9 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             "$PACKAGE.tar.gz" "$PACKAGE.tar.gz.sha256" \
+            "$DIAG.tar.gz" "$DIAG.tar.gz.sha256" \
             --title "Janas $GITHUB_REF_NAME" \
-            --notes "Janas for Linux x86-64 (Ubuntu 22.04, Debian 12 and later): janas-linux-x86_64.tar.gz; for Windows 10 and 11 x86-64: janas-windows-x86_64.zip. Unpack it and start: janas-get list, then janas-chat <model>. What changed: ChangeLog.md. The SHA-256 of every file: SHA256SUMS in the package."
+            --notes "Janas for Linux x86-64 (Ubuntu 22.04, Debian 12 and later): janas-linux-x86_64.tar.gz; for Windows 10 and 11 x86-64: janas-windows-x86_64.zip. Only the GPU checks (vkcheck, gpu_check), to tell whether a GPU computes what the CPU does: janas-diag-linux-x86_64.tar.gz, janas-diag-windows-x86_64.zip. Unpack it and start: janas-get list, then janas-chat <model>. What changed: ChangeLog.md. The SHA-256 of every file: SHA256SUMS in the package."
 
   # Windows x86-64: the same sources built with MinGW-w64 on Linux (a
   # newer Ubuntu: the C library does not matter for Windows, the MinGW
@@ -198,6 +229,7 @@ jobs:
     timeout-minutes: 20
     env:
       WPACKAGE: janas-windows-x86_64
+      WDIAG: janas-diag-windows-x86_64
     steps:
       - uses: actions/checkout@v7
 
@@ -213,7 +245,7 @@ jobs:
           P="$WPACKAGE/janas"
           mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
           for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
+                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck gpu_check; do
             install -m 755 "$B/$f.exe" "$P/"
           done
           for s in src/services/*/; do
@@ -238,6 +270,17 @@ jobs:
           (cd "$WPACKAGE" && zip -q -r -X "../$WPACKAGE.zip" janas)
           sha256sum "$WPACKAGE.zip" > "$WPACKAGE.zip.sha256"
           cat "$WPACKAGE.zip.sha256"
+          # the diagnostics alone, as for Linux
+          D="$WDIAG/janas-diag"
+          mkdir -p "$D"
+          install -m 755 "$B/vkcheck.exe" "$B/gpu_check.exe" "$D/"
+          install -m 644 dist/README-diag.md "$D/README.md"
+          install -m 644 LICENSE "$D/"
+          (cd "$D" && find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS)
+          (cd "$WDIAG" && zip -q -r -X "../$WDIAG.zip" janas-diag)
+          sha256sum "$WDIAG.zip" > "$WDIAG.zip.sha256"
+          cat "$WDIAG.zip.sha256"
 
       - name: Keep the package (run by hand)
         if: github.event_name == 'workflow_dispatch'
@@ -247,6 +290,8 @@ jobs:
           path: |
             ${{ env.WPACKAGE }}.zip
             ${{ env.WPACKAGE }}.zip.sha256
+            ${{ env.WDIAG }}.zip
+            ${{ env.WDIAG }}.zip.sha256
 
       - name: Add it to the release (a tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -254,7 +299,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
-            "$WPACKAGE.zip" "$WPACKAGE.zip.sha256"
+            "$WPACKAGE.zip" "$WPACKAGE.zip.sha256" \
+            "$WDIAG.zip" "$WDIAG.zip.sha256"
 
   # The wiki, made from the same pages as the repository: README.md becomes
   # Home, each docs/*.md a page named after its title. It is never edited

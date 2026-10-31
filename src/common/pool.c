@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include "pool.h"
+#include "aligned.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -50,8 +51,9 @@ struct done_flag {
  * the run for the slowest thread. Reading it: a high idle share means the
  * work does not divide by the threads; the time between runs, which is the
  * caller working alone, is not here - it is the difference between the wall
- * of the whole pass and the sum of this column. Off it costs one test of a
- * static variable per run.
+ * of the whole pass and the sum of this column - but in gap_s, by the sites
+ * of the runs before and after it. Off it costs one test of a static
+ * variable per run.
  */
 struct site {
     janas_pool_fn fn;
@@ -62,6 +64,19 @@ struct site {
 
 static struct site sites[32];
 static int n_sites;
+/* the caller alone between two runs of a pool, by the sites of the run
+   before and the run after: where in a pass the time between runs goes.
+   Per pool (struct janas_pool trace_gap): the caller of the experts' reads
+   waits for work between its runs, which is not work; the report gives the
+   pool that ran most, the one the passes are made of */
+struct trace_gaps {
+    double s[32][32];
+    unsigned long long n[32][32], runs;
+};
+static unsigned trace_epoch = 1; /* janas_pool_trace_reset: a new count */
+static struct janas_pool *traced[8];
+static int n_traced;
+static pthread_mutex_t traced_lock = PTHREAD_MUTEX_INITIALIZER;
 /* read by every worker, so atomic: they all decide the same thing, but a
    plain int written by twenty threads is still a race */
 static atomic_int trace = -1;
@@ -100,6 +115,10 @@ struct janas_pool {
     struct done_flag *done;  /* done[i].run: the last run thread i finished */
     atomic_int sleepers;     /* threads waiting on a condition variable */
     double work_prev;        /* the trace: sum of done[].work, last run */
+    double trace_end;        /* ... when the last run ended, its site */
+    int trace_site;
+    unsigned trace_epoch;
+    struct trace_gaps *trace_gap; /* allocated by the first traced run */
     atomic_bool stop;
     atomic_int spin; /* pause iterations before a worker sleeps */
     int active;      /* threads that take part in the next runs */
@@ -185,10 +204,8 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     atomic_init(&p->ticket, 0);
     atomic_init(&p->spin, SPIN_ITERATIONS);
     p->threads = calloc((size_t)n_threads, sizeof(pthread_t));
-    if (posix_memalign((void **)&p->done, LINE,
-                       (size_t)n_threads * sizeof(*p->done)) != 0)
-        p->done = NULL;
-    else
+    p->done = janas_aligned_alloc(LINE, (size_t)n_threads * sizeof(*p->done));
+    if (p->done)
         memset(p->done, 0, (size_t)n_threads * sizeof(*p->done));
     if (cpus) {
         p->cpus = malloc((size_t)n_threads * sizeof(int));
@@ -198,7 +215,7 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     }
     if (!p->threads || !p->done || (cpus && !p->cpus)) {
         free(p->threads);
-        free(p->done);
+        janas_aligned_free(p->done);
         free(p->cpus);
         free(p);
         return NULL;
@@ -209,18 +226,24 @@ struct janas_pool *janas_pool_create(int n_threads, const int *cpus)
     pthread_cond_init(&p->wake_idle, NULL);
     for (int i = 1; i < n_threads; i++) {
         struct worker_arg *wa = malloc(sizeof(*wa));
-        if (!wa)
-            abort();
-        wa->p = p;
-        wa->tid = i;
-        if (pthread_create(&p->threads[i], NULL, worker, wa) != 0)
-            abort();
+        if (wa) {
+            wa->p = p;
+            wa->tid = i;
+        }
+        if (!wa || pthread_create(&p->threads[i], NULL, worker, wa) != 0) {
+            /* a library does not end its host: the threads started stop,
+               and the caller hears NULL */
+            free(wa);
+            p->n_threads = i;
+            janas_pool_destroy(p);
+            return NULL;
+        }
     }
     return p;
 }
 
 static void pool_trace_run(struct janas_pool *p, janas_pool_fn fn,
-                           const char *name, double wall, int active);
+                           const char *name, double t0, double t1, int active);
 
 void janas_pool_run_named(struct janas_pool *p, janas_pool_fn fn, void *arg,
                           const char *name)
@@ -260,13 +283,14 @@ void janas_pool_run_named(struct janas_pool *p, janas_pool_fn fn, void *arg,
                p->runs)
             cpu_relax();
     if (tracing())
-        pool_trace_run(p, fn, name, now() - t0, active);
+        pool_trace_run(p, fn, name, t0, now(), active);
 }
 
 /* The trace of one run, from the caller's thread: nothing here is shared. */
 static void pool_trace_run(struct janas_pool *p, janas_pool_fn fn,
-                           const char *name, double wall, int active)
+                           const char *name, double t0, double t1, int active)
 {
+    double wall = t1 - t0;
     double w = 0;
     for (int i = 0; i < active; i++)
         w += p->done[i].work;
@@ -285,6 +309,25 @@ static void pool_trace_run(struct janas_pool *p, janas_pool_fn fn,
     sites[i].threads += (unsigned long long)active;
     sites[i].runs++;
     p->work_prev = w;
+    if (!p->trace_gap) {
+        pthread_mutex_lock(&traced_lock);
+        if (n_traced < 8 && (p->trace_gap = calloc(1, sizeof *p->trace_gap)))
+            traced[n_traced++] = p;
+        pthread_mutex_unlock(&traced_lock);
+        if (!p->trace_gap)
+            return;
+    }
+    struct trace_gaps *g = p->trace_gap;
+    if (p->trace_epoch != trace_epoch) /* a new count: from this run on */
+        memset(g, 0, sizeof *g);
+    else {
+        g->s[p->trace_site][i] += t0 - p->trace_end;
+        g->n[p->trace_site][i]++;
+    }
+    g->runs++;
+    p->trace_epoch = trace_epoch;
+    p->trace_end = t1;
+    p->trace_site = i;
 }
 
 void janas_pool_trace_reset(void)
@@ -293,6 +336,7 @@ void janas_pool_trace_reset(void)
         sites[i].wall = sites[i].work = 0;
         sites[i].runs = sites[i].threads = 0;
     }
+    trace_epoch++;
 }
 
 void janas_pool_trace_report(const char *what, double wall)
@@ -327,6 +371,44 @@ void janas_pool_trace_report(const char *what, double wall)
     }
     fprintf(stderr, "  %-16s %9s %6s %9.1f %7.1f%%\n", "all", "", "", tw * 1e3,
             off > 0 ? 100 * (off - tk) / off : 0);
+    /* the caller alone, by the runs it falls between, in the pool that ran
+       most since the reset: the largest */
+    struct trace_gaps *g = NULL;
+    pthread_mutex_lock(&traced_lock);
+    for (int k = 0; k < n_traced; k++)
+        if (traced[k]->trace_epoch == trace_epoch &&
+            (!g || traced[k]->trace_gap->runs > g->runs))
+            g = traced[k]->trace_gap;
+    pthread_mutex_unlock(&traced_lock);
+    if (!g)
+        return;
+    double gt = 0;
+    for (int a = 0; a < n_sites; a++)
+        for (int b = 0; b < n_sites; b++)
+            gt += g->s[a][b];
+    if (gt <= 0)
+        return;
+    fprintf(stderr,
+            "the caller alone between runs, %.0f ms:\n%-36s %9s %9s "
+            "%9s\n",
+            gt * 1e3, "  after -> before", "times", "ms", "us each");
+    static char listed[32][32];
+    memset(listed, 0, sizeof listed);
+    for (int k = 0; k < 16; k++) {
+        int ba = -1, bb = -1;
+        for (int a = 0; a < n_sites; a++)
+            for (int b = 0; b < n_sites; b++)
+                if (g->n[a][b] && !listed[a][b] &&
+                    (ba < 0 || g->s[a][b] > g->s[ba][bb]))
+                    ba = a, bb = b;
+        if (ba < 0 || g->s[ba][bb] < 0.005 * gt)
+            break;
+        listed[ba][bb] = 1;
+        char pair[64];
+        snprintf(pair, sizeof pair, "%s -> %s", sites[ba].name, sites[bb].name);
+        fprintf(stderr, "  %-34s %9llu %9.1f %9.1f\n", pair, g->n[ba][bb],
+                g->s[ba][bb] * 1e3, g->s[ba][bb] * 1e6 / g->n[ba][bb]);
+    }
 }
 
 int janas_pool_get_spin(const struct janas_pool *p)
@@ -359,6 +441,14 @@ void janas_pool_destroy(struct janas_pool *p)
 {
     if (!p)
         return;
+    if (p->trace_gap) {
+        pthread_mutex_lock(&traced_lock);
+        for (int k = 0; k < n_traced; k++)
+            if (traced[k] == p)
+                traced[k] = traced[--n_traced];
+        pthread_mutex_unlock(&traced_lock);
+        free(p->trace_gap);
+    }
     pthread_mutex_lock(&p->lock);
     atomic_store(&p->stop, true);
     pthread_cond_broadcast(&p->wake);
@@ -370,7 +460,7 @@ void janas_pool_destroy(struct janas_pool *p)
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->wake_idle);
     free(p->threads);
-    free(p->done);
+    janas_aligned_free(p->done);
     free(p->cpus);
     free(p);
 }

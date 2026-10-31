@@ -62,6 +62,9 @@ Output
   under src/ goes into the library. The release build
   also links libjanas_llm.so and libjanas_mcp.so, which export the public
   APIs of include/janas/llm.h and include/janas/mcp.h and nothing else.
+  On Linux src/node/ becomes janas.node, the module for Node.js, with the
+  library inside (janas-<variant>.node for the other variants), and its
+  TypeScript declarations, janas.d.ts, beside it.
 
 Environment
   CC            the compiler, gcc by default
@@ -125,7 +128,13 @@ SUFFIX=""
 # _GNU_SOURCE for every file, empty as the files that define it write it:
 # the C library of Ubuntu 22.04 (the binary package's) declares memmem,
 # strcasestr and the like only with it, where a newer one does by default
-CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread -Isrc -Iinclude)
+# -ffp-contract=off: no multiply and add fused by the compiler on its own -
+# gcc fuses them where FMA is enabled (the kernels' functions), clang within
+# an expression, each version where it sees fit - so that one source gives
+# the same bits with every compiler (issue #38); the FMAs the kernels write
+# with intrinsics stay
+CFLAGS=(-std=gnu11 -D_GNU_SOURCE= -Wall -Wextra -Werror -pthread
+    -ffp-contract=off -Isrc -Iinclude)
 if [ "$OS" = windows ]; then
     # Windows 10 and later; printf with the C99 formats (%zu, %lld); what
     # MinGW's C library lacks, in one header every file starts with
@@ -140,7 +149,10 @@ fi
 case "$VARIANT" in
 release) CFLAGS+=(-O2 -DNDEBUG) ;;
 debug) CFLAGS+=(-O0 -g) ;;
-asan) CFLAGS+=(-O1 -g -fsanitize=address -fno-omit-frame-pointer) ;;
+# asan: aligned blocks with a tag before them, as on Windows, so that one
+# given to the wrong release stops the program (src/common/aligned.h)
+asan) CFLAGS+=(-O1 -g -fsanitize=address -fno-omit-frame-pointer
+    -DJANAS_ALIGNED_CHECK) ;;
 ubsan) CFLAGS+=(-O1 -g -fsanitize=undefined -fno-sanitize-recover=all) ;;
 tsan) CFLAGS+=(-O1 -g -fsanitize=thread) ;;
 *)
@@ -181,9 +193,15 @@ fi
 AR="${AR:-ar}"
 LDSTATIC=()
 [ "$OS" = windows ] && LDSTATIC=(-static)
+# A text as a C string literal for -D: backslashes and quotes escaped,
+# anything but printable ASCII dropped (a tag's name, a tool's output)
+c_string() {
+    printf '"%s"' "$(printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' |
+        sed 's/[\\"]/\\&/g')"
+}
 # the version in reports (janas-bench)
 VERSION="$(git describe --always --dirty 2>/dev/null || echo unknown)"
-CFLAGS+=(-DJANAS_VERSION="\"$VERSION\"")
+CFLAGS+=(-DJANAS_VERSION="$(c_string "$VERSION")")
 
 # Throw away what this variant made, and only what this variant made: the
 # objects of the variant and the programs that carry its suffix. Release has
@@ -192,13 +210,14 @@ clean()
 {
     rm -rf "$OBJ"
     if [ -n "$SUFFIX" ]; then
-        rm -f "$BIN"/*"$SUFFIX"
+        rm -f "$BIN"/*"$SUFFIX" "$BIN"/*"$SUFFIX".node
         return
     fi
     for f in "$BIN"/*; do
         [ -e "$f" ] || continue
         case "$f" in
         *-debug | *-asan | *-ubsan | *-tsan) continue ;;
+        *-debug.node | *-asan.node | *-ubsan.node | *-tsan.node) continue ;;
         esac
         rm -f "$f"
     done
@@ -227,6 +246,7 @@ mkdir -p "$OBJ" "$BIN"
 SPV="$OBJ/spv"
 mkdir -p "$SPV"
 GPU_MISSING=""
+XFMA_NAMES=() # the shaders with an _xfma variant
 VK_INC=()
 if [ "$OS" = windows ] && [ -d /usr/include/vulkan ] &&
     ! echo '#include <vulkan/vulkan.h>' | "$CC" -E -x c - >/dev/null 2>&1; then
@@ -257,27 +277,88 @@ else
 fi
 echo '#include <vulkan/vulkan.h>' | "$CC" "${VK_INC[@]}" -E -x c - >/dev/null 2>&1 ||
     GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }the Vulkan headers (libvulkan-dev, vulkan-headers)"
+# every fma() of a shader decorated NoContraction, one operation as on the
+# CPU (tools/spv_fma.c: glslang leaves them free to be split), by a tool
+# built with the compiler of the machine that builds (HOSTCC, cc)
+SPV_FMA="$SPV/spv_fma"
+if [ -n "$GLSLANG" ] &&
+    { [ ! -x "$SPV_FMA" ] || [ tools/spv_fma.c -nt "$SPV_FMA" ]; }; then
+    if ! "${HOSTCC:-cc}" -O2 -o "$SPV_FMA" tools/spv_fma.c; then
+        GLSLANG=""
+        GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a C compiler for the build machine (HOSTCC) to build tools/spv_fma.c"
+    fi
+fi
 if [ -n "$GLSLANG" ]; then
     for comp in src/*/shaders/*.comp; do
         [ -f "$comp" ] || continue
         name=$(basename "${comp%.comp}")
         out="$SPV/$name.h"
-        if [ ! -f "$out" ] || [ "$comp" -nt "$out" ]; then
+        if [ ! -f "$out" ] || [ "$comp" -nt "$out" ] || [ "$SPV_FMA" -nt "$out" ]; then
             echo "SPV $comp"
             if ! glslangValidator -V --target-env vulkan1.3 \
-                --vn "janas_spv_$name" "$comp" -o "$out" >/dev/null; then
+                "$comp" -o "$SPV/$name.spv" >/dev/null ||
+                ! "$SPV_FMA" "$SPV/$name.spv" "janas_spv_$name" "$out"; then
                 rm -f "$out"
                 GLSLANG=""
                 GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a glslangValidator that compiles $comp"
                 break
             fi
+            rm -f "$SPV/$name.spv"
         fi
+        # a shader that calls fma() gets an _xfma variant, fma() rounded
+        # once in float64 (shaders/xfma.glsl after its #extension lines),
+        # for the drivers that split it (gpu_fma.c)
+        grep -q 'fma(' "$comp" || continue
+        xout="$SPV/${name}_xfma.h"
+        if [ ! -f "$xout" ] || [ "$comp" -nt "$xout" ] ||
+            [ "$SPV_FMA" -nt "$xout" ] ||
+            [ src/llm/shaders/xfma.glsl -nt "$xout" ]; then
+            echo "SPV $comp (xfma)"
+            last=$(grep -n '^#extension\|^#version' "$comp" | tail -1 | cut -d: -f1)
+            { head -n "$last" "$comp"; cat src/llm/shaders/xfma.glsl
+                echo "#line $((last + 1))"; tail -n "+$((last + 1))" "$comp"; } \
+                >"$SPV/${name}_xfma.comp"
+            if ! glslangValidator -V --target-env vulkan1.3 \
+                "$SPV/${name}_xfma.comp" -o "$SPV/${name}_xfma.spv" >/dev/null ||
+                ! "$SPV_FMA" "$SPV/${name}_xfma.spv" "janas_spv_${name}_xfma" \
+                    "$xout"; then
+                rm -f "$xout"
+                GLSLANG=""
+                GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }a glslangValidator that compiles $comp with float64"
+                break
+            fi
+            rm -f "$SPV/${name}_xfma.comp" "$SPV/${name}_xfma.spv"
+        fi
+        XFMA_NAMES+=("$name")
     done
+fi
+# the table of the variants (gpu_fma.c), rewritten only when it changes
+if [ -n "$GLSLANG" ]; then
+    {
+        echo "/* Generated by build.sh: the shaders' _xfma variants. */"
+        for name in "${XFMA_NAMES[@]}"; do
+            echo "#include \"${name}_xfma.h\""
+            echo "extern const uint32_t janas_spv_${name}[];"
+        done
+        echo "static const struct janas_xfma {"
+        echo "    const uint32_t *code, *xfma;"
+        echo "    size_t bytes;"
+        echo "} janas_xfma_table[] = {"
+        for name in "${XFMA_NAMES[@]}"; do
+            echo "    {janas_spv_${name}, janas_spv_${name}_xfma, sizeof(janas_spv_${name}_xfma)},"
+        done
+        echo "};"
+    } >"$SPV/xfma_table.h.new"
+    if cmp -s "$SPV/xfma_table.h.new" "$SPV/xfma_table.h"; then
+        rm -f "$SPV/xfma_table.h.new"
+    else
+        mv "$SPV/xfma_table.h.new" "$SPV/xfma_table.h"
+    fi
 fi
 [ -z "$GPU_MISSING" ] ||
     echo "note: building without GPU support: it needs $GPU_MISSING"
 # the reason, for the engine to give when asked for the GPU
-[ -z "$GPU_MISSING" ] || CFLAGS+=(-DJANAS_GPU_WHY="\"$GPU_MISSING\"")
+[ -z "$GPU_MISSING" ] || CFLAGS+=(-DJANAS_GPU_WHY="$(c_string "$GPU_MISSING")")
 [ -z "$GLSLANG" ] || CFLAGS+=(-DJANAS_GPU_SPV -I"$SPV")
 
 # Web pages of the programs (src/<tool>/*.html) as C arrays, so that the
@@ -302,8 +383,14 @@ for html in src/*/*.html; do
 done
 CFLAGS+=(-I"$GEN")
 
-# one object, rebuilt when its source or any header is newer
-headers_newest=$(find src include "$SPV" "$GEN" -name '*.h' -printf '%T@\n' | sort -n | tail -1)
+# one object, rebuilt when its source or any header (or .inc, such as the
+# server's routes.inc) is newer
+if ! headers_newest=$(find src include "$SPV" "$GEN" \( -name '*.h' -o \
+    -name '*.inc' \) -printf '%T@\n' |
+    sort -n | tail -1) || [ -z "$headers_newest" ]; then
+    echo "build.sh: cannot list the headers under src/ and include/" >&2
+    exit 2
+fi
 compile()
 { # source, object, then the flags
     local src="$1" obj="$2"
@@ -315,6 +402,26 @@ compile()
     fi
 }
 objname() { echo "$OBJ/$(echo "${1#src/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
+# The output of a listing of sources, or a stop that names what was listed:
+# read through a pipe or a process substitution its failure would be lost,
+# and a program linked with fewer objects than it needs. An empty listing
+# stops too, unless "may-be-empty" comes first.
+sources()
+{ # [may-be-empty] what was listed, then the command
+    local empty="" what out
+    [ "$1" = may-be-empty ] && empty=yes && shift
+    what="$1"
+    shift
+    if ! out=$("$@"); then
+        echo "build.sh: cannot list the sources of $what" >&2
+        exit 2
+    fi
+    if [ -z "$out" ] && [ -z "$empty" ]; then
+        echo "build.sh: no sources in $what" >&2
+        exit 2
+    fi
+    [ -z "$out" ] || printf '%s\n' "$out"
+}
 
 # Libraries of others (src/third_party/<lib>/, see its origin.md), each with
 # the flags it needs and without Janas's warnings, in an archive of their
@@ -351,6 +458,13 @@ tp_flags()
             "-I$c/core -I$v/builtin/src -I$c/dispatch -I$c/extras" \
             "-I$c/platform -I$c/utilities -I$v/pqcp/src" \
             "-I$v/pqcp/mldsa-native/mldsa" ;;
+    yyjson) ;;
+    *)
+        # without its flags it would be compiled wrong, or not at all
+        echo "build.sh: no flags for the library of others $1" \
+            "(src/third_party/$1): add it to tp_flags" >&2
+        return 1
+        ;;
     esac
 }
 # The sources of a library of others: all its .c files, or for Mbed TLS the
@@ -362,28 +476,45 @@ tp_sources()
     case "$1" in
     mbedtls)
         local c="$d/tf-psa-crypto" v="$d/tf-psa-crypto/drivers"
-        ls "$d"/library/*.c "$c"/core/*.c "$c"/extras/*.c "$c"/platform/*.c \
-            "$c"/utilities/*.c "$v"/builtin/src/*.c "$v"/pqcp/src/*.c \
-            "$v"/everest/library/x25519.c \
+        local s
+        # a directory with no .c left is its pattern unexpanded, which is
+        # no file either: both missing, both named
+        for s in "$d"/library/*.c "$c"/core/*.c "$c"/extras/*.c \
+            "$c"/platform/*.c "$c"/utilities/*.c "$v"/builtin/src/*.c \
+            "$v"/pqcp/src/*.c "$v"/everest/library/x25519.c \
             "$v"/everest/library/Hacl_Curve25519_joined.c \
             "$v"/p256-m/p256-m_driver_entrypoints.c \
-            "$v"/p256-m/p256-m/p256-m.c 2>/dev/null | sort
+            "$v"/p256-m/p256-m/p256-m.c; do
+            if [ ! -f "$s" ]; then
+                echo "build.sh: $1: missing $s" >&2
+                return 1
+            fi
+            echo "$s"
+        done | sort
         ;;
     *) find "$d" -name '*.c' | sort ;;
     esac
 }
 tp_objs=()
+tp_libs=0
 for d in src/third_party/*/; do
     [ -d "$d" ] || continue
+    tp_libs=$((tp_libs + 1))
     lib=$(basename "$d")
-    # shellcheck disable=SC2207
-    extra=($(tp_flags "$lib"))
+    flags=$(tp_flags "$lib") || exit 2
+    # shellcheck disable=SC2206
+    extra=($flags)
+    tp_list=$(sources "$d" tp_sources "$lib") || exit 2
     while IFS= read -r src; do
         obj=$(objname "$src")
         tp_objs+=("$obj")
         compile "$src" "$obj" "${TP_CFLAGS[@]}" "${extra[@]}"
-    done < <(tp_sources "$lib")
+    done <<<"$tp_list"
 done
+if [ $tp_libs = 0 ]; then
+    echo "build.sh: no libraries of others in src/third_party/" >&2
+    exit 2
+fi
 rm -f "$OBJ/libjanas_third.a"
 # archives made anew: ar only adds and replaces, so the objects of a source
 # since removed or renamed would stay in them and be linked twice
@@ -394,12 +525,18 @@ fi
 # their public headers, for the programs that use them
 TP_INC=(-Isrc/third_party/libmicrohttpd/src/include -Isrc/third_party/yyjson)
 # Mbed TLS's, for the TLS layer of the MCP client (src/common/mcp_tls.c)
-# shellcheck disable=SC2207
-MBEDTLS_INC=($(tp_flags mbedtls))
+flags=$(tp_flags mbedtls) || exit 2
+# shellcheck disable=SC2206
+MBEDTLS_INC=($flags)
 
 # A directory with a main.c is a program: its other .c files are its own.
-# Every other .c under src/ goes into the library.
+# Every other .c under src/ goes into the library, but the module for
+# Node.js (src/node/) and Janet (src/janet/), which are built on their own
+# below.
 tool_dirs=$(for m in src/*/main.c src/services/*/main.c; do dirname "$m"; done)
+lib_list=$(sources src/ find src -name '*.c' ! -name main.c ! -name win_start.c \
+    ! -path 'src/third_party/*' ! -path 'src/node/*' ! -path 'src/janet/*') ||
+    exit 2
 objs=()
 while IFS= read -r src; do
     grep -qx "$(dirname "$src")" <<<"$tool_dirs" && continue
@@ -410,8 +547,7 @@ while IFS= read -r src; do
     # warnings are not Janas's to fix
     [ "$src" = src/common/mcp_tls.c ] && extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
     compile "$src" "$obj" "${CFLAGS[@]}" "${extra[@]}"
-done < <(find src -name '*.c' ! -name main.c ! -name win_start.c \
-    ! -path 'src/third_party/*' | sort)
+done < <(sort <<<"$lib_list")
 rm -f "$OBJ/libjanas.a"
 "$AR" rcs "$OBJ/libjanas.a" "${objs[@]}"
 if [ "$VARIANT" = release ]; then
@@ -456,6 +592,38 @@ if [ "$VARIANT" = release ]; then
             "$OBJ/libjanas_third.a" "${LDLIBS[@]}" -o "$BIN/libjanas_mcp.so"
     fi
 fi
+# The module for Node.js: its own files and the library, in one janas.node
+# that Node loads. The functions of Node-API are the node process's, so they
+# stay undefined here - and only they: in release anything else undefined
+# stops the build, as --no-undefined does for the libraries above. Linux
+# only, for now: on Windows they would come from node.exe's import library.
+if [ "$OS" != windows ]; then
+    node_objs=()
+    node_list=$(sources src/node find src/node -maxdepth 1 -name '*.c') || exit 2
+    while IFS= read -r c; do
+        obj=$(objname "$c")
+        node_objs+=("$obj")
+        compile "$c" "$obj" "${CFLAGS[@]}"
+    done < <(sort <<<"$node_list")
+    addon="$BIN/janas$SUFFIX.node"
+    echo "LD  $addon"
+    "$CC" "${CFLAGS[@]}" -shared "${node_objs[@]}" "$OBJ/libjanas.a" \
+        "${LDLIBS[@]}" -o "$addon"
+    if [ "$VARIANT" = release ]; then
+        if ! missing=$(nm -D --undefined-only "$addon" |
+            awk '$1 == "U" && $2 !~ /@/ && $2 !~ /^napi_/ { print $2 }'); then
+            echo "build.sh: cannot list what $addon needs (nm)" >&2
+            exit 2
+        fi
+        if [ -n "$missing" ]; then
+            echo "build.sh: $addon needs what it does not have:" $missing >&2
+            exit 2
+        fi
+    fi
+    [ "$BIN/janas.d.ts" -nt src/node/janas.d.ts ] ||
+        cp src/node/janas.d.ts "$BIN/janas.d.ts"
+fi
+
 THIRD=()
 [ -f "$OBJ/libjanas_third.a" ] && THIRD=("$OBJ/libjanas_third.a")
 # Windows: every program starts with the console made ready for UTF-8 and
@@ -476,21 +644,71 @@ fi
 
 # test and benchmark programs, and the C tools
 for src in tests/*.c tools/*.c src/*/main.c src/services/*/main.c; do
+    # a pattern that matched nothing comes here as it is
+    if [ ! -f "$src" ]; then
+        echo "build.sh: no sources match $src" >&2
+        exit 2
+    fi
+    [ "$src" = src/janet/main.c ] && continue # below
     exe="$BIN/$(basename "${src%.c}")$SUFFIX$EXE"
     own=()
     if [ "$(basename "$src")" = main.c ]; then
         dir=$(dirname "$src")
         exe="$BIN/janas-$(basename "$dir")$SUFFIX$EXE"
+        own_list=$(sources may-be-empty "$dir" \
+            find "$dir" -maxdepth 1 -name '*.c' ! -name main.c) || exit 2
         while IFS= read -r c; do
+            [ -n "$c" ] || continue
             obj=$(objname "$c")
             own+=("$obj")
-            compile "$c" "$obj" "${CFLAGS[@]}" "${TP_INC[@]}"
-        done < <(find "$dir" -maxdepth 1 -name '*.c' ! -name main.c | sort)
+            # the server's HTTPS reads Mbed TLS's headers, as the system's
+            extra=()
+            [ "$c" = src/server/tls.c ] &&
+                extra=("${MBEDTLS_INC[@]/#-I/-isystem}")
+            compile "$c" "$obj" "${CFLAGS[@]}" "${TP_INC[@]}" "${extra[@]}"
+        done < <(sort <<<"$own_list")
     fi
     echo "LD  $exe"
     "$CC" "${CFLAGS[@]}" "${TP_INC[@]}" "$src" "${own[@]}" "${START[@]}" \
         "$OBJ/libjanas.a" "${THIRD[@]}" "${LDSTATIC[@]}" "${LDLIBS[@]}" -o "$exe"
 done
+
+# Janet (src/janet/README.md), a neural network of the project's own:
+# janet, its trainer and probes for language models, and janet-check,
+# the same in double for the derivatives' check, with
+# OpenMP and the x86-64 features its code takes at build time (AVX2, FMA,
+# F16C, AVX-VNNI: it has no run-time choice yet); janet-mnist and
+# janet-mnist-deep, which choose their kernels at run time. Linux
+# x86-64 only, for now. The probes against third parties' libraries
+# (src/janet/probes/) are built by hand, as their files say.
+if [ -d src/janet ] && [ "$OS" != windows ] && [ "$CPU" = x86_64 ]; then
+    JANET=(-march=x86-64-v3 -mavxvnni -fopenmp)
+    MNIST=()
+    [ "$VARIANT" = release ] && JANET+=(-O3) && MNIST+=(-O3)
+    janet_list=$(sources src/janet find src/janet -maxdepth 1 -name '*.c' \
+        ! -name main.c) || exit 2
+    for kind in "" -check; do
+        extra=()
+        [ "$kind" = -check ] && extra=(-DJANET_DOUBLE)
+        jobjs=()
+        while IFS= read -r c; do
+            obj=$(objname "$c")
+            obj="${obj%.o}$kind.o"
+            jobjs+=("$obj")
+            compile "$c" "$obj" "${CFLAGS[@]}" "${JANET[@]}" "${extra[@]}"
+        done < <(sort <<<"$janet_list")
+        exe="$BIN/janet$kind$SUFFIX"
+        echo "LD  $exe"
+        "$CC" "${CFLAGS[@]}" "${JANET[@]}" "${extra[@]}" src/janet/main.c \
+            "${jobjs[@]}" "$OBJ/libjanas.a" "${LDLIBS[@]}" -o "$exe"
+    done
+    for m in mnist mnist_deep; do
+        exe="$BIN/janet-${m/_/-}$SUFFIX"
+        echo "LD  $exe"
+        "$CC" "${CFLAGS[@]}" "${MNIST[@]}" "src/janet/mnist/$m.c" \
+            "$OBJ/libjanas.a" "${LDLIBS[@]}" -o "$exe"
+    done
+fi
 
 if [ "$ACTION" = test ]; then
     status=0

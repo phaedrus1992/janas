@@ -18,6 +18,7 @@
 #define JANAS_LLM_GPU_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "matvec.h"
 
@@ -115,6 +116,21 @@ int janas_gpu_dense_mm(struct janas_gpu *g, int bf16, const void *w,
                        size_t n, float scale);
 
 /*
+ * y = scale w x for bf16 weights (rows x cols, in memory the GPU holds),
+ * with n vectors of cols floats in x and y[v * rows + r], computed as the
+ * CPU computes them with AVX2 and FMA (bf16.h): the same bits, so for any
+ * n the GPU takes (janas_gpu_min_n); x and y in place where the GPU shares
+ * them with the host, else through its stages. Waited for. Not in a pass
+ * the tuner gave the CPU (janas_gpu_set_only_fast). 0, or -1 with nothing
+ * written (the caller computes it). Qwen3.8-Flash-Next's mixes of the
+ * streams, 1.25 GB of weights a token: a reply's tokens on a card with
+ * memory of its own.
+ */
+int janas_gpu_bf16_mv(struct janas_gpu *g, const uint16_t *w, const float *x,
+                      float *y, size_t rows, size_t cols, size_t n,
+                      float scale);
+
+/*
  * Whether the fast prompt is on (unless JANAS_GPU_FAST_PROMPT=0): blocks of
  * JANAS_GPU_FAST_N vectors and more of the types it has shaders for go to
  * the GPU whole, rounded group by group - close to the CPU's results, not
@@ -129,6 +145,21 @@ int janas_gpu_fast_prompt(void);
 /* For the passes that follow: only the fast prompt's products on the GPU,
    the rest on the CPU (a pass the tuner gave the CPU alone). */
 void janas_gpu_set_only_fast(struct janas_gpu *g, int on);
+/* The tokens of the pass that follows. A mixture's experts go to the fast
+   prompt's shaders (experts_id) only in a prompt's blocks, of
+   JANAS_GPU_FAST_N tokens and more: a chain of drafts to verify stays bit
+   for bit with the CPU, so that drafts never change the text. Not said
+   (a probe calling the products itself): any pass. */
+void janas_gpu_set_pass(struct janas_gpu *g, uint32_t n);
+/* JANAS_GPU_REPEATABLE=1: a prompt gives the same results every time - a
+   mixture's experts never on the GPU (janas_m_gpu: an expert's product went
+   to the fast prompt's tiles where the GPU could read its slot, to the CPU
+   where it could not, as the cache filled), and in a prompt's blocks the
+   GPU only the fast prompt's products (janas_m_apply_candidate):
+   products shared with the CPU, begun beside them, made the GPU busy, and
+   the fast ones asked meanwhile went to the CPU, as the tuner tried one
+   configuration or another. */
+int janas_gpu_repeatable(void);
 
 /* Keeps the GPU out of its sleep states (an empty dispatch every 0.5 ms,
    JANAS_GPU_KEEPALIVE_US) while on: for the passes that use it. */
@@ -137,10 +168,38 @@ void janas_gpu_keep_awake(struct janas_gpu *g, int on);
 /* The device's name, and the subgroup size the shaders run with. */
 const char *janas_gpu_name(const struct janas_gpu *g);
 unsigned janas_gpu_subgroup(const struct janas_gpu *g);
+/* The subgroup sizes the device lets the shaders be given (the running one
+   twice where it cannot be chosen): JANAS_GPU_SG picks one at creation. */
+void janas_gpu_subgroup_range(const struct janas_gpu *g, unsigned *min,
+                              unsigned *max);
+/* One line on the device and its driver for a report: name, kind, driver
+   and its version, Vulkan, subgroups, the float controls that keep its
+   results the CPU's. */
+const char *janas_gpu_about(const struct janas_gpu *g);
+/* What the check of the GPU's products against the CPU's on opening left
+   out on this driver ("" if nothing; gpu_selfcheck.c). */
+const char *janas_gpu_check_note(const struct janas_gpu *g);
+
+/* For diagnosis (gpu_check): the shader that recorded the last product,
+   as "q6k_row NV 1 SG 32" (its name, vectors a workgroup, subgroup size,
+   kind where it serves several types), "" if none; and the products'
+   paths switched on or off, the value before returned. */
+size_t janas_gpu_last_shader(const struct janas_gpu *g, char *buf, size_t len);
+enum janas_gpu_path {
+    JANAS_GPU_PATH_ROW,    /* the subgroup-per-row shaders (*_row.comp) */
+    JANAS_GPU_PATH_ROW_NV, /* ... on up to this many vectors (4) */
+    JANAS_GPU_PATH_MVD,    /* the lanes on the vectors (*_mvd.comp) */
+    JANAS_GPU_PATH_MV      /* q4k_mv.comp (off) */
+};
+int janas_gpu_set_path(struct janas_gpu *g, enum janas_gpu_path path,
+                       int value);
 /* The fewest vectors a product needs to be given to the GPU: 1 on a
    discrete GPU (single tokens too), 2 on an integrated one;
    JANAS_GPU_MIN_N sets it. */
 size_t janas_gpu_min_n(const struct janas_gpu *g);
+/* ... set by the engine: 1 where the user asked for replies on the GPU
+   (--reply-on gpu). */
+void janas_gpu_set_min_n(struct janas_gpu *g, size_t n);
 /* The most vectors the shaders with the lanes on the vectors take
    (*_mvd.comp: subgroups of 8 lanes, JANAS_GPU_MVD=0 leaves them out),
    beyond which a product goes to the slower shaders of many vectors: 8,
@@ -151,5 +210,14 @@ size_t janas_gpu_few_max(const struct janas_gpu *g);
    whole token needs, and what makes the engine's buffers worth importing.
    On a card with memory of its own an import is a copy. */
 int janas_gpu_shares_host(const struct janas_gpu *g);
+
+/* Bytes of a card's own memory still free for Janas (85% of it, less what
+   it took); 0 on a GPU that shares the host's memory. */
+size_t janas_gpu_local_room(const struct janas_gpu *g);
+/* Bytes of host memory and the GPU's copy of them made the same: to the
+   device (to_device 1) or back to the host (0), for buffers both write on
+   a card with memory of its own; nothing where the GPU shares the host's
+   memory. 0, or -1 (not imported, or the GPU busy or broken). */
+int janas_gpu_sync(struct janas_gpu *g, void *p, size_t bytes, int to_device);
 
 #endif

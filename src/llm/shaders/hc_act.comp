@@ -1,0 +1,38 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's mix, between its two low-rank products (model_hc.c hc_mix):
+// lo = SiLU(lo) in place and its bf16 rounding into lob (silu 1); or only
+// the rounding, x into xb (silu 0: the n-gram embeddings before their bf16
+// value product). n floats, a thread each.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
+
+layout(push_constant) uniform P { uvec2 x, xb; uint n, silu; } p;
+
+float round_bf16(float f)
+{
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u)
+        return f; /* NaN */
+    u = (u + (0x7fffu + ((u >> 16) & 1u))) & 0xffff0000u;
+    return uintBitsToFloat(u);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n)
+        return;
+    F X = F(p.x);
+    float v = X.v[i];
+    if (p.silu != 0u) {
+        v = v / (1.0 + exp(-v));
+        X.v[i] = v;
+    }
+    F(p.xb).v[i] = round_bf16(v);
+}

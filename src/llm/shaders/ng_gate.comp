@@ -1,0 +1,81 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's n-gram embeddings, their gates (model_hc.c gate_worker): for
+// stream c of token j, the key (kq, the key product's output) normalized
+// with nk, the stream as a query normalized with nq, s = their dot product
+// / sqrt(d), the gate sigmoid(signed sqrt(max(|s|, 1e-6))); the gated
+// value (val, d floats a token, times the gate) into gv, and the same
+// normalized with nc into the conv's ring (hist: cap rows of hc x d, row
+// (pos + j) % cap; pos the position buffer's word 0). A workgroup per
+// stream (x) and token (y); sums in the GPU's order.
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer W { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
+
+// kq, res, gv: n rows of hc x d; val: n rows of d; nk, nq, nc: hc x d
+layout(push_constant) uniform P {
+    uvec2 kq, res, val, nk, nq, nc, gv, hist, pos;
+    uint d, hc, cap;
+    float eps;
+} p;
+
+shared float sg_part[64];
+
+float wg_sum(float s)
+{
+    float r = subgroupAdd(s);
+    if (subgroupElect())
+        sg_part[gl_SubgroupID] = r;
+    barrier();
+    float tot = sg_part[0];
+    for (uint i = 1u; i < gl_NumSubgroups; i++)
+        tot += sg_part[i];
+    barrier();
+    return tot;
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x, c = gl_WorkGroupID.x, j = gl_WorkGroupID.y;
+    uint d = p.d, hd = p.hc * d, o = j * hd + c * d, wo = c * d;
+    F K = F(p.kq), S = F(p.res), V = F(p.val), NK = F(p.nk), NQ = F(p.nq),
+      NC = F(p.nc);
+    float sk = 0.0, sq = 0.0;
+    for (uint i = t; i < d; i += 256u) {
+        float a = K.v[o + i], b = S.v[o + i];
+        sk += a * a;
+        sq += b * b;
+    }
+    sk = wg_sum(sk);
+    sq = wg_sum(sq);
+    float ik = 1.0 / sqrt(sk / float(d) + p.eps),
+          iq = 1.0 / sqrt(sq / float(d) + p.eps);
+    float dot = 0.0;
+    for (uint i = t; i < d; i += 256u)
+        dot += (K.v[o + i] * ik * NK.v[wo + i]) * (S.v[o + i] * iq * NQ.v[wo + i]);
+    dot = wg_sum(dot);
+    float s = dot / sqrt(float(d));
+    float mag = sqrt(max(abs(s), 1e-6));
+    float gt = 1.0 / (1.0 + exp(-(s > 0.0 ? mag : s < 0.0 ? -mag : 0.0)));
+    W G = W(p.gv);
+    float sg = 0.0;
+    for (uint i = t; i < d; i += 256u) {
+        float g = V.v[j * d + i] * gt;
+        G.v[o + i] = g;
+        sg += g * g;
+    }
+    sg = wg_sum(sg);
+    float ig = 1.0 / sqrt(sg / float(d) + p.eps);
+    uint row = (RP(p.pos).v[0] + j) % p.cap;
+    W H = W(p.hist);
+    for (uint i = t; i < d; i += 256u)
+        H.v[row * hd + c * d + i] = G.v[o + i] * ig * NC.v[wo + i];
+}

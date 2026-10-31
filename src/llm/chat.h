@@ -26,19 +26,47 @@ enum chat_format {
        "model", the reasoning in <|channel>thought\n...<channel|>:
        ChatML's shape, so im_start and im_end hold <|turn> and <turn|> */
     FORMAT_GEMMA,
+    /* Llama 3: <|begin_of_text|> once, then <|start_header_id|>role
+       <|end_header_id|>\n\ntext<|eot_id|>, nothing after: ChatML's shape,
+       im_start and im_end holding <|start_header_id|> and <|eot_id|>, the
+       role closed by hdr_end */
+    FORMAT_LLAMA3,
+};
+
+/* a picture read by the vision encoder (api_image.c): its embeddings and
+   its grid of tokens; and where one is in the prompt being built */
+struct cpic {
+    float *embd;
+    uint32_t nx, ny;
+};
+struct ppic {
+    uint32_t off; /* of its first token in ids */
+    const struct cpic *pic;
 };
 
 struct janas_llm {
     struct janas_llm_model *m;
+    char *path;               /* the model's file */
+    struct janas_vision *vis; /* its vision encoder, opened at the first
+                                 picture (api_image.c) */
     struct janas_tokenizer *tok;
     int format;
     int32_t im_start, im_end;
     const char *asst_role; /* "assistant", or Gemma's "model" */
     int32_t bos;           /* written once at the start, or -1 */
+    int32_t hdr_end;       /* Llama 3's <|end_header_id|>, or -1 */
     int32_t think_on;      /* Gemma's <|think|>: reasoning asked for, or -1 */
     int32_t quote, decl_open, decl_close; /* Gemma's <|"|>, <|tool>, <tool|> */
     int32_t think_open, think_close;      /* reasoning markers, or -1 */
-    int thinker;       /* the template knows enable_thinking */
+    int thinker; /* the template knows enable_thinking */
+    /* the template's words at the top of the system message while the
+       model reasons, at its default effort (Qwen3.8: "Reasoning effort is
+       set to xhigh. ..."); empty where it has none */
+    char think_note[512];
+    /* the template gives every earlier turn of the assistant its reasoning
+       back (Qwen3.8: preserve_thinking unless told otherwise), not only
+       those after the user's last question (Qwen3.5 and 3.6) */
+    int think_kept;
     int empty_thought; /* Gemma 4: an empty channel when not reasoning */
     enum janas_tool_dialect tools; /* how its template writes tool calls */
     int32_t call_open, call_close; /* <tool_call>, </tool_call>, or -1 */
@@ -101,6 +129,11 @@ struct janas_llm_chat {
     /* the message being built: ids, and plain text not yet tokenized */
     int32_t *ids;
     size_t n_ids, cap_ids;
+    /* pictures queued for the next user message, and those in ids */
+    struct cpic *pics;
+    size_t n_pics;
+    struct ppic *idpics;
+    size_t n_idpics;
     char *text;
     size_t n_text, cap_text;
     /* counters */
@@ -155,6 +188,8 @@ struct janas_llm_chat {
         size_t n;
         struct janas_tool_call *calls; /* name and args owned here */
         size_t n_calls;
+        struct cpic *pics; /* a user message's pictures, owned here */
+        size_t n_pics;
     } *msgs;
     size_t n_msgs, cap_msgs;
 
@@ -165,6 +200,9 @@ struct janas_llm_chat {
     struct janas_toolset *tools, *tools_sys;
     char *tools_json, *more_json;
     int32_t tool_choice, tool_only, parallel;
+    char tool_prefix[128]; /* REQUIRED with a name: the calls' names begin
+                              with it (tool_prefix_n bytes; 0: any) */
+    size_t tool_prefix_n;
     int32_t format;
     struct janas_json_doc *schema;
     struct janas_grammar *g;       /* of the reply being read, with ... */
@@ -241,9 +279,25 @@ int janas_api_rtext_add(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_add_text(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_flush_text(janas_llm_chat *c);
 int janas_api_add_special(janas_llm_chat *c, int32_t id);
+/* The newline after a turn's end where the format has one. */
+int janas_api_end_turn_nl(janas_llm_chat *c);
+/* api_image.c */
+int janas_api_add_user(janas_llm_chat *c, const char *text, size_t n,
+                       const struct cpic *pics, size_t n_pics);
+uint32_t janas_api_media_first(const janas_llm_chat *c);
+/* The prefill block a model at path needs for its pictures: 0, or (a
+   vision encoder beside it whose pictures attend both ways) their most
+   tokens rounded up to 64 */
+uint32_t janas_api_picture_block(const char *path);
+int janas_api_media_register(janas_llm_chat *c, uint32_t base, uint32_t from);
+void janas_api_pics_free(struct cpic *p, size_t n);
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n);
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n);
+/* The model's words on reasoning for the system message's top
+   (janas_llm.think_note) when this chat's replies reason, else NULL: where
+   it is not NULL there is a system message whatever the caller says. */
+const char *janas_api_think_note(const janas_llm_chat *c);
 int janas_api_start_reply(janas_llm_chat *c);
 int janas_api_begin_sequence(janas_llm_chat *c);
 int janas_api_note_turn(janas_llm_chat *c, uint32_t at);

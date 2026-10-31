@@ -32,19 +32,11 @@ Then open a [hardware report](https://github.com/prabanta-dev/janas/issues/new?t
 - A change that touches arithmetic must keep the results it promises: kernels agree bit for bit with the scalar reference, and a pass over a block of tokens agrees bit for bit with the same tokens one at a time. The tests check this; keep them passing.
 - Numbers in a commit message are welcome, and should say on what they were measured.
 
-## Copyright and sign-off
+## Copyright
 
-Janas is licensed under the **GNU General Public License, version 3 or later** (see [LICENSE](LICENSE)). Contributions are taken under the same licence.
+Janas is licensed under the **GNU General Public License, version 3 or later** (see [LICENSE](LICENSE)).
 
-Every commit must carry a sign-off line:
-
-```
-Signed-off-by: Your Name <your@email>
-```
-
-which `git commit -s` adds for you. It means what the [Developer Certificate of Origin](https://developercertificate.org/) says: that you wrote the change, or have the right to submit it under this licence.
-
-Please keep contributions to code you own. Code copied from elsewhere, however small, has to be declared in the pull request, with where it came from and under what licence.
+**Code from contributors cannot be accepted yet.** Janas's copyright is going to be held by a non-profit foundation, which does not exist yet; once it does, contributors will assign their rights in what they contribute to it, and their authorship will be recognised. A single holder is what keeps the code free for everyone to use, in the spirit of free and open source software, and lets the project defend its licence as a whole. Until the foundation is set up, pull requests with code stay open but are not merged; reports, measurements and ideas in the issues are as welcome as ever.
 
 ## Models
 

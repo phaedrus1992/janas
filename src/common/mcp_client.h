@@ -75,6 +75,14 @@ enum {
 /* mcp_client_http.c: a request (id >= 0) or notification over HTTP, its
    answer into *a as in the stdio transport; REFUSED says the server
    refused it at the HTTP level (m->http_status). */
+/* janas_mcp_open_url with connections only where policy allows (kept by
+   the caller while the client lives; NULL: anywhere), for a server that
+   reaches the MCP servers its clients name. */
+int32_t janas_mcp_open_url_policy(const char *name, const char *url,
+                                  int32_t n_headers, const char *const *headers,
+                                  int32_t seconds,
+                                  const struct janas_net_policy *policy,
+                                  janas_mcp **out);
 int janas_mcp_http_exchange(struct janas_mcp *m, const char *method, int64_t id,
                             const char *body, size_t n, double ms,
                             struct janas_rpc_msg *a);

@@ -21,25 +21,43 @@ struct push_nq {
     uint32_t x[2], add[2], w[2], xo[2], q256[2], q32[2], xn[2];
     uint32_t d;
     float eps;
+    float os; /* x + add times os (0: as it is), Gemma 4's output scale */
+    float ps; /* the normalized value times ps before w (0: not) */
+    /* 0: the CPU's rms_norm and janas_q8k_quantize, bit for bit; 1: the
+       deterministic quantization (an activation, janas_q8k_quantize_det) */
+    uint32_t det;
 };
 struct push_qk {
     uint32_t qkv[2], qn[2], kn[2], rope[2], kc[2], vc[2], ks[2], vs[2];
     uint32_t n_head, n_kv, hd, n_rot, cap, qs;
     float eps;
-    uint32_t pad, pos[2]; /* the position's buffer, 8-byte aligned */
+    /* bit 0: q's heads not normalized, bit 1: k's (llama); bit 2: q at
+       sixteen bits for attn_decode.comp (JANAS_GPU_Q16=1); Gemma 4's: bit
+       3 keys and values at sixteen bits (q left in float), bit 4 a ring
+       of positions, bit 5 V is K, bit 6 V normalized without weights */
+    uint32_t flags;
+    uint32_t pos[2]; /* the position's buffer, 8-byte aligned */
 };
 struct push_at {
     uint32_t q[2], kc[2], vc[2], ks[2], vs[2], part[2];
     uint32_t n_head, n_kv, hd, cap, nch;
     float scale;
     uint32_t qs, ps;
-    uint32_t pos[2]; /* the position's buffer */
+    uint32_t pos[2];  /* the position's buffer */
+    uint32_t list[2]; /* qwen4exp's positions a token (ix_select.comp) */
+    /* flags: bit 0 q as qk_rope.comp's bit 2 left it, bit 1 keys and
+       values at sixteen bits, bit 2 a ring; hg: workgroups a KV head's
+       query heads are split into (G of them each); window: positions a
+       token sees (0: all) */
+    uint32_t ls, flags, hg, window;
 };
 struct push_am {
     uint32_t part[2], q256[2], q32[2];
     uint32_t hd, nch, ps, gs;
     uint32_t pos[2]; /* 8-byte aligned, as the GLSL block puts it */
     uint32_t gate[2];
+    uint32_t list[2];    /* as push_at's */
+    uint32_t ls, window; /* window: as push_at's, the runs before it left */
 };
 /* the Gated DeltaNet shaders (gdn_*.comp) */
 struct push_gconv {
@@ -73,6 +91,7 @@ struct push_ggate {
     uint32_t att[2], z[2], w[2], q256[2], q32[2], bd[2], lb[2], ld[2], pos[2];
     uint32_t d, nv;
     float eps;
+    uint32_t sig; /* sigmoid(z) in place of SiLU(z) (qwen4exp) */
 };
 struct push_dm { /* gpu.c's dense_mm.comp */
     uint32_t w[2], x[2], y[2];
@@ -81,7 +100,7 @@ struct push_dm { /* gpu.c's dense_mm.comp */
 };
 /* a mixture's (moe_*.comp, and gpu.c's *_mmid.comp) */
 struct push_tk {
-    uint32_t r[2], pe[2], pw[2], shw[2];
+    uint32_t r[2], pe[2], pw[2], shw[2], es[2]; /* es: Gemma 4's scales */
     uint32_t ne, rs, k, n, sh;
 };
 struct push_ga {
@@ -92,24 +111,98 @@ struct push_cb {
     uint32_t dout[2], pw[2], inv[2], sh[2], shw[2], y[2];
     uint32_t dm, k, has_sh;
 };
+struct push_pl { /* moe_plan.comp; offsets in bytes from b */
+    uint32_t at[2], b[2];
+    uint32_t pe, gt, inv, t1, t2, ind, xg, egu, eh, dout;
+    uint32_t n, k, ne, nbd, nbf, ep, dm, eff, s1, s2, tiles1, tiles2;
+};
 struct push_id {
     uint32_t t[2];
     uint32_t rows, nb, tiles;
+    uint32_t ngroups; /* b32_mmid.comp: the groups of 32 a row */
 };
 struct push_sm {
     uint32_t g[2], u[2], h[2];
-    uint32_t n;
+    uint32_t n, gelu; /* gelu: GELU (tanh) in place of SiLU */
 };
+/* qwen4exp's mixes and n-gram embeddings (hc_*.comp, ng_*.comp) */
+struct push_hn {
+    uint32_t res[2], w[2], xn[2], xb[2];
+    uint32_t d, hc;
+    float eps;
+};
+struct push_ha {
+    uint32_t x[2], xb[2];
+    uint32_t n, silu;
+};
+struct push_hm {
+    uint32_t xn[2], g[2], out[2];
+    uint32_t d, hc;
+};
+struct push_hcb {
+    uint32_t res[2], out[2], inj[2];
+    uint32_t d, hc, init;
+};
+struct push_ngg {
+    uint32_t kq[2], res[2], val[2], nk[2], nq[2], nc[2], gv[2], hist[2], pos[2];
+    uint32_t d, hc, cap;
+    float eps;
+};
+struct push_ngc {
+    uint32_t res[2], gv[2], w[2], hist[2], pos[2];
+    uint32_t hd, cap, k, len;
+};
+/* qwen4exp's indexer (ix_*.comp, gpu_token_qsa.c) */
+struct push_ixp {
+    uint32_t q[2], k[2], qn[2], rope[2], raw[2], pos[2];
+    uint32_t nh, d, n_rot, qs;
+    float eps;
+};
+struct push_ixl {
+    uint32_t raw[2], kn[2], rope[2], pool[2], pos[2];
+    uint32_t d, r, n, n_rot, rb;
+    float eps;
+};
+struct push_ixs {
+    uint32_t q[2], pool[2], sc[2], pos[2];
+    uint32_t nh, d, r, keep, nbs, qs;
+};
+struct push_ixc {
+    uint32_t sc[2], list[2], pos[2];
+    uint32_t r, keep, nbs, ls;
+};
+_Static_assert(sizeof(struct push_ngg) <= JANAS_G_PUSH_BYTES, "push size");
+_Static_assert(sizeof(struct push_at) <= JANAS_G_PUSH_BYTES, "push size");
 /* The attention's positions a run (attn_decode.comp C), and the shapes its
    shared memory takes: the query heads of a KV head times hd, and times a
    run. */
 #define ATT_RUN 128
+#define JANAS_GT_POS_BYTES 20 /* the pass's words at o_pos */
 #define ATT_MAXQ 2048
 #define ATT_MAXS 1024
+/* ... larger where a KV head has more than 8 query heads (attn_decode.comp
+   MAXQ, MAXS) */
+#define ATT_MAXQ_G(g) ((g) * 256u > ATT_MAXQ ? (g) * 256u : ATT_MAXQ)
+#define ATT_MAXS_G(g) ((g) * ATT_RUN > ATT_MAXS ? (g) * ATT_RUN : ATT_MAXS)
+/* The query heads a workgroup of the attention takes, of the gt that share
+   a KV head of hd numbers: all of them, or (Gemma 4's full layers, 16 of
+   512) the most of a divisor of gt that its shared memory holds, at most
+   16 (the query scales' array, sqs); 0: none */
+static inline uint32_t janas_gt_att_g(uint32_t gt, uint32_t hd)
+{
+    for (uint32_t g = gt < 16 ? gt : 16; g >= 1; g--)
+        if (gt % g == 0 && g * hd <= ATT_MAXQ_G(g))
+            return g;
+    return 0;
+}
 
+struct push_pa { /* ple_act.comp */
+    uint32_t g[2], in[2], h[2];
+    uint32_t n, pd, w;
+};
 struct push_ac {
     uint32_t g[2], u[2], x[2];
-    uint32_t blocks;
+    uint32_t blocks, gelu; /* as push_sm's */
 };
 _Static_assert(sizeof(struct push_qk) <= JANAS_G_PUSH_BYTES, "push size");
 _Static_assert(sizeof(struct push_at) <= JANAS_G_PUSH_BYTES, "push size");
@@ -127,11 +220,13 @@ _Static_assert(sizeof(struct push_cb) <= JANAS_G_PUSH_BYTES, "push size");
 /* The most tokens a block takes (the model's own blocks: model.h
    JANAS_LLM_MAX_BLOCK), and the memory the attention's runs may take for
    them. */
-#define TOK_MAX_BLOCK 256
+#define TOK_MAX_BLOCK JANAS_GPU_TOK_BLOCK
 #define TOK_PART_BUDGET ((size_t)64 << 20)
 
 /* JANAS_GPU_TOKEN_PROFILE=1: the GPU's own timestamps after each phase of
-   the token, summed per phase and printed when the model is closed */
+   the token, summed per phase and printed when the model is closed; a
+   mixture's segments too, with the time between two of them (the CPU's
+   plan, the submission's round trip) as a phase of its own */
 enum {
     PH_NORM,
     PH_QKV,
@@ -151,6 +246,11 @@ enum {
     PH_SSM_CONV,
     PH_SSM_REC,
     PH_SSM_GATE,
+    /* a mixture's: the router's choice, the experts' weighted sum, the
+       time from a segment's last timestamp to the next one's start */
+    PH_ROUTER,
+    PH_COMBINE,
+    PH_BETWEEN,
     PH_N
 };
 #define MAX_TS 1024
@@ -165,24 +265,39 @@ struct janas_gpu_tok {
     /* [n][all][hidden wanted] */
     VkCommandBuffer cb[TOK_MAX_BLOCK + 1][3][2];
     uint32_t cb_nch[TOK_MAX_BLOCK + 1][3]
-                   [2]; /* the runs each was recorded for */
-    int prof;           /* timestamps in the commands being recorded (n = 1) */
-    VkQueryPool qp;     /* timestamps, if profiling */
-    uint32_t n_ts;      /* written this token */
+                   [2];    /* the runs each was recorded for */
+    int prof;              /* timestamps in the commands being recorded */
+    VkQueryPool qp;        /* timestamps, if profiling */
+    uint32_t n_ts;         /* written this token */
     uint8_t ph_of[MAX_TS]; /* the phase each timestamp closes */
     double ph_ns[PH_N];
     double wall_ns;       /* submission to the fence, as the CPU sees it */
     double copy_ns;       /* the logits copied out */
+    double plan_ns;       /* a mixture's plans, on the CPU */
+    double cpu_ns;        /* of which its experts computed by the CPU */
+    double fetch_ns;      /* and the experts asked of the cache */
     uint64_t tokens;      /* with profiling: passes measured */
     uint64_t pass_tokens; /* ... and their tokens */
     VkShaderModule sm_nq, sm_qk, sm_at, sm_am;
     VkPipeline p_nq, p_qk, p_at, p_am;
+    /* the attention of a second kind of layer (Gemma 4), whose query
+       heads a workgroup takes (attn_decode.comp G) are at_g[1], p_at's
+       at_g[0] */
+    VkShaderModule sm_at2, sm_pa;
+    VkPipeline p_at2, p_pa; /* p_pa: ple_act.comp */
+    uint32_t at_g[2];
+    int gelu; /* the feed-forward's activation: md's */
     /* qwen3.5's recurrent layers (sm_gb: the betas and decays of a short
        block, sm_gx: those of a long one's raw dot products) */
     VkShaderModule sm_gc, sm_gs, sm_gl, sm_gr, sm_gg, sm_gb, sm_gx;
     VkPipeline p_gc, p_gs, p_gl, p_gr, p_gg, p_gb, p_gx;
     size_t *par;      /* per layer: its parameters' offsets in buf (PAR_*) */
     struct stage buf; /* every intermediate, one allocation */
+    /* on a card with memory of its own buf is in that memory (its map this
+       mirror's, host-visible): janas_gt_sync_range copies the ranges the
+       host writes or reads between the two */
+    struct stage mirror;
+    int local;
     /* offsets into buf, each nb tokens' worth */
     uint32_t nch;       /* the attention's runs of positions, for the cache */
     size_t part_floats; /* room for the runs of a block, floats */
@@ -190,6 +305,14 @@ struct janas_gpu_tok {
     size_t o_part;
     size_t o_x, o_x1, o_q256, o_q32, o_qkv, o_ywo, o_gu, o_h, o_yd, o_rope,
         o_logits, o_pos;
+    /* Gemma 4: the sliding-window layers' RoPE tables, a sandwich norm's
+       output */
+    size_t o_rope2, o_post;
+    /* ... its per-layer inputs, a branch's gate and activation */
+    size_t o_ple, o_pg, o_ph;
+    /* ... its mixture's dense branch, that normalized, the router's
+       input, the experts' sum normalized */
+    size_t o_ybr, o_xbr, o_rin, o_post2;
     /* qwen3.5: the normalized input (f32), q|k|v and z of the recurrent
        layers, their convolution's output (the replayed tokens' rows
        first), beta and alpha, their raw output, the betas and decays used
@@ -206,6 +329,13 @@ struct janas_gpu_tok {
        tiles2 on), the two dispatches' sizes */
     VkCommandBuffer *seg_cb[TOK_MAX_BLOCK + 1][3][2];
     uint32_t seg_nch[TOK_MAX_BLOCK + 1][3][2];
+    /* a plan's last copies recorded in g->cb, for the next segment's
+       submission */
+    int cp_pending;
+    /* a plan's experts left to the CPU (gpu_token_moe.c cpu_part), and the
+       command buffer of their rows' copies */
+    uint32_t pend_nc;
+    VkCommandBuffer cb_rows;
     VkShaderModule sm_tk, sm_ga, sm_cb, sm_sm;
     VkPipeline p_tk, p_ga, p_cb, p_sm;
     size_t o_r, o_pe, o_pw, o_shw, o_sh, o_xg, o_egu, o_eh, o_dout, o_gt, o_inv,
@@ -214,11 +344,64 @@ struct janas_gpu_tok {
        blocks of 32, where a down matrix is in blocks of 32 */
     size_t o_hf, o_h32;
     uint32_t tiles1, tiles2;
+    /* blocks of this many tokens or fewer (by default all): the experts'
+       products whose types have one through the matvec shaders (gpu.c
+       pipe_mvid, bit for bit with the CPU's), not *_mmid's tiles
+       (JANAS_GPU_MVID=<n>, 0 never) */
+    uint32_t mvid_n;
     uint32_t n_seg; /* n_layer + 1 */
     /* the CPU's side: the experts' counts and fill, those chosen, their
        slots */
     uint32_t *cnt, *fill, *ids;
     const uint8_t **slots;
+    /* a card whose memory does not hold the experts (gpu_token_moe.c): a
+       tier of n_slot slots of slot_bytes in it with the experts used most,
+       slot_of[layer * n_expert + e] (or -1), owner (layer * n_expert + e,
+       or UINT32_MAX), uses[layer * n_expert + e] counted at each block,
+       stamp the plan that last counted on a slot (plan_no: that plan's);
+       the experts read into it through up (a stage of UP_SLOTS slots); per
+       block the experts of a layer that the GPU computes (gpu ids, their
+       tier slot), those that the CPU does, the misses asked of fetch */
+#define TIER_PIECES 64
+    struct stage tier[TIER_PIECES], up; /* the tier in pieces of per slots */
+    uint32_t n_slot, n_free, scan, plan_no, per;
+    size_t slot_bytes;
+    int32_t *slot_of;
+    uint32_t *owner, *uses, *stamp, *on_gpu, *gpu_slot, *on_cpu, *miss, *ra,
+        *rb;
+    const uint8_t **cpu_slots;
+    /* a plan's copies in one submission: the last experts read into the
+       tier, the CPU's rows */
+    struct janas_g_cp *cps;
+    uint64_t tier_hits, tier_loads, cpu_experts;
+    /* every expert in the tier (janas_gt_tier_fill, tried once): the plan
+       on the GPU, moe_plan.comp after each router, a mixture's pass in one
+       submission; at: the experts' addresses in the tier, 3 uvec4 each,
+       n_expert a layer */
+    int gplan, gplan_tried;
+    struct stage at;
+    VkShaderModule sm_pl;
+    VkPipeline p_pl;
+    /* the feed-forwards' widths padded to whole groups of 256: the
+       experts' (effp) and the shared expert's or dense one's (ffp) */
+    uint32_t effp, ffp;
+    /* qwen4exp: the streams (hc dm a token), each normalized and at bf16,
+       the mixes' low rank and its bf16, their gates, injects and means;
+       the n-gram layer's key products, values, the embeddings at bf16 and
+       the gated values; their shaders (gpu_token_hc.c) */
+    size_t o_res, o_hxn, o_hxb, o_lo, o_lob, o_hg, o_inj, o_hmean, o_ngk, o_ngv,
+        o_ngeb, o_nggv, o_ngemb, o_ngw;
+    VkShaderModule sm_hn, sm_ha, sm_hm, sm_hcb, sm_ngg, sm_ngc;
+    VkPipeline p_hn, p_ha, p_hm, p_hcb, p_ngg, p_ngc;
+    /* qwen4exp's indexer: the block's queries and keys, the cos and sin of
+       the tokens' positions and the blocks' (the caller's), the scores of
+       every block for each token (nbs a token), the positions each attends
+       to (ls words a token), the runs that take them; its shaders
+       (gpu_token_qsa.c) */
+    size_t o_ixq, o_ixk, o_ixrope, o_ixsc, o_ixlist;
+    uint32_t ix_nbs, ix_ls, ix_runs;
+    VkShaderModule sm_ixp, sm_ixl, sm_ixs, sm_ixc;
+    VkPipeline p_ixp, p_ixl, p_ixs, p_ixc;
 };
 
 /* A recurrent layer's parameters copied into buf: beta then alpha (2 nv x
@@ -231,6 +414,11 @@ VkDeviceAddress janas_gt_addr_of(const struct janas_gpu *g, const void *p,
                                  size_t bytes);
 /* Bytes [off, off + bytes) of the token's buffer out of the CPU's caches
    (flush) or reloaded from memory (!flush), where it is not coherent. */
+/* Bytes [off, off + bytes) of the mirror out of the CPU's caches (flush)
+   or reloaded from memory (!flush), where it is not coherent: the copies
+   between it and buf are in the pass's own commands. */
+void janas_gt_mirror_cache(struct janas_gpu *g, struct janas_gpu_tok *t,
+                           size_t off, size_t bytes, int flush);
 void janas_gt_sync_range(struct janas_gpu *g, struct janas_gpu_tok *t,
                          size_t off, size_t bytes, int flush);
 /* A command buffer for cb, allocated, and the commands of segment seg of a
@@ -238,8 +426,15 @@ void janas_gt_sync_range(struct janas_gpu *g, struct janas_gpu_tok *t,
    NULL. */
 int janas_gt_make_cb(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_gpu_tok_model *md, VkCommandBuffer *cb,
-                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg);
+                     uint32_t n, uint32_t first, int hi, uint32_t nch, int seg,
+                     int part);
 int janas_gt_submit_wait(struct janas_gpu *g, const VkCommandBuffer *cb);
+/* The same with pre (or VK_NULL_HANDLE) submitted before it, together */
+int janas_gt_submit_wait2(struct janas_gpu *g, VkCommandBuffer pre,
+                          const VkCommandBuffer *cb);
+/* cbs[0..n) in one submission, NULL ones left out; waited for if wait */
+int janas_gt_submit_list(struct janas_gpu *g, const VkCommandBuffer *cbs,
+                         uint32_t n, int wait);
 
 /* gpu_token_rec.c: the commands, recorded into g->cb */
 void janas_gt_stamp(struct janas_gpu *g, struct janas_gpu_tok *t, int ph);
@@ -250,6 +445,35 @@ void janas_gt_rec_norm_quant(struct janas_gpu *g, struct janas_gpu_tok *t,
                              VkDeviceAddress add, VkDeviceAddress w,
                              VkDeviceAddress xo, VkDeviceAddress xn, uint32_t d,
                              float eps, uint32_t n);
+void janas_gt_rec_norm_quant_s(struct janas_gpu *g, struct janas_gpu_tok *t,
+                               VkPipeline *bound, VkDeviceAddress x,
+                               VkDeviceAddress add, VkDeviceAddress w,
+                               VkDeviceAddress xo, VkDeviceAddress xn,
+                               uint32_t d, float eps, uint32_t n, float os);
+void janas_gt_rec_norm_quant_p(struct janas_gpu *g, struct janas_gpu_tok *t,
+                               VkPipeline *bound, VkDeviceAddress x,
+                               VkDeviceAddress add, VkDeviceAddress w,
+                               VkDeviceAddress xo, VkDeviceAddress xn,
+                               uint32_t d, float eps, uint32_t n, float os,
+                               float ps);
+int janas_gt_rec_gemma_moe(struct janas_gpu *g, struct janas_gpu_tok *t,
+                           const struct janas_gpu_tok_model *md,
+                           const struct janas_gpu_tok_layer *ly,
+                           VkPipeline *bound, VkDeviceAddress x, uint32_t n);
+void janas_gt_rec_gemma_moe_tail(struct janas_gpu *g, struct janas_gpu_tok *t,
+                                 const struct janas_gpu_tok_model *md,
+                                 const struct janas_gpu_tok_layer *ly,
+                                 VkPipeline *bound, VkDeviceAddress yd,
+                                 uint32_t n);
+void janas_gt_rec_ple(struct janas_gpu *g, struct janas_gpu_tok *t,
+                      const struct janas_gpu_tok_model *md,
+                      const struct janas_gpu_tok_layer *ly, uint32_t l,
+                      VkPipeline *bound, VkDeviceAddress x, VkDeviceAddress y,
+                      uint32_t n);
+void janas_gt_rec_post_norm(struct janas_gpu *g, struct janas_gpu_tok *t,
+                            VkPipeline *bound, VkDeviceAddress x,
+                            const float *w,
+                            const struct janas_gpu_tok_model *md, uint32_t n);
 int janas_gt_rec_product(struct janas_gpu *g, struct janas_gpu_tok *t,
                          VkPipeline *bound, const struct janas_matvec_task *w,
                          size_t xoff, VkDeviceAddress y, uint32_t n, size_t ys);
@@ -269,15 +493,75 @@ int janas_gt_rec_ffn(struct janas_gpu *g, struct janas_gpu_tok *t,
                      const struct janas_matvec_task *down, uint32_t n,
                      VkDeviceAddress out);
 
+/* gpu_token_hc.c: qwen4exp's streams. A mix (k 0 before the token mixer,
+   1 before the feed-forward, 2 the output's) of the streams into the
+   sublayer's input, quantized in q256 / q32 and as floats in xnf, its
+   inject (none for the output's) into o_inj; a combine of the sublayer's
+   output (out) into the streams; the n-gram layer; the streams set to the
+   embeddings at x. */
+void janas_gt_rec_hc_mix(struct janas_gpu *g, struct janas_gpu_tok *t,
+                         const struct janas_gpu_tok_model *md,
+                         const struct janas_gpu_tok_layer *ly, int k,
+                         VkPipeline *bound, VkDeviceAddress xnf, uint32_t n);
+void janas_gt_rec_hc_combine(struct janas_gpu *g, struct janas_gpu_tok *t,
+                             const struct janas_gpu_tok_model *md,
+                             VkPipeline *bound, VkDeviceAddress out, int init,
+                             uint32_t n);
+int janas_gt_rec_ng(struct janas_gpu *g, struct janas_gpu_tok *t,
+                    const struct janas_gpu_tok_model *md,
+                    const struct janas_gpu_tok_layer *ly, VkPipeline *bound,
+                    uint32_t n);
+int janas_gt_hc_create(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md);
+void janas_gt_hc_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
+/* y (n rows of ys) = scale w x (n rows of cols floats): w bf16, rows x
+   cols, in dense_mm.comp's tiles */
+void janas_gt_rec_bf16(struct janas_gpu *g, VkPipeline *bound,
+                       VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
+                       uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
+                       float scale);
+/* the same for w of dense_mm.comp's kind: 0 f32, 1 bf16, 2 Q8_0; on
+   DENSE_MV_MAX vectors or fewer a workgroup a row (dense_mv.comp) */
+#define DENSE_MV_MAX 8
+void janas_gt_rec_dense(struct janas_gpu *g, VkPipeline *bound, int kind,
+                        VkDeviceAddress w, VkDeviceAddress x, VkDeviceAddress y,
+                        uint32_t rows, uint32_t cols, uint32_t ys, uint32_t n,
+                        float scale);
+
+/* gpu_token_qsa.c: qwen4exp's indexer for an attention layer, on its input
+   at bf16 (xb, n rows of dm): the keys and queries, the blocks the block
+   completes, the scores and the positions each token attends to, which
+   janas_gt_rec_attn's runs then read */
+int janas_gt_rec_qsa(struct janas_gpu *g, struct janas_gpu_tok *t,
+                     const struct janas_gpu_tok_model *md,
+                     const struct janas_gpu_tok_layer *ly, VkPipeline *bound,
+                     VkDeviceAddress xb, uint32_t n);
+int janas_gt_qsa_create(struct janas_gpu *g, struct janas_gpu_tok *t);
+void janas_gt_qsa_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
+
 /* gpu_token_moe.c: a mixture's layers */
 int janas_gt_rec_router(struct janas_gpu *g, struct janas_gpu_tok *t,
                         const struct janas_gpu_tok_model *md,
                         const struct janas_gpu_tok_layer *ly, uint32_t l,
                         VkPipeline *bound, uint32_t n);
+/* part 0 all of it, 1 the products, 2 the experts' sum */
 void janas_gt_rec_experts(struct janas_gpu *g, struct janas_gpu_tok *t,
                           const struct janas_gpu_tok_model *md,
                           const struct janas_gpu_tok_layer *ly,
-                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n);
+                          VkPipeline *bound, VkDeviceAddress YD, uint32_t n,
+                          int part);
+int janas_gt_tier_create(struct janas_gpu *g, struct janas_gpu_tok *t,
+                         const struct janas_gpu_tok_model *md);
+void janas_gt_tier_destroy(struct janas_gpu *g, struct janas_gpu_tok *t);
+/* Every expert read into a tier that holds them all, their addresses
+   written for moe_plan.comp, t->gplan set: 0, or -1 (the plan stays the
+   CPU's). */
+int janas_gt_tier_fill(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md);
+/* Layer l's plan on the GPU from its router's choice (t->gplan) */
+void janas_gt_rec_plan(struct janas_gpu *g, struct janas_gpu_tok *t,
+                       const struct janas_gpu_tok_model *md, uint32_t l,
+                       VkPipeline *bound, uint32_t n);
 void janas_gt_free_segments(struct janas_gpu *g, struct janas_gpu_tok *t,
                             VkCommandBuffer **seg);
 int janas_gt_run_segments(struct janas_gpu *g, struct janas_gpu_tok *t,

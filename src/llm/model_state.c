@@ -11,12 +11,19 @@
  * stands exactly there; otherwise - a draft was partly rejected, and the
  * model reaches position n by replaying the accepted tokens of its log -
  * both buffers and the log are kept as they are.
+ *
+ * qwen4exp adds what its n-gram embeddings read back (the conv's inputs and
+ * the tokens of the positions its history reaches, out of their rings) and
+ * its sparse attention's raw keys for positions 0 .. n - 1; the blocks'
+ * pooled keys are made again from them.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "model_impl.h"
+
+#include "expert_cache.h"
 
 struct janas_llm_state {
     uint32_t n;       /* positions 0 .. n - 1 */
@@ -35,12 +42,80 @@ struct janas_llm_state {
     float *log_mixed, *log_beta, *log_decay;
     int base;
     uint32_t base_pos, log_n;
+    /* qwen4exp: the n-gram rings' last ng_n positions before n, and the
+       indexer's raw keys (n_attn x n x ix_dim, f16) */
+    uint32_t ng_n;
+    int32_t *ng_tok;
+    float *ng_hist;
+    uint16_t *ix;
     size_t bytes;
 };
 
+/* qwen4exp: the bytes of a position's conv inputs, and of a slot's raw
+   keys for n positions */
+static size_t ng_row(const struct janas_llm_model *m)
+{
+    return (size_t)m->hc_n * m->d_model * sizeof(float);
+}
+
+static size_t ix_len(const struct janas_llm_model *m, size_t n)
+{
+    return (size_t)m->n_attn * n * m->ix_dim * sizeof(uint16_t);
+}
+
+/* the positions of the n-gram history a state of n needs */
+static uint32_t ng_keep(const struct janas_llm_model *m, uint32_t n)
+{
+    if (!m->hc_n || m->ng_layer >= m->n_layer)
+        return 0;
+    uint32_t hist = (m->ng_kernel - 1) * m->ng_len;
+    return n < hist ? n : hist;
+}
+
+/* the n-gram history and the raw keys of a state of n, out of the model
+   (out) or into it; -1 if the rings no longer hold that history */
+static int copy_hc(struct janas_llm_model *m, struct janas_llm_state *st,
+                   int out)
+{
+    uint32_t n = st->n, from = n - st->ng_n;
+    if (st->ng_n) {
+        if (out && (m->ng_hi < n ||
+                    (m->ng_hi > m->ng_cap && from < m->ng_hi - m->ng_cap)))
+            return -1;
+        for (uint32_t i = 0; i < st->ng_n; i++) {
+            uint32_t r = (from + i) % m->ng_cap;
+            float *h = m->ng_hist + (size_t)r * ng_row(m) / sizeof(float);
+            if (out) {
+                st->ng_tok[i] = m->ng_tok[r];
+                memcpy(st->ng_hist + (size_t)i * ng_row(m) / sizeof(float), h,
+                       ng_row(m));
+            } else {
+                m->ng_tok[r] = st->ng_tok[i];
+                memcpy(h, st->ng_hist + (size_t)i * ng_row(m) / sizeof(float),
+                       ng_row(m));
+            }
+        }
+        if (!out)
+            m->ng_hi = n;
+    }
+    if (st->ix) {
+        size_t row = (size_t)n * m->ix_dim;
+        for (uint32_t sl = 0; sl < m->n_attn; sl++) {
+            uint16_t *c = m->ix_raw + (size_t)sl * m->n_ctx * m->ix_dim;
+            if (out)
+                memcpy(st->ix + sl * row, c, row * sizeof(uint16_t));
+            else
+                memcpy(c, st->ix + sl * row, row * sizeof(uint16_t));
+        }
+        if (!out)
+            janas_m_qsa_restore(m, n);
+    }
+    return 0;
+}
+
 static size_t ssm_len(const struct janas_llm_model *m)
 {
-    return (size_t)m->n_rec * m->n_vh * m->ds * m->ds;
+    return (size_t)m->n_rec * m->ssm_per;
 }
 
 static size_t conv_len(const struct janas_llm_model *m)
@@ -61,6 +136,9 @@ void janas_llm_state_free(struct janas_llm_state *st)
     free(st->log_mixed);
     free(st->log_beta);
     free(st->log_decay);
+    free(st->ng_tok);
+    free(st->ng_hist);
+    free(st->ix);
     free(st);
 }
 
@@ -154,6 +232,7 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
 {
     if (n > m->n_ctx)
         return NULL;
+    janas_m_gtok_host(m, 0); /* what the GPU made newer, read here */
     /* a ring keeps the window before n only while nothing past n + (its
        capacity - the window) has been written over it */
     for (uint32_t sl = 0; sl < m->n_attn; sl++)
@@ -213,7 +292,20 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
         st->bytes += 2 * ssm_len(m) * sizeof(uint16_t) +
                      2 * conv_len(m) * sizeof(float) + lm + 2 * lb;
     }
-    if (bad) {
+    /* qwen4exp's n-gram history and raw keys */
+    st->ng_n = ng_keep(m, n);
+    if (st->ng_n) {
+        st->ng_tok = malloc(st->ng_n * sizeof(int32_t));
+        st->ng_hist = malloc(st->ng_n * ng_row(m));
+        bad |= !st->ng_tok || !st->ng_hist;
+        st->bytes += st->ng_n * (sizeof(int32_t) + ng_row(m));
+    }
+    if (m->ix_heads) {
+        st->ix = malloc(ix_len(m, n) ? ix_len(m, n) : 1);
+        bad |= !st->ix;
+        st->bytes += ix_len(m, n);
+    }
+    if (bad || copy_hc(m, st, 1) != 0) {
         janas_llm_state_free(st);
         return NULL;
     }
@@ -223,11 +315,13 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
 int janas_llm_model_state_load(struct janas_llm_model *m,
                                const struct janas_llm_state *st)
 {
+    janas_m_gtok_host(m, 1); /* the state written here */
     /* the rows copied do not depend on the context opened, only on its
        being long enough */
     if (st->n > m->n_ctx || st->n_slots != m->n_attn + (m->mtp ? 1u : 0u) ||
         st->k_use != m->k_use || st->exp_level != m->exp_level ||
-        (m->a->rec != 0) != (st->nbuf != 0))
+        (m->a->rec != 0) != (st->nbuf != 0) || st->ng_n != ng_keep(m, st->n) ||
+        (m->ix_heads != 0) != (st->ix != 0))
         return -1;
     copy_kv(m, (struct janas_llm_state *)st, 0);
     m->ring_hi = st->n;
@@ -253,6 +347,7 @@ int janas_llm_model_state_load(struct janas_llm_model *m,
         m->base_pos = st->base_pos;
         m->log_n = st->log_n;
     }
+    copy_hc(m, (struct janas_llm_state *)st, 0);
     return 0;
 }
 
@@ -341,12 +436,16 @@ int janas_llm_state_write(const struct janas_llm_model *m,
     h[H_LEVEL] = (uint32_t)st->exp_level;
     size_t kv, rows, ssm, conv, lm, lb;
     lengths(m, h, &kv, &rows, &ssm, &conv, &lm, &lb);
+    /* qwen4exp's part last, its sizes the model's (ng_keep, ix_len) */
     return put(f, h, sizeof(h)) || put(f, st->k, kv) || put(f, st->v, kv) ||
                    put(f, st->ks, rows * sizeof(float)) ||
                    put(f, st->vs, rows * sizeof(float)) ||
                    put(f, st->ssm, ssm) || put(f, st->conv, conv) ||
                    put(f, st->log_mixed, lm) || put(f, st->log_beta, lb) ||
-                   put(f, st->log_decay, lb)
+                   put(f, st->log_decay, lb) ||
+                   put(f, st->ng_tok, st->ng_n * sizeof(int32_t)) ||
+                   put(f, st->ng_hist, st->ng_n * ng_row(m)) ||
+                   (st->ix && put(f, st->ix, ix_len(m, st->n)))
                ? -1
                : 0;
 }
@@ -363,8 +462,12 @@ struct janas_llm_state *janas_llm_state_read(const struct janas_llm_model *m,
     for (size_t i = 0; i < sizeof(same) / sizeof(same[0]); i++)
         if (h[same[i]] != want[same[i]])
             return NULL;
+    /* the recurrent log within its buffers, the base within the text */
     if (h[H_N] > m->n_ctx || h[H_NBUF] > 2 ||
-        (h[H_NBUF] != 0) != (m->a->rec != 0))
+        (h[H_NBUF] != 0) != (m->a->rec != 0) ||
+        (h[H_NBUF] == 2 &&
+         (h[H_LOG_N] > JANAS_LLM_MAX_BLOCK || h[H_BASE_POS] > h[H_N] ||
+          h[H_N] > (uint64_t)h[H_BASE_POS] + h[H_LOG_N])))
         return NULL;
     struct janas_llm_state *st = calloc(1, sizeof(*st));
     if (!st)
@@ -401,9 +504,37 @@ struct janas_llm_state *janas_llm_state_read(const struct janas_llm_model *m,
           get(f, st->vs, rows * sizeof(float)) || get(f, st->ssm, ssm) ||
           get(f, st->conv, conv) || get(f, st->log_mixed, lm) ||
           get(f, st->log_beta, lb) || get(f, st->log_decay, lb);
+    if (!bad && (st->ng_n = ng_keep(m, st->n)) != 0) {
+        st->ng_tok = malloc(st->ng_n * sizeof(int32_t));
+        st->ng_hist = malloc(st->ng_n * ng_row(m));
+        bad = !st->ng_tok || !st->ng_hist ||
+              get(f, st->ng_tok, st->ng_n * sizeof(int32_t)) ||
+              get(f, st->ng_hist, st->ng_n * ng_row(m));
+        st->bytes += st->ng_n * (sizeof(int32_t) + ng_row(m));
+    }
+    if (!bad && m->ix_heads) {
+        st->ix = malloc(ix_len(m, st->n) ? ix_len(m, st->n) : 1);
+        bad = !st->ix || get(f, st->ix, ix_len(m, st->n));
+        st->bytes += ix_len(m, st->n);
+    }
     if (bad || (st->nbuf == 2 && (st->base < 0 || st->base > 1))) {
         janas_llm_state_free(st);
         return NULL;
     }
     return st;
+}
+
+void janas_llm_model_memory(const struct janas_llm_model *m, uint64_t *resident,
+                            uint64_t *cache, uint64_t *kv)
+{
+    uint64_t r = m->j.h.resident_bytes;
+    if (m->ple_tok && !m->ple_ram &&
+        m->ple_tok->offset >= m->j.h.resident_offset && m->ple_tok->bytes < r)
+        r -= m->ple_tok->bytes;
+    uint64_t c = 0;
+    if (m->cache)
+        janas_expert_cache_arena(m->cache, &c);
+    *resident = r;
+    *cache = c;
+    *kv = 2 * ((uint64_t)m->kv_bytes + m->ks_bytes);
 }

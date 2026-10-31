@@ -78,6 +78,44 @@ Both steps are deterministic, so the file can be checked against the fingerprint
 
 Room needed: three copies of the model at the worst moment — the GGUF, the converted file and the one with the planes — so about 145 GB for the largest. The flat file goes as soon as the planes are written, and the GGUF can go too, though keeping it saves the download the day a new version of the converter is worth running.
 
+**The vision encoder** (Qwen3.5 and Gemma 4: E2B, E4B, 12B and 26B-A4B; pictures in janas-chat with `/image`, in janas-server's messages, `janas_llm_chat_image` in the library). Like the MTP block it comes from the original checkpoint, which `hf2jns_vision` reads from the directory a download from Hugging Face makes (`config.json`, `preprocessor_config.json` or `processor_config.json`, and the safetensors; of Gemma's checkpoint, which holds the whole model, only the vision tower is read):
+
+```
+bin/x86_64-linux/hf2jns_vision models/hf/Qwen/Qwen3.5-0.8B \
+    models/jns/qwen3.5-0.8b.vision.jns
+bin/x86_64-linux/hf2jns_vision models/hf/google/gemma-4-E2B-it \
+    models/jns/gemma-4-e2b-it.vision.jns
+```
+
+The engine finds it beside the model: the `.vision.jns` whose name is the longest beginning of the model's (`qwen3.5-0.8b.vision.jns` serves `qwen3.5-0.8b-q4km.jns` and every other quantization of it). For Qwen3.5-0.8B it is 202 MB, its matrices kept in bfloat16 as the checkpoint has them. Its output against llama.cpp's (an mmproj made from the same checkpoint): cosine 0.999997 on average. Gemma 4 E2B's is 338 MB; a picture is made at most 280 tokens, as its processor does, and its output against llama.cpp's is at a cosine of 0.999999 on average, 0.99999 at worst, on pictures of 256 and 252 tokens. E4B is converted the same way and answers the same questions about the same pictures. The 26B-A4B too (1.1 GB, 27 blocks; cosine 0.999998 on average against llama.cpp): in its language model a picture's tokens see one another, the later ones too, so the engine, finding its encoder beside it, reads prompts in blocks that hold a picture whole (320 tokens). The 12B's has no blocks - a patch of 48x48 pixels normed, through one dense layer, plus its positions - 100 MB, at a cosine of 1.000000 against llama.cpp's, its pictures attended both ways as the 26B's.
+
+**Speech to text: Whisper** (`janas-server --speech-model`, `janas_llm_speech_*` in the library). OpenAI's models from their Hugging Face checkpoints (`openai/whisper-small`, `openai/whisper-large-v3-turbo` and the others: `config.json`, `generation_config.json`, `preprocessor_config.json`, `tokenizer.json` and the safetensors), converted by `hf2jns_whisper`:
+
+```sh
+bin/x86_64-linux/hf2jns_whisper models/hf/openai/whisper-small \
+    models/jns/whisper-small.jns
+```
+
+The matrices are kept in half precision, as OpenAI released them (the checkpoints' floats are their exact copies), laid out as the engine reads them; whisper-small is 489 MB. Against whisper.cpp on the same weights and the same sound, the logits of every token of a transcription agree to a cosine of 1.000000 on average, 0.999996 at worst (whisper.cpp without its half-precision flash attention, which alone takes it to 0.99996), and the spectrograms are the same; the tokenizer splits text as Hugging Face's does. The transcription goes window by window as OpenAI's does (language found, timestamps, temperatures raised where the text loops or is unlikely, silence skipped).
+
+**Voice activity detection: Silero VAD** (chunking a recording, `chunking_strategy` in janas-server, `chunking` in the library), from its ONNX model (`onnx-community/silero-vad`, MIT, 2.2 MB), converted by `silero2jns` into a file beside the speech model, where it is found by itself:
+
+```sh
+bin/x86_64-linux/silero2jns models/hf/onnx-community/silero-vad/onnx/model.onnx \
+    models/jns/silero-vad.jns
+```
+
+The weights of its 16 kHz model in single precision as the ONNX file holds them (read by Janas's own protobuf reader); its probability of speech in each 32 ms agrees with onnxruntime's on the same file to 1.7e-6 over 46 seconds of speech.
+
+**Speaker embeddings: WeSpeaker ResNet34-LM** (who speaks when: `diarized_json` in janas-server, `diarize` in the library), from its ONNX model (`Wespeaker/wespeaker-voxceleb-resnet34-LM`, by the WeSpeaker project, trained on VoxCeleb2, CC-BY-4.0: credit to WeSpeaker, https://github.com/wenet-e2e/wespeaker), converted by `wespeaker2jns` into a file beside the speech model:
+
+```sh
+bin/x86_64-linux/wespeaker2jns models/hf/Wespeaker/wespeaker-voxceleb-resnet34-LM/voxceleb_resnet34_LM.onnx \
+    models/jns/wespeaker-resnet34.jns
+```
+
+Its convolutions in half precision (13 MB); on the same filter banks its embedding agrees with onnxruntime's to a cosine of 0.9999993, and Janas's filter banks with Kaldi's (kaldi-native-fbank) to 1.6e-4.
+
 **The multi-token prediction block** (Qwen3-Next and the dense Qwen3.5; optional, faster replies). Its own model carries it, GGUF files leave it out, so it comes from the original checkpoint. `hf2jns_mtp` can read just the block's tensors from Hugging Face, with range requests, instead of the shards that hold them:
 
 ```sh
@@ -86,6 +124,15 @@ bin/x86_64-linux/hf2jns_mtp models/qwen3-next.jns \
 ```
 
 For the dense Qwen3.5-9B that is 487 MB instead of 14 GB of shards, in under a minute. It also takes the shards themselves, when you have them on disk (`hf2jns_mtp <model.jns> <shard>... <out.jns>`). Qwen3.6-35B-A3B needs none of this: its GGUF keeps the block.
+
+Qwen3.8-Flash-Next's block comes in a GGUF file of its own, which unsloth publishes beside its quantizations of the model ([`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), folder `MTP`). `hf2jns_mtp` copies the block as it is, in its own types, and leaves out the file's token embeddings and output head - the engine takes the model's own:
+
+```sh
+bin/x86_64-linux/hf2jns_mtp models/qwen3.8-flash-next.jns \
+    mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf models/qwen3.8-flash-next-mtp.jns
+```
+
+From the Q4_K_M file (2.8 GB) that is 1.9 GB, the same bytes on every run. In the chat, on one reply of 64 tokens to a question on bread, 72.5% of its drafts were kept greedy and 80.5% sampled as the chat samples, and the reply was the one written without them.
 
 **Gemma 4** comes from unsloth's GGUF files, converted in one step, and so does its assistant (the `mtp-gemma-4-*.gguf` file beside the model, under 0.5 GB), which serves as the multi-token prediction file:
 

@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/devices.h"
 #include "common/env_names.h"
 #include "common/model_pick.h"
 #include "common/sysinfo.h"
@@ -60,7 +61,7 @@ static double sess_tokens, sess_seconds;
 static const char *const commands[] = {
     "/help",    "/about", "/stats", "/reset",   "/system",   "/temp",
     "/spec",    "/think", "/mode",  "/experts", "/markdown", "/mcp",
-    "/context", "/quit",  "/exit",  NULL};
+    "/context", "/image", "/quit",  "/exit",    NULL};
 
 static void on_sigwinch(int sig)
 {
@@ -115,6 +116,39 @@ static struct {
     atomic_int busy, stop, done, total;
 } prep;
 
+/*
+ * The NPU made ready in sight. The first blocks the NPU reads in a session
+ * wait while its weights are copied and its graphs compiled - seconds to a
+ * minute, inside janas_llm_chat_next, where the chat draws nothing - so a
+ * watcher draws the footer meanwhile, which says how far it is
+ * (janas_llm_npu_preparing). Only while the chat is in the engine
+ * (in_engine), and under lock, which the chat takes to come out: it never
+ * draws beside the chat's own writing, and the footer asks the engine then
+ * only what may be asked from aside, as while the system message is read
+ * ahead.
+ */
+static struct {
+    pthread_t th;
+    int on; /* started, not joined */
+    pthread_mutex_t lock;
+    atomic_int in_engine, stop;
+    const janas_llm *llm;
+} watch = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+/* the chat goes into the engine for a pass that may make the NPU ready,
+   and comes out of it: the watcher may draw in between */
+static void engine_in(void)
+{
+    atomic_store(&watch.in_engine, 1);
+}
+
+static void engine_out(void)
+{
+    pthread_mutex_lock(&watch.lock);
+    atomic_store(&watch.in_engine, 0);
+    pthread_mutex_unlock(&watch.lock);
+}
+
 static int prep_pct(void)
 {
     int t = atomic_load(&prep.total), d = atomic_load(&prep.done);
@@ -138,7 +172,7 @@ static void footer(const janas_llm *llm, const janas_llm_chat *c,
     /* while the system message is read ahead, the chat and the engine's
        settings are the reading thread's: only the cache's filling, which
        is made to be watched from aside, is asked */
-    int reading = atomic_load(&prep.busy);
+    int reading = atomic_load(&prep.busy) || atomic_load(&watch.in_engine);
     struct janas_llm_chat_stats s = {.size = sizeof(s)};
     int have = c && !reading && janas_llm_chat_stats(c, &s) == JANAS_LLM_OK;
     int32_t used = 0, most = 0;
@@ -156,6 +190,15 @@ static void footer(const janas_llm *llm, const janas_llm_chat *c,
         foot_add(part, &np, 2, "%d/%d experts", used, most);
     } else if (!state) /* kept longest: it is what holds the reply back */
         foot_add(part, &np, 9, "reading the tools ahead %d%%", prep_pct());
+    int32_t nd = 0, nt = 0;
+    double ns = 0;
+    if (janas_llm_npu_preparing(llm, &nd, &nt, &ns) == 1) { /* held back too */
+        if (nt > 0)
+            foot_add(part, &np, 9, "preparing the NPU %d/%d, %.0f s", (int)nd,
+                     (int)nt, ns);
+        else
+            foot_add(part, &np, 9, "preparing the NPU, %.0f s", ns);
+    }
     if (have && s.context_size)
         foot_add(part, &np, 4, "context %u/%u", s.context_used, s.context_size);
     /* only where it is on, and only where it means something: it is the one
@@ -221,15 +264,22 @@ static const janas_llm_chat *idle_chat;
 
 static int footer_idle(void)
 {
-    static int shown = -2;
+    static int shown = -2, shown_npu = -2;
     int64_t done = 0, total = 0;
     janas_llm_preload(idle_llm, &done, &total);
     int pct = total > done ? (int)(100 * done / total) : -1;
     /* and the reading ahead's share, while it goes */
     pct = pct * 1000 + (atomic_load(&prep.busy) ? prep_pct() : 999);
-    if (pct == shown)
+    /* and the NPU's preparation, a second at a time */
+    int32_t nd = 0;
+    double ns = 0;
+    int npu = janas_llm_npu_preparing(idle_llm, &nd, NULL, &ns) == 1
+                  ? (int)nd * 10000 + (int)ns
+                  : -1;
+    if (pct == shown && npu == shown_npu)
         return 0;
     shown = pct;
+    shown_npu = npu;
     footer(idle_llm, idle_chat, NULL);
     return 1;
 }
@@ -252,10 +302,17 @@ static void usage(void)
         "  model            a .jns file, or a name of the catalog (none: the\n"
         "                   list, to choose one; a model not here yet is\n"
         "                   downloaded, after asking)\n"
-        "  --profile <quality|fast>\n"
-        "                   quality (default): answers as the file gives\n"
-        "                   them; fast: also what was measured faster on\n"
-        "                   this model at a small cost to its answers\n"
+        "  --quality <high|medium|low>\n"
+        "                   the lowest quality the engine may choose to\n"
+        "                   be faster where memory is short: low (the\n"
+        "                   default) the experts at four bits, the light\n"
+        "                   ones not in memory left out; medium: four\n"
+        "                   bits, nothing left out; high: nothing\n"
+        "                   lowered. With memory for every expert all\n"
+        "                   three read alike. Asked for, low also takes\n"
+        "                   what was measured faster on this model at a\n"
+        "                   small cost (the head at four bits). The\n"
+        "                   levers below (--bits, --head...) win over it\n"
         "  --models <dir>   where the models are (default: JANAS_MODELS,\n"
         "                   or ~/.local/share/janas/models)\n"
         "  --tune           measure again how this model runs fastest on\n"
@@ -308,6 +365,22 @@ static void usage(void)
         "reading them\n"
         "  --no-gpu         never give the GPU work, whatever the mode "
         "says\n"
+        "  --prompt-on <devices>\n"
+        "                   what reads the prompts: auto (default: what\n"
+        "                   measures fastest here), cpu, gpu, npu, npu+gpu\n"
+        "                   (both in each pass), or a list apart by commas\n"
+        "                   for the engine to choose from, such as npu,gpu;\n"
+        "                   the CPU takes part in every pass, the NPU in\n"
+        "                   blocks of 64 tokens and more; a choice wins\n"
+        "                   over the mode\n"
+        "  --drafts-on <devices>\n"
+        "                   the same for the passes that check guessed\n"
+        "                   tokens (2 to 16)\n"
+        "  --reply-on <devices>\n"
+        "                   the same for a reply's tokens, one at a time\n"
+        "  --npu-int8       the NPU reads prompts with eight-bit\n"
+        "                   activations: faster, a little less exact\n"
+        "                   (dense Qwen3 models)\n"
         "  --mcp-config <file>\n"
         "                   the MCP servers whose tools the model may call\n"
         "                   (default ~/.config/janas/mcp.json, in the\n"
@@ -350,6 +423,9 @@ static const struct {
     {"/system <text>", "new conversation with this system message"},
     {"/system off", "new conversation with no system message"},
     {"/temp <t>", "temperature (0: greedy)"},
+    {"/image <file>",
+     "a picture (PNG or JPEG) for your next message, for models that see "
+     "(their vision file beside them)"},
     {"/spec [on|off]", "speculative decoding (toggles)"},
     {"/mode [auto|eco|max]", "power mode, and what the engine chose"},
     {"/experts [n]",
@@ -622,7 +698,9 @@ static void prep_start(janas_llm_chat *c)
         return;
     int32_t d = 0, t = 0;
     double t0 = now_ms();
+    engine_in(); /* the first block: the NPU may be made ready in it */
     int r = janas_llm_chat_prepare(c, &d, &t);
+    engine_out();
     if (r < 0) {
         prep_say(T_WARN(&term),
                  "the system message could not be read "
@@ -680,6 +758,49 @@ static void prep_wait(const janas_llm *llm, int stop)
     }
     pthread_join(prep.th, NULL);
     prep.on = 0;
+}
+
+static void *watch_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&watch.stop)) {
+        struct timespec ts = {0, 250 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        if (!atomic_load(&watch.in_engine) ||
+            janas_llm_npu_preparing(watch.llm, NULL, NULL, NULL) != 1)
+            continue;
+        pthread_mutex_lock(&watch.lock);
+        if (atomic_load(&watch.in_engine))
+            footer(watch.llm, NULL, "");
+        pthread_mutex_unlock(&watch.lock);
+    }
+    return NULL;
+}
+
+static void watch_start(const janas_llm *llm)
+{
+    watch.llm = llm;
+    atomic_store(&watch.stop, 0);
+    watch.on = pthread_create(&watch.th, NULL, watch_main, NULL) == 0;
+}
+
+static void watch_stop(void)
+{
+    if (!watch.on)
+        return;
+    atomic_store(&watch.stop, 1);
+    pthread_join(watch.th, NULL);
+    watch.on = 0;
+}
+
+/* janas_llm_chat_next, the watcher free to draw while it runs */
+static int32_t engine_next(janas_llm_chat *c, char *buf, int32_t cap,
+                           int32_t *len)
+{
+    engine_in();
+    int32_t rc = janas_llm_chat_next(c, buf, cap, len);
+    engine_out();
+    return rc;
 }
 
 /*
@@ -834,21 +955,27 @@ struct chat_opts { /* where the words land: main keeps them, this names them */
     int *all_tools;
     int *profile; /* 1: the catalog's fast profile */
     int *tune;    /* 1: measure again (--tune), -1: never (--no-tune) */
+    /* --prompt-on, --drafts-on, --reply-on as masks (common/devices.h; 0:
+       as the engine chooses) and --npu-int8, put in the engine's variables
+       when read, for the next model to open */
+    int *devices;
+    int *npu_int8;
 };
 
 /* every option, for the nearest to one mistyped: the first N_ALONE stand
    alone, the others take a value */
-#define N_ALONE 14
+#define N_ALONE 15
 static const char *const OPTIONS[] = {
-    "--no-spec",     "--stats",     "--no-markdown", "--no-gpu",
-    "--no-preload",  "--no-recap",  "--no-mtp",      "--no-mcp",
-    "--no-services", "--all-tools", "--mcp-auto",    "--mcp-instructions",
-    "--tune",        "--no-tune",   "--mtp",         "--draft",
-    "--think",       "--mode",      "--ctx",         "--cache",
-    "--reserve",     "--bits",      "--attention",   "--system",
-    "--mcp-config",  "--progress",  "--temp",        "--top-k",
-    "--top-p",       "--min-p",     "--seed",        "--max",
-    "--head",        "--profile",   "--models"};
+    "--no-spec",     "--stats",      "--no-markdown", "--no-gpu",
+    "--no-preload",  "--no-recap",   "--no-mtp",      "--no-mcp",
+    "--no-services", "--all-tools",  "--mcp-auto",    "--mcp-instructions",
+    "--tune",        "--no-tune",    "--npu-int8",    "--mtp",
+    "--draft",       "--think",      "--mode",        "--ctx",
+    "--cache",       "--reserve",    "--bits",        "--attention",
+    "--system",      "--mcp-config", "--progress",    "--temp",
+    "--top-k",       "--top-p",      "--min-p",       "--seed",
+    "--max",         "--head",       "--profile",     "--models",
+    "--quality",     "--prompt-on",  "--drafts-on",   "--reply-on"};
 #define N_OPTIONS (sizeof OPTIONS / sizeof *OPTIONS)
 
 /* v of option a as a whole number or a number within limits; on a
@@ -895,6 +1022,7 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
     static const char *const BITS[] = {"2", "4", "6"};
     static const char *const HEAD[] = {"4", "6"};
     static const char *const PROFILES[] = {"quality", "fast"};
+    static const char *const QUALITY[] = {"high", "medium", "low"};
     for (int i = 0; i < n; i++) {
         const char *a = w[i], *v = i + 1 < n ? w[i + 1] : NULL;
         long long x;
@@ -952,6 +1080,11 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             *o->tune = a[2] == 't' ? 1 : -1;
             continue;
         }
+        if (strcmp(a, "--npu-int8") == 0) {
+            *o->npu_int8 = 1;
+            setenv("JANAS_NPU_A8", "1", 1); /* read when the model opens */
+            continue;
+        }
         int valued = 0;
         for (size_t j = N_ALONE; j < N_OPTIONS && !valued; j++)
             valued = strcmp(a, OPTIONS[j]) == 0;
@@ -965,7 +1098,11 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             return -1;
         }
         i++;
-        if (strcmp(a, "--mtp") == 0)
+        if ((k = janas_devices_option(a, v, why, why_len)) != 0) {
+            if (k < 0)
+                return -1;
+            o->devices[k - 1] = janas_devices_mask(v, why, why_len);
+        } else if (strcmp(a, "--mtp") == 0)
             o->mp->mtp_path = v;
         else if (strcmp(a, "--draft") == 0)
             o->mp->draft_path = v;
@@ -1003,9 +1140,17 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             if ((k = opt_choice(a, v, BITS, 3, why, why_len)) < 0)
                 return -1;
             o->mp->expert_bits = 2 + 2 * k;
+        } else if (strcmp(a, "--quality") == 0) {
+            if ((k = opt_choice(a, v, QUALITY, 3, why, why_len)) < 0)
+                return -1;
+            o->mp->min_quality = 2 - k; /* JANAS_LLM_QUALITY_* */
+            *o->profile = k == 2;       /* the catalog's choices: low */
         } else if (strcmp(a, "--profile") == 0) {
+            /* the older name: quality is high, fast is low */
             if ((k = opt_choice(a, v, PROFILES, 2, why, why_len)) < 0)
                 return -1;
+            o->mp->min_quality =
+                k ? JANAS_LLM_QUALITY_LOW : JANAS_LLM_QUALITY_HIGH;
             *o->profile = k;
         } else if (strcmp(a, "--models") == 0) {
             setenv("JANAS_MODELS", v, 1); /* read when the model is found */
@@ -1069,6 +1214,18 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
  */
 /* A question answered with one key. Piped in, nobody is there to answer:
    the caller asked for it in writing and that is the answer. */
+/* A key for a question: a window resized meanwhile (SIGWINCH, no
+   SA_RESTART) is not an answer, Ctrl+C is (no) */
+static int answer_byte(unsigned char *k)
+{
+    for (;;) {
+        int r = tty_byte(k);
+        if (r < 0 && errno == EINTR && !interrupted)
+            continue;
+        return r;
+    }
+}
+
 static int ask_yes(const char *question)
 {
     if (!term.tty)
@@ -1076,7 +1233,7 @@ static int ask_yes(const char *question)
     term_printf(&term, "%s [y/N] ", question);
     term_raw(&term, 1);
     unsigned char k = 0;
-    if (tty_byte(&k) < 0)
+    if (answer_byte(&k) < 0)
         k = 0;
     term_raw(&term, 0);
     int yes = k == 'y' || k == 'Y';
@@ -1222,6 +1379,14 @@ static void conf_write(const char *path, const struct chat_opts *o)
         fprintf(f, "--no-markdown\n");
     if (!*o->gpu)
         fprintf(f, "--no-gpu\n");
+    for (int k = 0; k < JANAS_DEVICES_OPTIONS; k++)
+        if (o->devices[k]) {
+            char nm[64];
+            janas_devices_name(o->devices[k], nm, sizeof nm);
+            fprintf(f, "%s %s\n", janas_devices_options[k], nm);
+        }
+    if (*o->npu_int8)
+        fprintf(f, "--npu-int8\n");
     if (*o->mcp_config)
         fprintf(f, "--mcp-config %s\n", *o->mcp_config);
     if (!*o->mcp)
@@ -1234,8 +1399,12 @@ static void conf_write(const char *path, const struct chat_opts *o)
         fprintf(f, "--mcp-auto\n");
     if (*o->mcp_instructions)
         fprintf(f, "--mcp-instructions\n");
-    if (*o->profile)
-        fprintf(f, "--profile fast\n");
+    if (m->min_quality == JANAS_LLM_QUALITY_HIGH)
+        fprintf(f, "--quality high\n");
+    else if (m->min_quality == JANAS_LLM_QUALITY_MEDIUM)
+        fprintf(f, "--quality medium\n");
+    else if (*o->profile) /* asked for: with the catalog's choices */
+        fprintf(f, "--quality low\n");
     fclose(f);
     term_printf(&term, "written to %s (the system message is not kept)\n",
                 path);
@@ -1274,7 +1443,7 @@ static int ask_key(const char *question)
     term_printf(&term, "%s ", question);
     term_raw(&term, 1);
     unsigned char k = 0;
-    if (tty_byte(&k) < 0)
+    if (answer_byte(&k) < 0)
         k = 0;
     term_raw(&term, 0);
     if (k >= 'A' && k <= 'Z')
@@ -1369,12 +1538,18 @@ static int run_calls(janas_llm_chat *c, int autorun)
            for every time, even with --mcp-auto: never "always"; shown
            whole, since the user says yes to what it holds */
         int writes = mcpc_writes(name);
-        int cut = writes ? INT_MAX : 400;
-        term_printf(&term, "%s→ %s%s %s%.*s%s%s\n",
-                    mcpc_own(name) && !writes ? T_DIM(&term) : T_CMD(&term),
-                    name, T_DIM(&term), "", cut, args,
-                    strlen(args) > (size_t)cut ? " ..." : "", T_RESET(&term));
         int go = !writes && (autorun || mcpc_always(name) || mcpc_own(name));
+        /* whole where the user is asked: a yes (or an always) is to all of
+           it, not to its first 400 bytes */
+        int cut = go ? 400 : INT_MAX;
+        char *sname = term_cleaned(name), *sargs = term_cleaned(args);
+        term_printf(
+            &term, "%s→ %s%s %s%.*s%s%s\n",
+            mcpc_own(name) && !writes ? T_DIM(&term) : T_CMD(&term),
+            sname ? sname : "?", T_DIM(&term), "", cut, sargs ? sargs : "?",
+            sargs && strlen(sargs) > (size_t)cut ? " ..." : "", T_RESET(&term));
+        free(sname);
+        free(sargs);
         char *key = call_key(name, args);
         if (failed_before(key)) {
             go = 0;
@@ -1412,24 +1587,31 @@ static int run_calls(janas_llm_chat *c, int autorun)
                     term_printf(&term, "%s\n", janas_llm_last_error());
                 free(more);
                 /* and the next reply is a call: told to call one, a small
-                   model (Qwen3.5-0.8B) still made up the weather instead */
-                janas_llm_chat_tool_choice(c, JANAS_LLM_TOOLS_REQUIRED, NULL, 0,
-                                           1);
+                   model (Qwen3.5-0.8B) still made up the weather instead;
+                   and to one of the service's own tools: Qwen3.8-Flash-Next
+                   (two bits a weight) opened the service again and again,
+                   its name being that of its tools' prefix (22 Oct 2026) */
+                janas_llm_chat_tool_choice(c, JANAS_LLM_TOOLS_REQUIRED,
+                                           mcpc_opened_prefix(), -1, 1);
             }
             if (rc != 0 && key && failed.n < FAILED_MAX) {
                 failed.call[failed.n++] = key;
                 key = NULL;
             }
-            const char *t = texts[i] ? texts[i] : "";
-            size_t line = strcspn(t, "\n");
+            char *t = term_cleaned(texts[i] ? texts[i] : "");
+            const char *tt = t ? t : "";
+            size_t line = strcspn(tt, "\n");
             term_printf(
                 &term, "%s%s%.*s%s%s\n", rc ? T_WARN(&term) : T_DIM(&term),
-                rc > 0 ? "tool error: " : "", (int)(line < 200 ? line : 200), t,
-                line < strlen(t) || line > 200 ? " ..." : "", T_RESET(&term));
+                rc > 0 ? "tool error: " : "", (int)(line < 200 ? line : 200),
+                tt, line < strlen(tt) || line > 200 ? " ..." : "",
+                T_RESET(&term));
+            free(t);
             if (shown && *shown) {
                 /* the user's, as the tool wrote it (a page): the model
                    has only a note of it */
                 term_gap(&term);
+                shown[term_clean(shown, strlen(shown))] = 0;
                 term_printf(&term, "%s\n", shown);
             }
             free(shown);
@@ -1481,8 +1663,7 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
     struct janas_md md;
     md_init(&md, &term, markdown);
     term_puts(&term, T_MODEL(&term));
-    while ((rc = janas_llm_chat_next(c, piece, sizeof(piece), &len)) ==
-           JANAS_LLM_OK) {
+    while ((rc = engine_next(c, piece, sizeof(piece), &len)) == JANAS_LLM_OK) {
         /* the reasoning in grey: the colour changes only where the
            reasoning starts and ends */
         int th = janas_llm_chat_thinking(c);
@@ -1498,9 +1679,19 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
             if (conv.back)
                 scroll_draw(&term, &conv); /* re-wrapped to the new width */
         }
-        md_write(&md, piece, (size_t)len);
         if (len > 0)
             tail = piece[len - 1];
+        /* what the model writes drives no terminal; its tabs (code) four
+           spaces */
+        char wide[4 * sizeof(piece)];
+        size_t wn = 0;
+        for (int32_t i = 0; i < len; i++)
+            if (piece[i] == '\t')
+                for (int k = 0; k < 4; k++)
+                    wide[wn++] = ' ';
+            else
+                wide[wn++] = piece[i];
+        md_write(&md, wide, term_clean(wide, wn));
         fflush(stdout);
         struct janas_llm_chat_stats rs = {.size = sizeof(rs)};
         if (len == 0 && janas_llm_chat_stats(c, &rs) == JANAS_LLM_OK &&
@@ -1559,6 +1750,19 @@ static int show_reply(const janas_llm *llm, janas_llm_chat *c, int markdown,
             sess_seconds += st.output_seconds;
         }
     }
+    /* the NPU made ready meanwhile: said once, so a slow first reply is
+       understood */
+    static double npu_said;
+    double ns = 0;
+    if (term.tty && janas_llm_npu_preparing(llm, NULL, NULL, &ns) == 0 &&
+        ns > npu_said + 0.5) {
+        term_gap(&term);
+        term_printf(&term,
+                    "%s[the NPU made ready for this model in %.0f s, "
+                    "once a session]%s\n",
+                    T_DIM(&term), ns - npu_said, T_RESET(&term));
+        npu_said = ns;
+    }
     if (stats) {
         term_gap(&term);
         report(c);
@@ -1570,8 +1774,14 @@ int main(int argc, char **argv)
 {
     janas_env_check("janas-chat");
     /* wcwidth() answers for the locale's character set, and in the C locale
-       it answers -1 to everything past ASCII: ask for the user's own */
+       it answers -1 to everything past ASCII: ask for the user's own. Not on
+       Windows, where wcwidth() is not used (term.h) and the user's locale
+       did harm: msvcrt then translated what was written to the console from
+       that locale's code page, so the UTF-8 came out as CP1251 under a
+       Ukrainian one, "в–„" for "▄" (issue #44) */
+#ifndef _WIN32
     setlocale(LC_CTYPE, "");
+#endif
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();
@@ -1602,13 +1812,15 @@ int main(int argc, char **argv)
     int gpu = 1;      /* the GPU may be given work, if there is one */
     const char *mcp_config = NULL; /* NULL: the default file */
     int mcp = 1, mcp_auto = 0, mcp_instructions = 0, services = 1, no_mtp = 0;
-    int all_tools = 0, profile = 0, tune = 0;
+    /* profile: the catalog's faster choices, at --quality low asked */
+    int all_tools = 0, profile = 0, tune = 0, npu_int8 = 0;
+    int devices[JANAS_DEVICES_OPTIONS] = {0, 0, 0};
     static char mtp_found[4096];
     struct chat_opts o = {
         &mp,       &cp,         &system_arg, &stats,     &markdown,
         &gpu,      &mcp_config, &mcp,        &mcp_auto,  &mcp_instructions,
         &services, &no_mtp,     mtp_found,   &all_tools, &profile,
-        &tune};
+        &tune,     devices,     &npu_int8};
     /*
      * The settings in layers, each over the one before: the catalog's
      * profile for the model, the chat's own file, the model's file, the
@@ -1617,6 +1829,8 @@ int main(int argc, char **argv)
      */
     char cpath[1024];
     char *conf_text = NULL, *mconf_text = NULL;
+    char **old_texts = NULL; /* those /load-config replaced, freed at the end */
+    int n_old_texts = 0;
     int cn = 0, mn = 0;
     char **cw = conf_path(cpath, sizeof(cpath), 0, NULL) == 0
                     ? conf_read(cpath, &cn, &conf_text)
@@ -1639,18 +1853,32 @@ int main(int argc, char **argv)
     char **mw = conf_path(mpath, sizeof(mpath), 0, cm.key) == 0
                     ? conf_read(mpath, &mn, &mconf_text)
                     : NULL;
-    const char *pv = chat_words_last(argc - oi, argv + oi, "--profile");
-    if (!pv)
-        pv = chat_words_last(mn, mw, "--profile");
-    if (!pv)
-        pv = chat_words_last(cn, cw, "--profile");
+    /* the quality asked (--quality, or --profile its older name): typed,
+       else the model's file, else the chat's; low when none says */
+    const char *qs[3][2] = {
+        {chat_words_last(argc - oi, argv + oi, "--quality"),
+         chat_words_last(argc - oi, argv + oi, "--profile")},
+        {chat_words_last(mn, mw, "--quality"),
+         chat_words_last(mn, mw, "--profile")},
+        {chat_words_last(cn, cw, "--quality"),
+         chat_words_last(cn, cw, "--profile")}};
+    const char *qv = NULL;
+    int asked = 0;
+    for (int i = 0; i < 3 && !qv; i++)
+        if ((qv = qs[i][0] ? qs[i][0] : qs[i][1]) != NULL)
+            asked = 1;
+    /* low by default lets the engine choose by the machine (memory short:
+       faster, plenty: the file's quality); asked for, it adds the
+       catalog's choices measured faster on this model whatever the
+       machine (the head at four bits, say) */
+    int low = asked && (!strcmp(qv, "low") || !strcmp(qv, "fast"));
     char why[400];
-    if (pv && strcmp(pv, "fast") == 0) {
+    if (low) {
         const char *fw = cm.entry ? cm.entry->fast : NULL;
-        if (!fw)
-            fprintf(stderr, "profile fast: nothing measured faster on this "
-                            "model yet, so the same as quality\n");
-        else {
+        if (!fw) {
+            fprintf(stderr, "quality low: nothing measured faster on this "
+                            "model beyond the engine's own choices\n");
+        } else {
             /* the catalog's words, split on spaces */
             static char fbuf[256];
             char *pw[16];
@@ -1663,7 +1891,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "janas-chat: catalog: %s\n", why);
                 return 2;
             }
-            fprintf(stderr, "profile fast: %s\n", fw);
+            fprintf(stderr,
+                    "quality low: %s (measured faster on this "
+                    "model; --quality high keeps the file's)\n",
+                    fw);
         }
     }
     /* the levers the user set, in any file or typed: the measure leaves
@@ -1852,6 +2083,7 @@ int main(int argc, char **argv)
         idle_llm = llm;
         idle_chat = c;
         line_idle = footer_idle;
+        watch_start(llm);
     } else
         fprintf(stderr, "%s\n/help for the commands\n", desc);
     prep_start(c);
@@ -1944,7 +2176,15 @@ int main(int argc, char **argv)
                     if (take_options(cn, cw, &o, bad, sizeof bad) != 0)
                         term_printf(&term, "%s: %s\n", cpath, bad);
                     free(cw);
-                    free(conf_text); /* the older words are let go */
+                    /* the older words stay: options not in the new file
+                       (an MTP path, the MCP configuration) still point
+                       into them, and /save-config reads those */
+                    char **ot = realloc(old_texts, (size_t)(n_old_texts + 1) *
+                                                       sizeof(*ot));
+                    if (ot) {
+                        old_texts = ot;
+                        old_texts[n_old_texts++] = conf_text;
+                    }
                     conf_text = text;
                     if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
                         term_printf(&term, "%s\n", janas_llm_last_error());
@@ -2020,6 +2260,30 @@ int main(int argc, char **argv)
                 }
                 janas_llm_experts(llm, &used, &most);
                 term_printf(&term, "%d experts per token of %d\n", used, most);
+            } else if (strcmp(msg, "/image") == 0) {
+                /* a picture for the next message, read now */
+                FILE *f = *arg ? fopen(arg, "rb") : NULL;
+                long fn = -1;
+                char *data = NULL;
+                if (f && fseek(f, 0, SEEK_END) == 0 && (fn = ftell(f)) > 0 &&
+                    fn <= (32L << 20) && fseek(f, 0, SEEK_SET) == 0 &&
+                    (data = malloc((size_t)fn)) &&
+                    fread(data, 1, (size_t)fn, f) != (size_t)fn) {
+                    free(data);
+                    data = NULL;
+                }
+                if (f)
+                    fclose(f);
+                if (!*arg)
+                    term_printf(&term, "/image <file>: a PNG or a JPEG\n");
+                else if (!data)
+                    term_printf(&term, "cannot read %s\n", arg);
+                else if (janas_llm_chat_image(c, data, fn) != JANAS_LLM_OK)
+                    term_printf(&term, "%s\n", janas_llm_last_error());
+                else
+                    term_printf(&term, "the picture goes with your next "
+                                       "message\n");
+                free(data);
             } else if (strcmp(msg, "/temp") == 0 && *arg) {
                 cp.temperature = (float)atof(arg);
                 if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
@@ -2088,6 +2352,7 @@ int main(int argc, char **argv)
         footer(llm, c, NULL);
     }
     prep_wait(llm, 1);
+    watch_stop();
     failed_clear();
     free(msg);
     free(system);
@@ -2097,6 +2362,9 @@ int main(int argc, char **argv)
     janas_llm_close(llm);
     scroll_free(&conv);
     free(conf_text);
+    for (int i = 0; i < n_old_texts; i++)
+        free(old_texts[i]);
+    free(old_texts);
     if (term.tty) {
         hist_save(&history);
         hist_free(&history);
