@@ -144,6 +144,8 @@ void janas_llm_chat_destroy(janas_llm_chat *c)
         free(c->memo[i].ids);
     }
     free(c->rtext);
+    janas_api_pics_free(c->pics, c->n_pics);
+    free(c->idpics);
     free(c);
 }
 
@@ -246,12 +248,25 @@ int janas_api_add_special(janas_llm_chat *c, int32_t id)
     return 0;
 }
 
+/* The newline after a turn's end: ChatML's and Gemma's, none in Llama 3. */
+int janas_api_end_turn_nl(janas_llm_chat *c)
+{
+    return c->llm->format == FORMAT_LLAMA3 ? 0 : janas_api_add_text(c, "\n", 1);
+}
+
 /* One message of the conversation, in the model's format. */
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n)
 {
     const janas_llm *llm = c->llm;
     switch (llm->format) {
+    case FORMAT_LLAMA3:
+        return janas_api_add_special(c, llm->im_start) ||
+               janas_api_add_text(c, role, strlen(role)) ||
+               janas_api_add_special(c, llm->hdr_end) ||
+               janas_api_add_text(c, "\n\n", 2) ||
+               janas_api_add_text(c, text, n) ||
+               janas_api_add_special(c, llm->im_end);
     case FORMAT_CHATML:
     default:
         return janas_api_add_special(c, llm->im_start) ||
@@ -259,11 +274,12 @@ int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                janas_api_add_text(c, "\n", 1) ||
                janas_api_add_text(c, text, n) ||
                janas_api_add_special(c, llm->im_end) ||
-               janas_api_add_text(c, "\n", 1);
+               janas_api_end_turn_nl(c);
     }
 }
 
-/* The start of the sequence: Gemma's <bos>, nothing for ChatML. */
+/* The start of the sequence: Gemma's <bos>, Llama 3's <|begin_of_text|>,
+   nothing for ChatML. */
 int janas_api_begin_sequence(janas_llm_chat *c)
 {
     return c->llm->bos >= 0 ? janas_api_add_special(c, c->llm->bos) : 0;
@@ -292,6 +308,12 @@ int janas_api_start_reply(janas_llm_chat *c)
                janas_api_add_text(c, "thought\n", 8) ||
                janas_api_add_special(c, llm->think_close) ||
                janas_api_flush_text(c);
+    case FORMAT_LLAMA3:
+        c->in_think = 0;
+        return janas_api_add_special(c, llm->im_start) ||
+               janas_api_add_text(c, "assistant", 9) ||
+               janas_api_add_special(c, llm->hdr_end) ||
+               janas_api_add_text(c, "\n\n", 2) || janas_api_flush_text(c);
     case FORMAT_CHATML:
     default:
         if (janas_api_add_special(c, llm->im_start) ||
@@ -361,12 +383,48 @@ int janas_api_add_markup(janas_llm_chat *c, const char *s, size_t n)
     return janas_api_add_text(c, s + from, n - from);
 }
 
+const char *janas_api_think_note(const janas_llm_chat *c)
+{
+    const janas_llm *llm = c->llm;
+    return llm->format == FORMAT_CHATML && llm->thinker && c->p.thinking != 0 &&
+                   llm->think_note[0]
+               ? llm->think_note
+               : NULL;
+}
+
 /* The system message, with the tools when there are: the dialect's
-   template writes them into it. */
+   template writes them into it. While the model reasons, its words on
+   reasoning (janas_api_think_note) at the top, before the tools, as its
+   template writes them: the message trimmed after them. */
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
 {
     const janas_llm *llm = c->llm;
     c->tools_tokens = 0;
+    const char *note = janas_api_think_note(c);
+    struct janas_buf nb = {0};
+    if (note && llm->format == FORMAT_CHATML) {
+        while (n && sys &&
+               (*sys == ' ' || *sys == '\n' || *sys == '\t' || *sys == '\r'))
+            sys++, n--;
+        while (n && (sys[n - 1] == ' ' || sys[n - 1] == '\n' ||
+                     sys[n - 1] == '\t' || sys[n - 1] == '\r'))
+            n--;
+        janas_buf_puts(&nb, note);
+        if (n && (!c->tools_sys || llm->tools == JANAS_TOOLS_NONE)) {
+            janas_buf_puts(&nb, "\n\n");
+            janas_buf_put(&nb, sys, n);
+        }
+        if (nb.oom) {
+            janas_buf_free(&nb);
+            return -1;
+        }
+        if (!c->tools_sys || llm->tools == JANAS_TOOLS_NONE) {
+            int err = janas_api_add_message(c, "system", nb.p, nb.n);
+            janas_buf_free(&nb);
+            return err;
+        }
+        janas_buf_puts(&nb, "\n\n"); /* before the tools */
+    }
     if (llm->format == FORMAT_GEMMA) {
         /* a system turn only when there is something to say: the message,
            or <|think|> at its top when reasoning is asked for */
@@ -383,7 +441,7 @@ int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
                              janas_api_add_text(c, "\n", 1))) ||
                   janas_api_add_markup(c, b.p, b.n) ||
                   janas_api_add_special(c, llm->im_end) ||
-                  janas_api_add_text(c, "\n", 1);
+                  janas_api_end_turn_nl(c);
         janas_buf_free(&b);
         return err ? -1 : 0;
     }
@@ -392,21 +450,34 @@ int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n)
     /* how many of its tokens the tools take: the message without them is
        built and taken back, for the count alone */
     size_t ids0 = c->n_ids;
-    if (janas_api_flush_text(c) != 0)
+    if (janas_api_flush_text(c) != 0) {
+        janas_buf_free(&nb);
         return -1;
+    }
     ids0 = c->n_ids;
-    if (janas_api_add_message(c, "system", sys ? sys : "", n) != 0 ||
-        janas_api_flush_text(c) != 0)
+    /* the words on reasoning are the message's, not the tools' */
+    size_t nn = nb.n;
+    if (n)
+        janas_buf_put(&nb, sys, n);
+    if (nb.oom ||
+        janas_api_add_message(c, "system", nb.p ? nb.p : "", nb.n) != 0 ||
+        janas_api_flush_text(c) != 0) {
+        janas_buf_free(&nb);
         return -1;
+    }
+    nb.n = nn;
     size_t plain = c->n_ids - ids0;
     c->n_ids = ids0;
     struct janas_buf b = {0};
+    if (nb.n)
+        janas_buf_put(&b, nb.p, nb.n);
+    janas_buf_free(&nb);
     janas_tools_system(&b, llm->tools, c->tools_sys, sys, n);
     int err = b.oom || janas_api_add_special(c, llm->im_start) ||
               janas_api_add_text(c, "system\n", 7) ||
               janas_api_add_markup(c, b.p, b.n) ||
               janas_api_add_special(c, llm->im_end) ||
-              janas_api_add_text(c, "\n", 1) || janas_api_flush_text(c);
+              janas_api_end_turn_nl(c) || janas_api_flush_text(c);
     janas_buf_free(&b);
     if (!err && c->n_ids - ids0 > plain)
         c->tools_tokens = (uint32_t)(c->n_ids - ids0 - plain);
@@ -446,10 +517,11 @@ static int recap(janas_llm_chat *c)
         memcpy(keep, c->ids, n_keep * sizeof(int32_t));
     }
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     int err = 0;
     if (!c->closed)
         err |= janas_api_add_special(c, c->llm->im_end);
-    err |= janas_api_add_text(c, "\n", 1);
+    err |= janas_api_end_turn_nl(c);
     err |= janas_api_add_message(c, "user", RECAP_ASK, strlen(RECAP_ASK));
     err |= janas_api_start_reply(c);
     if (!err && janas_llm_session_append(c->s, c->ids, (uint32_t)c->n_ids) == 0)
@@ -550,8 +622,10 @@ int32_t janas_llm_chat_prepare(janas_llm_chat *c, int32_t *done, int32_t *total)
         if (janas_llm_session_length(c->s) > 0 || c->replying)
             return 0; /* the conversation has started */
         c->n_ids = c->n_text = 0;
+        c->n_idpics = 0;
         int err = janas_api_begin_sequence(c);
-        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA)
+        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA ||
+            janas_api_think_note(c))
             err |= janas_api_add_system(c, c->system,
                                         c->system ? strlen(c->system) : 0);
         err |= janas_api_flush_text(c);
@@ -778,6 +852,7 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
     }
     janas_api_reply_clear(c);
     c->n_ids = c->n_text = 0;
+    c->n_idpics = 0;
     int err = ans.oom;
     /* (ans is freed once written, below) */
     if (gemma_answers) {
@@ -792,11 +867,12 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
            it was cut and gets one now; then the newline after it */
         if (!c->closed)
             err |= janas_api_add_special(c, c->llm->im_end);
-        err |= janas_api_add_text(c, "\n", 1);
+        err |= janas_api_end_turn_nl(c);
     } else {
         /* the start: <bos> where the format has one, the system message */
         err |= janas_api_begin_sequence(c);
-        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA)
+        if (c->system || c->tools_sys || c->llm->format == FORMAT_GEMMA ||
+            janas_api_think_note(c))
             err |= janas_api_add_system(c, c->system,
                                         c->system ? strlen(c->system) : 0);
         c->sys_tokens = (uint32_t)c->n_ids;
@@ -815,9 +891,10 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
             err |= janas_api_add_markup(c, "\n</tool_response>", 17);
         }
         err |= janas_api_add_special(c, c->llm->im_end) ||
-               janas_api_add_text(c, "\n", 1);
+               janas_api_end_turn_nl(c);
     } else {
-        err |= janas_api_add_message(c, "user", text, n);
+        /* the pictures queued: before the text, as the template has it */
+        err |= janas_api_add_user(c, text, n, c->pics, c->n_pics);
     }
     err |= janas_api_flush_text(c);
     size_t reply_off = c->n_ids;
@@ -863,6 +940,16 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
         c->replying = 0;
         return janas_api_fail(JANAS_LLM_EFULL,
                               "the context is full (%u tokens)", c->llm->n_ctx);
+    }
+    /* the pictures' embeddings where their tokens are */
+    if (c->n_idpics) {
+        int bad = janas_api_media_register(c, at, 0);
+        c->n_idpics = 0;
+        janas_api_pics_free(c->pics, c->n_pics);
+        c->pics = NULL;
+        c->n_pics = 0;
+        if (bad)
+            return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
     }
     if (janas_api_begin_reply(c, at + (uint32_t)reply_off,
                               at + (uint32_t)c->n_ids, at) != 0)

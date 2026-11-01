@@ -162,6 +162,89 @@ static void run(struct janas_pool *pool, uint32_t n_head, uint32_t n_kv,
 }
 
 /*
+ * A span that attends both ways (a picture's tokens, janas_attn_set_last):
+ * n tokens from pos0, the picture's at pic .. pic_end - 1 seeing up to its
+ * end, run as the engine runs a block - JANAS_ATTN_MAX_BLOCK tokens a call,
+ * the span cut by a call's end - against the reference over the positions
+ * each token sees. Not fed to the checksum.
+ */
+static void run_both(struct janas_pool *pool, uint32_t pos0, uint32_t n,
+                     uint32_t pic, uint32_t pic_end)
+{
+    uint32_t n_head = 16, n_kv = 2, hd = 128, n_ctx = 1024;
+    struct janas_attn *a = janas_attn_create(
+        n_head, n_kv, hd, n_ctx, janas_pool_size(pool), JANAS_ATTN_FLOAT);
+    size_t qd = (size_t)n_head * hd, kv = (size_t)n_kv * n_ctx * hd;
+    size_t nsc = (size_t)n_kv * n_ctx;
+    int8_t *K = malloc(kv), *V = malloc(kv);
+    float *ks = malloc(nsc * sizeof(float)), *vs = malloc(nsc * sizeof(float));
+    float *q = malloc(n * qd * sizeof(float)), *out = malloc(n * qd * 4);
+    uint32_t *last = malloc(n * sizeof(uint32_t));
+    double *ref = malloc(hd * sizeof(double));
+    for (size_t i = 0; i < kv; i++) {
+        K[i] = (int8_t)(int)(rndf(-127, 127));
+        V[i] = (int8_t)(int)(rndf(-127, 127));
+    }
+    for (size_t i = 0; i < nsc; i++) {
+        ks[i] = rndf(0.001f, 0.02f);
+        vs[i] = rndf(0.001f, 0.02f);
+    }
+    for (size_t i = 0; i < n * qd; i++)
+        q[i] = rndf(-3, 3);
+    for (uint32_t j = 0; j < n; j++) {
+        uint32_t p = pos0 + j;
+        last[j] = p >= pic && p < pic_end ? pic_end - 1 : p;
+    }
+    for (uint32_t s = 0; s < n; s += JANAS_ATTN_MAX_BLOCK) {
+        uint32_t len =
+            n - s < JANAS_ATTN_MAX_BLOCK ? n - s : JANAS_ATTN_MAX_BLOCK;
+        janas_attn_set_last(a, last + s);
+        janas_attn_run(a, pool, q + s * qd, K, ks, V, vs, len, pos0 + s,
+                       out + s * qd);
+    }
+    double worst = 0;
+    uint32_t group = n_head / n_kv;
+    for (uint32_t j = 0; j < n; j++)
+        for (uint32_t h = 0; h < n_head; h++) {
+            size_t base = (size_t)(h / group) * n_ctx * hd;
+            size_t sb = (size_t)(h / group) * n_ctx;
+            reference(q + j * qd + (size_t)h * hd, K + base, ks + sb, V + base,
+                      vs + sb, last[j] + 1, hd, ref);
+            for (uint32_t i = 0; i < hd; i++) {
+                double e = fabs(ref[i] - out[j * qd + (size_t)h * hd + i]);
+                if (e > worst)
+                    worst = e;
+            }
+        }
+    /* and the call after, causal again: set_last holds for one call */
+    janas_attn_run(a, pool, q, K, ks, V, vs, 1, pos0 + n, out);
+    for (uint32_t h = 0; h < n_head; h++) {
+        size_t base = (size_t)(h / group) * n_ctx * hd;
+        size_t sb = (size_t)(h / group) * n_ctx;
+        reference(q + (size_t)h * hd, K + base, ks + sb, V + base, vs + sb,
+                  pos0 + n + 1, hd, ref);
+        for (uint32_t i = 0; i < hd; i++) {
+            double e = fabs(ref[i] - out[(size_t)h * hd + i]);
+            if (e > worst)
+                worst = e;
+        }
+    }
+    CHECK(worst < 1e-5, "both ways, picture %u..%u in %u..%u: error %g", pic,
+          pic_end - 1, pos0, pos0 + n - 1, worst);
+    printf("both ways, picture %4u..%4u in %4u..%4u: error %.2e\n", pic,
+           pic_end - 1, pos0, pos0 + n - 1, worst);
+    free(K);
+    free(V);
+    free(ks);
+    free(vs);
+    free(q);
+    free(out);
+    free(last);
+    free(ref);
+    janas_attn_destroy(a);
+}
+
+/*
  * Gemma 4's settings: keys and values of sixteen bits, a sliding window and
  * a score scale of 1, against a double-precision reference that sees the
  * same positions. Not fed to the checksum, which stays that of the
@@ -272,6 +355,9 @@ int main(void)
     run16(pool, 16, 8, 256, 2048, 700, 64, 256); /* a window of 256 */
     run16(pool, 16, 1, 512, 1024, 250, 17, 0);   /* Gemma 4's full layers */
     run16(pool, 16, 8, 256, 2048, 1030, 5, 1024);
+    run_both(pool, 200, 100, 230, 290); /* across a call and a chunk */
+    run_both(pool, 0, 64, 0, 64);       /* the whole call */
+    run_both(pool, 500, 200, 510, 690); /* over three calls */
     janas_pool_destroy(pool);
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

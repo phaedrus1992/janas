@@ -20,15 +20,20 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "common/devices.h"
+#include "common/npu.h"
 #include "common/sysinfo.h"
 #include "llm/arch.h"
 #include "llm/attention.h"
 #include "llm/expert_cache.h"
 #include "llm/generate.h"
+#include "llm/gpu.h"
 #include "llm/jns.h"
 #include "llm/model.h"
+#include "llm/quant.h"
 #include "llm/tokenizer.h"
 #include "llm/chat.h"
+#include "llm/vision.h"
 #include "llm/metrics.h"
 
 static _Thread_local char last_error[256];
@@ -92,6 +97,42 @@ static uint64_t file_size(const char *path)
     return stat(path, &st) == 0 ? (uint64_t)st.st_size : 0;
 }
 
+/* The words a template puts at the top of the system message while the
+   model reasons, at the effort it takes when none is asked for, into
+   llm->think_note; empty where it has none. Qwen3.8's:
+     {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+     ...
+     {%- if resolved_reasoning_effort == 'xhigh' %}
+         {%- set reasoning_instructions = 'Reasoning effort is set to ...' %}
+   read from the template rather than written here, so that another
+   model's words, or another default, are its own. */
+static void find_think_note(janas_llm *llm, const char *tmpl)
+{
+    static const char DEF[] = "reasoning_effort|default('",
+                      SET[] = "set reasoning_instructions = '";
+    llm->think_note[0] = 0;
+    const char *d = strstr(tmpl, DEF);
+    if (!d)
+        return;
+    d += sizeof DEF - 1;
+    const char *e = strchr(d, '\'');
+    if (!e || e - d > 32)
+        return;
+    char key[64];
+    snprintf(key, sizeof key, "== '%.*s' %%}", (int)(e - d), d);
+    const char *k = strstr(tmpl, key);
+    const char *s = k ? strstr(k, SET) : NULL;
+    if (!s)
+        return;
+    s += sizeof SET - 1;
+    const char *q = strchr(s, '\'');
+    if (!q || (size_t)(q - s) >= sizeof llm->think_note ||
+        memchr(s, '\\', (size_t)(q - s)))
+        return; /* too long, or escaped: left out rather than cut */
+    memcpy(llm->think_note, s, (size_t)(q - s));
+    llm->think_note[q - s] = 0;
+}
+
 /* Recognizes the chat format from the template in tmpl; returns 0 or an
    error code. */
 static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
@@ -100,7 +141,7 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
     llm->im_start = janas_tokenizer_find(llm->tok, "<|im_start|>");
     llm->im_end = janas_tokenizer_find(llm->tok, "<|im_end|>");
     llm->asst_role = "assistant";
-    llm->bos = llm->think_on = -1;
+    llm->bos = llm->think_on = llm->hdr_end = -1;
     llm->quote = llm->decl_open = llm->decl_close = -1;
     int32_t turn_open = janas_tokenizer_find(llm->tok, "<|turn>");
     int32_t turn_close = janas_tokenizer_find(llm->tok, "<turn|>");
@@ -141,6 +182,25 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
             llm->tools = JANAS_TOOLS_NONE;
         if (llm->tools != JANAS_TOOLS_NONE)
             llm->stop[llm->n_stop++] = llm->resp_open;
+    } else if (janas_tokenizer_find(llm->tok, "<|start_header_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|end_header_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|eot_id|>") >= 0 &&
+               janas_tokenizer_find(llm->tok, "<|begin_of_text|>") >= 0 &&
+               (tmpl[0] == 0 || strstr(tmpl, "<|start_header_id|>"))) {
+        /* Llama 3, a base model too: no reasoning, no tools yet */
+        llm->format = FORMAT_LLAMA3;
+        llm->im_start = janas_tokenizer_find(llm->tok, "<|start_header_id|>");
+        llm->hdr_end = janas_tokenizer_find(llm->tok, "<|end_header_id|>");
+        llm->im_end = janas_tokenizer_find(llm->tok, "<|eot_id|>");
+        llm->bos = janas_tokenizer_find(llm->tok, "<|begin_of_text|>");
+        llm->stop[llm->n_stop++] = llm->im_end;
+        int32_t eom = janas_tokenizer_find(llm->tok, "<|eom_id|>");
+        if (eom >= 0)
+            llm->stop[llm->n_stop++] = eom;
+        llm->think_open = llm->think_close = -1;
+        llm->call_open = llm->call_close = -1;
+        llm->resp_open = llm->resp_close = -1;
+        llm->tools = JANAS_TOOLS_NONE;
     } else if (llm->im_start >= 0 && llm->im_end >= 0 &&
                (tmpl[0] == 0 || strstr(tmpl, "<|im_start|>"))) {
         llm->format = FORMAT_CHATML;
@@ -149,6 +209,11 @@ static int32_t find_format_in(janas_llm *llm, const struct janas_jns *j,
         llm->think_close = janas_tokenizer_find(llm->tok, "</think>");
         llm->thinker = strstr(tmpl, "enable_thinking") &&
                        llm->think_open >= 0 && llm->think_close >= 0;
+        if (llm->thinker)
+            find_think_note(llm, tmpl);
+        llm->think_kept =
+            llm->thinker && strstr(tmpl, "preserve_thinking is undefined or "
+                                         "preserve_thinking is true") != NULL;
         /* tools: the template says how calls are written, the vocabulary
            must have the markers as tokens of their own */
         llm->call_open = janas_tokenizer_find(llm->tok, "<tool_call>");
@@ -199,6 +264,283 @@ static int32_t find_format(janas_llm *llm, const struct janas_jns *j)
     return rc;
 }
 
+/*
+ * What a model takes besides its expert cache, from its file's header and
+ * metadata, for n_ctx tokens of context: janas_llm_open's estimate, and
+ * janas_llm_estimate's, the one same reckoning.
+ */
+struct mem_need {
+    uint64_t resident;   /* the resident weights the engine reads in */
+    uint64_t experts;    /* a cache holding every expert slot */
+    uint64_t kv_token;   /* keys and values a token of context */
+    uint64_t ring_bytes; /* sliding-window layers' rings, all positions */
+    uint32_t ring;       /* their positions */
+    uint64_t attn_part;  /* attention's partial results beside the cache */
+    uint64_t scratch;    /* a pass's scratch */
+    uint64_t npu;        /* the NPU's copies of its matrices (model_npu.c) */
+    uint64_t table;      /* the per-layer table, read a row at a time unless the
+                            memory holds it (janas_llm_options ple_ram) */
+};
+
+/*
+ * The memory the NPU's copies will take, if an NPU is there to use
+ * (JANAS_NPU not 0): its matrices - the resident ones a block's products
+ * read, and a dense model's feed-forwards - in INT8, within
+ * JANAS_NPU_MAX_MB, times 1.3 for what its driver keeps (measured 0.3-1.3
+ * on Meteor Lake, 20 Oct 2026), and 128 MB for the compiler. Taken from the
+ * expert cache's share: without it the copies came on top of a cache sized
+ * to the memory, and Qwen3-Next-80B ran out of it as the NPU's
+ * configurations began. Every type the NPU takes (until 22 Oct 2026 only
+ * Q4_K, Q5_K, Q6_K and Q8_0 were counted, and a model of other types,
+ * Qwen3.8-Flash-Next's Q2_0, Q3_K and IQ4_XS, would have had its copies on
+ * top of the cache), and qwen4exp's bf16 mixes at two bytes a weight
+ * (model_hc.c, in FP16 on the NPU).
+ */
+static uint64_t npu_need(const struct janas_jns *j)
+{
+    const char *e = getenv("JANAS_NPU");
+    if ((e && atoi(e) <= 0) || !janas_npu_available())
+        return 0;
+    uint64_t n = 0, r0 = j->h.resident_offset, r1 = r0 + j->h.resident_bytes;
+    for (uint64_t i = 0; i < j->h.n_tensor; i++) {
+        const struct janas_jns_tensor *t = &j->tensors[i];
+        int type = (int)t->type;
+        /* not the tables (token_embd, and per_layer_token_embd: read a row
+           at a time) */
+        if (t->n_dims != 2 || t->offset < r0 || t->offset >= r1 ||
+            strstr(t->name, "token_embd") || !strcmp(t->name, "output.weight"))
+            continue;
+        /* bf16: the mixes of the streams and the n-gram layer's value */
+        int mix = type == 30 && t->dims[1] >= 64 &&
+                  (strstr(t->name, "hc_down") || strstr(t->name, "hc_up") ||
+                   strstr(t->name, "ple_value") || strstr(t->name, "indexer"));
+        if (mix)
+            n += 2 * t->dims[0] * t->dims[1];
+        else if (janas_llm_npu_type(type))
+            n += t->dims[0] * t->dims[1];
+    }
+    for (uint32_t l = 0; j->h.n_expert <= 1 && l < j->h.n_layer; l++)
+        for (int k = 0; k < 3; k++)
+            n += (uint64_t)j->layers[l].m[k].rows * j->layers[l].m[k].cols;
+    const char *mb = getenv("JANAS_NPU_MAX_MB");
+    uint64_t budget = (uint64_t)(mb && atol(mb) > 0 ? atol(mb) : 4096) << 20;
+    if (n > budget)
+        n = budget;
+    return n ? n / 10 * 13 + ((uint64_t)128 << 20) : 0;
+}
+
+static void mem_need(const struct janas_jns *j, uint32_t n_ctx, int mtp_file,
+                     uint32_t min_block, struct mem_need *e)
+{
+    char arch[32] = "";
+    janas_jns_meta_str(j, "general.architecture", arch, sizeof(arch));
+    uint64_t resident = j->h.resident_bytes, table = 0;
+    /* less the per-layer table (Gemma 4's embeddings, Qwen3.8-Flash-Next's
+       n-grams), read from the file a row at a time unless the memory holds
+       it (janas_llm_open) */
+    const struct janas_jns_tensor *ple =
+        janas_jns_tensor(j, "per_layer_token_embd.weight");
+    if (ple && ple->bytes < resident) {
+        resident -= ple->bytes;
+        table = ple->bytes;
+    }
+    /* what the cache would need to hold every slot at once. Not the size of
+       the expert region: the cache's slots are all as big as the largest, so
+       where the layers differ (a down matrix in Q6_K in one and Q4_K in the
+       next) the region is smaller than the room the same slots take in it.
+       A dense model is the case that cannot survive the difference - its one
+       expert a layer is wanted at every token, in order, so a cache one slot
+       short of the layers is a cache that never hits. An MTP block in the
+       file with larger experts has slots of its own (expert_cache.h
+       create_split), and none is asked of it when the block comes in a
+       file of its own (model_load.c). */
+    uint32_t n_main = janas_llm_main_layers(j);
+    uint64_t experts =
+        janas_expert_cache_room(j, mtp_file ? n_main : j->h.n_layer, n_main, 3);
+    if (experts < j->h.experts_bytes)
+        experts = j->h.experts_bytes;
+    /* what a token of context costs: keys and values of the layers that
+       have them, one byte a number with a scale per position and KV head */
+    uint32_t n_layer = j->h.n_layer, kv_heads = 0, kv_len = 0, train = 0;
+    char key[96];
+    snprintf(key, sizeof(key), "%.32s.attention.head_count_kv", arch);
+    janas_jns_meta_u32(j, key, &kv_heads);
+    snprintf(key, sizeof(key), "%.32s.attention.key_length", arch);
+    janas_jns_meta_u32(j, key, &kv_len);
+    snprintf(key, sizeof(key), "%.32s.context_length", arch);
+    janas_jns_meta_u32(j, key, &train);
+    uint64_t kv_token = (uint64_t)n_layer * kv_heads * (kv_len * 2 + 8);
+    /* hybrids that give one count for all layers (Qwen3-Next, Qwen3.5 and
+       3.6): only every full_attention_interval-th layer has keys and values
+       (see model.c), plus the one of a prediction block. Counted on all of
+       them, 262144 tokens of Qwen3-Next-80B took 13.1 GB from the expert
+       cache for 3.3 GB of cache, and the engine fell back to four bits and
+       eight experts to fit (23 Sep 2026) */
+    const struct janas_arch *a = janas_arch_find(arch, sizeof(arch));
+    if (a && a->rec != JANAS_REC_NONE) {
+        uint32_t interval = 4;
+        snprintf(key, sizeof(key), "%.32s.full_attention_interval", arch);
+        janas_jns_meta_u32(j, key, &interval);
+        if (interval > 0)
+            kv_token = (uint64_t)(n_layer / interval + 1) * kv_heads *
+                       (kv_len * 2 + 8);
+    }
+    /* hybrids say it layer by layer, with nothing where the layer is
+       recurrent: those keep a state of fixed size instead of a cache */
+    uint64_t n_arr = 0, n_pat = 0;
+    const int32_t *per_layer = NULL;
+    /* Gemma 4: sliding-window layers with a head size of their own, and an
+       attention (its partial results) for each kind of layer */
+    const uint8_t *pat = NULL;
+    uint32_t len_swa = 0, kv_swa = 0, window = 0;
+    /* a sliding-window layer keeps a ring of positions (model_load.c): a
+       fixed amount, counted apart from the tokens */
+    uint64_t ring_bytes = 0;
+    uint32_t ring = 0;
+    snprintf(key, sizeof(key), "%.32s.attention.sliding_window", arch);
+    if (janas_jns_meta_u32(j, key, &window) == 0 && window) {
+        const char *rg = getenv("JANAS_SWA_RING");
+        ring = janas_attn_ring_positions(window,
+                                         janas_llm_prefill_block(j, min_block));
+        if (ring >= n_ctx || (rg && atoi(rg) == 0))
+            ring = 0;
+    }
+    snprintf(key, sizeof(key), "%.32s.attention.sliding_window_pattern", arch);
+    if (janas_jns_meta_bytes(j, key, &n_pat, &pat) != 0 || n_pat != n_layer)
+        pat = NULL;
+    snprintf(key, sizeof(key), "%.32s.attention.key_length_swa", arch);
+    janas_jns_meta_u32(j, key, &len_swa);
+    /* E2B and E4B: one count of KV heads for both kinds, and the last
+       shared_kv_layers layers reading earlier layers' keys and values */
+    uint32_t shared = 0;
+    snprintf(key, sizeof(key), "%.32s.attention.shared_kv_layers", arch);
+    janas_jns_meta_u32(j, key, &shared);
+    snprintf(key, sizeof(key), "%.32s.attention.head_count_kv", arch);
+    int arr = janas_jns_meta_ints(j, key, &n_arr, &per_layer) == 0 &&
+              per_layer && n_arr == n_layer;
+    if (arr || (pat && kv_heads)) {
+        uint32_t one = kv_heads;
+        kv_token = 0;
+        for (uint64_t i = 0; i + shared < n_layer; i++) {
+            int32_t h = (int32_t)one;
+            if (arr)
+                memcpy(&h, per_layer + i, sizeof(h));
+            uint32_t len = pat && pat[i] && len_swa ? len_swa : kv_len;
+            /* keys and values of one byte a number, or two (Gemma 4) */
+            uint64_t per =
+                h > 0 ? (uint64_t)h * (len * (a && a->kv16 ? 4 : 2) + 8) : 0;
+            if (pat && pat[i] && ring)
+                ring_bytes += per * ring;
+            else
+                kv_token += per;
+            if (h > 0 && pat && pat[i])
+                kv_swa = (uint32_t)h;
+            else if (h > 0 && pat)
+                kv_heads = (uint32_t)h;
+        }
+    }
+    if (!kv_token || kv_token > (1 << 20))
+        kv_token = 64 << 10; /* unsaid or odd: the old bound */
+    /* qwen4exp's sparse attention: its indexer keeps every position's key
+       at half precision and each block's pooled key at full in every
+       attention layer (model_qsa.c) - 4.5 KB a position on
+       Qwen3.8-Flash-Next, 1.2 GB at 262,144 tokens, uncounted until 22 Oct
+       2026 */
+    uint32_t ix_heads = 0, ix_dim = 0;
+    snprintf(key, sizeof(key), "%.32s.attention.indexer.head_count", arch);
+    if (janas_jns_meta_u32(j, key, &ix_heads) == 0 && ix_heads) {
+        snprintf(key, sizeof(key), "%.32s.attention.indexer.key_length", arch);
+        janas_jns_meta_u32(j, key, &ix_dim);
+        uint64_t ratio = 0;
+        snprintf(key, sizeof(key), "%.32s.attention.compress_ratios", arch);
+        for (uint32_t l = 0; !ratio && l < n_layer; l++)
+            if (janas_jns_meta_uint_at(j, key, l, &ratio, NULL) != 0)
+                break;
+        uint32_t interval = 1;
+        snprintf(key, sizeof(key), "%.32s.full_attention_interval", arch);
+        if (a && a->rec != JANAS_REC_NONE &&
+            (janas_jns_meta_u32(j, key, &interval) != 0 || interval == 0))
+            interval = 4;
+        uint64_t n_attn = n_layer / interval;
+        if (ratio)
+            kv_token += n_attn * ix_dim * 2 + n_attn * ix_dim * 4 / ratio;
+    }
+    /* and what attention keeps beside the cache, which grows with the
+       context as well: uncounted, 262,144 tokens of Qwen3-Next-80B put
+       1.08 GB of partial results in the margin left to other programs */
+    uint32_t n_head = 0;
+    snprintf(key, sizeof(key), "%.32s.attention.head_count", arch);
+    janas_jns_meta_u32(j, key, &n_head);
+    uint64_t attn_part =
+        n_head && kv_heads && kv_len
+            ? janas_attn_part_bytes(n_head, kv_heads, kv_len, n_ctx)
+            : 0;
+    if (pat && n_head && kv_swa && len_swa)
+        attn_part += janas_attn_part_bytes(n_head, kv_swa, len_swa,
+                                           ring ? ring : n_ctx) +
+                     ring_bytes;
+    /* and the scratch of a pass, which grows with the prefill block
+       (janas_llm_model_max_block): per token, the rows of its experts (gate,
+       up, their product, down) and a few rows of the model's width. An
+       estimate from the shapes, on the generous side */
+    uint32_t embd = 0, ff = 0, k_used = 1;
+    snprintf(key, sizeof(key), "%.32s.embedding_length", arch);
+    janas_jns_meta_u32(j, key, &embd);
+    snprintf(key, sizeof(key), "%.32s.expert_feed_forward_length", arch);
+    if (janas_jns_meta_u32(j, key, &ff) != 0) {
+        snprintf(key, sizeof(key), "%.32s.feed_forward_length", arch);
+        const int32_t *ffs = NULL;
+        uint64_t n_ff = 0;
+        if (janas_jns_meta_u32(j, key, &ff) != 0 &&
+            janas_jns_meta_ints(j, key, &n_ff, &ffs) == 0 && ffs)
+            for (uint64_t i = 0; i < n_ff; i++) { /* E2B: the widest */
+                int32_t v;
+                memcpy(&v, ffs + i, sizeof(v));
+                if (v > 0 && (uint32_t)v > ff)
+                    ff = (uint32_t)v;
+            }
+    }
+    snprintf(key, sizeof(key), "%.32s.expert_used_count", arch);
+    janas_jns_meta_u32(j, key, &k_used);
+    uint64_t blk = janas_llm_prefill_block(j, min_block);
+    if (blk < 256)
+        blk = 256;
+    uint64_t scratch =
+        blk * (((uint64_t)k_used + 1) * (3ull * ff + embd) + 32ull * embd) *
+        sizeof(float);
+    /* qwen4exp: a block's residual streams and n-gram rows beside it
+       (model_hc.c janas_m_hc_alloc), some seven rows of hc times the width
+       a token - 81 MB on Qwen3.8-Flash-Next, uncounted until 22 Oct 2026,
+       when the estimate fell 0.27 GiB short of the memory measured */
+    uint32_t hc = 0;
+    snprintf(key, sizeof(key), "%.32s.hyper_connection.count", arch);
+    if (janas_jns_meta_u32(j, key, &hc) == 0 && hc)
+        scratch += blk * (8ull * hc * embd + 4ull * embd) * sizeof(float);
+    *e = (struct mem_need){.resident = resident,
+                           .experts = experts,
+                           .kv_token = kv_token,
+                           .ring_bytes = ring_bytes,
+                           .ring = ring,
+                           .attn_part = attn_part,
+                           .scratch = scratch,
+                           .npu = npu_need(j),
+                           .table = table};
+}
+
+/* What a model needs whatever its expert cache: the resident weights, the
+   keys and values of p->n_ctx tokens, the attention's partial results, a
+   pass's scratch and the MTP file, which the engine holds whole (its
+   experts' cache takes every one), with 256 MiB beside it. */
+static uint64_t mem_fixed(const struct mem_need *e,
+                          const struct janas_llm_params *p)
+{
+    uint64_t need = e->resident + (uint64_t)p->n_ctx * e->kv_token +
+                    e->attn_part + e->scratch + e->npu;
+    if (p->mtp_path)
+        need += file_size(p->mtp_path) + ((uint64_t)256 << 20);
+    return need;
+}
+
 int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
                        janas_llm **out)
 {
@@ -234,10 +576,12 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     janas_jns_meta_str(&j, "general.name", name, sizeof(name));
     janas_jns_meta_str(&j, "general.architecture", arch, sizeof(arch));
     int32_t rc = 0;
-    /* byte-level BPE with Qwen's pre-tokenizers, or Gemma 4's */
-    int known = (strcmp(kind, "gpt2") == 0 &&
-                 (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0)) ||
-                strcmp(kind, "gemma4") == 0;
+    /* byte-level BPE with Qwen's or Llama 3's pre-tokenizers, or Gemma 4's */
+    int known =
+        (strcmp(kind, "gpt2") == 0 &&
+         (strcmp(pre, "qwen2") == 0 || strcmp(pre, "qwen35") == 0 ||
+          strcmp(pre, "llama-bpe") == 0 || strcmp(pre, "pixtral") == 0)) ||
+        strcmp(kind, "gemma4") == 0;
     if (!known)
         rc = janas_api_fail(JANAS_LLM_EMODEL, "tokenizer %s/%s not supported",
                             kind, pre);
@@ -245,151 +589,11 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         rc = janas_api_fail(JANAS_LLM_EMODEL, "tokenizer: %s", err);
     else
         rc = find_format(llm, &j);
-    uint64_t resident = j.h.resident_bytes;
-    /* less Gemma 4's per-layer embeddings, read from the file a row at a
-       time (model_ple.c) */
-    const struct janas_jns_tensor *ple =
-        janas_jns_tensor(&j, "per_layer_token_embd.weight");
-    if (ple && ple->bytes < resident)
-        resident -= ple->bytes;
-    /* what the cache would need to hold every slot at once. Not the size of
-       the expert region: the cache's slots are all as big as the largest, so
-       where the layers differ (a down matrix in Q6_K in one and Q4_K in the
-       next) the region is smaller than the room the same slots take in it.
-       A dense model is the case that cannot survive the difference - its one
-       expert a layer is wanted at every token, in order, so a cache one slot
-       short of the layers is a cache that never hits. */
-    uint64_t slot = 0;
-    for (uint32_t l = 0; l < j.h.n_layer; l++)
-        if (j.layers[l].slot_bytes > slot)
-            slot = j.layers[l].slot_bytes;
-    uint64_t experts = (uint64_t)j.h.n_layer * j.h.n_expert * slot;
-    if (experts < j.h.experts_bytes)
-        experts = j.h.experts_bytes;
-    /* what a token of context costs: keys and values of the layers that
-       have them, one byte a number with a scale per position and KV head */
-    uint32_t n_layer = j.h.n_layer, kv_heads = 0, kv_len = 0, train = 0;
-    char key[96];
-    snprintf(key, sizeof(key), "%.32s.attention.head_count_kv", arch);
-    janas_jns_meta_u32(&j, key, &kv_heads);
-    snprintf(key, sizeof(key), "%.32s.attention.key_length", arch);
-    janas_jns_meta_u32(&j, key, &kv_len);
-    snprintf(key, sizeof(key), "%.32s.context_length", arch);
-    janas_jns_meta_u32(&j, key, &train);
-    uint64_t kv_token = (uint64_t)n_layer * kv_heads * (kv_len * 2 + 8);
-    /* hybrids that give one count for all layers (Qwen3-Next, Qwen3.5 and
-       3.6): only every full_attention_interval-th layer has keys and values
-       (see model.c), plus the one of a prediction block. Counted on all of
-       them, 262144 tokens of Qwen3-Next-80B took 13.1 GB from the expert
-       cache for 3.3 GB of cache, and the engine fell back to four bits and
-       eight experts to fit (23 Sep 2026) */
-    const struct janas_arch *a = janas_arch_find(arch, sizeof(arch));
-    if (a && a->rec != JANAS_REC_NONE) {
-        uint32_t interval = 4;
-        snprintf(key, sizeof(key), "%.32s.full_attention_interval", arch);
-        janas_jns_meta_u32(&j, key, &interval);
-        if (interval > 0)
-            kv_token = (uint64_t)(n_layer / interval + 1) * kv_heads *
-                       (kv_len * 2 + 8);
-    }
-    /* hybrids say it layer by layer, with nothing where the layer is
-       recurrent: those keep a state of fixed size instead of a cache */
-    uint64_t n_arr = 0, n_pat = 0;
-    const int32_t *per_layer = NULL;
-    /* Gemma 4: sliding-window layers with a head size of their own, and an
-       attention (its partial results) for each kind of layer */
-    const uint8_t *pat = NULL;
-    uint32_t len_swa = 0, kv_swa = 0, window = 0;
-    /* a sliding-window layer keeps a ring of positions (model_load.c): a
-       fixed amount, counted apart from the tokens */
-    uint64_t ring_bytes = 0;
-    uint32_t ring = 0;
-    snprintf(key, sizeof(key), "%.32s.attention.sliding_window", arch);
-    if (janas_jns_meta_u32(&j, key, &window) == 0 && window) {
-        const char *rg = getenv("JANAS_SWA_RING");
-        ring = janas_attn_ring_positions(window, janas_llm_prefill_block(&j));
-        if (ring >= p.n_ctx || (rg && atoi(rg) == 0))
-            ring = 0;
-    }
-    snprintf(key, sizeof(key), "%.32s.attention.sliding_window_pattern", arch);
-    if (janas_jns_meta_bytes(&j, key, &n_pat, &pat) != 0 || n_pat != n_layer)
-        pat = NULL;
-    snprintf(key, sizeof(key), "%.32s.attention.key_length_swa", arch);
-    janas_jns_meta_u32(&j, key, &len_swa);
-    /* E2B and E4B: one count of KV heads for both kinds, and the last
-       shared_kv_layers layers reading earlier layers' keys and values */
-    uint32_t shared = 0;
-    snprintf(key, sizeof(key), "%.32s.attention.shared_kv_layers", arch);
-    janas_jns_meta_u32(&j, key, &shared);
-    snprintf(key, sizeof(key), "%.32s.attention.head_count_kv", arch);
-    int arr = janas_jns_meta_ints(&j, key, &n_arr, &per_layer) == 0 &&
-              per_layer && n_arr == n_layer;
-    if (arr || (pat && kv_heads)) {
-        uint32_t one = kv_heads;
-        kv_token = 0;
-        for (uint64_t i = 0; i + shared < n_layer; i++) {
-            int32_t h = (int32_t)one;
-            if (arr)
-                memcpy(&h, per_layer + i, sizeof(h));
-            uint32_t len = pat && pat[i] && len_swa ? len_swa : kv_len;
-            /* keys and values of one byte a number, or two (Gemma 4) */
-            uint64_t per =
-                h > 0 ? (uint64_t)h * (len * (a && a->kv16 ? 4 : 2) + 8) : 0;
-            if (pat && pat[i] && ring)
-                ring_bytes += per * ring;
-            else
-                kv_token += per;
-            if (h > 0 && pat && pat[i])
-                kv_swa = (uint32_t)h;
-            else if (h > 0 && pat)
-                kv_heads = (uint32_t)h;
-        }
-    }
-    if (!kv_token || kv_token > (1 << 20))
-        kv_token = 64 << 10; /* unsaid or odd: the old bound */
-    /* and what attention keeps beside the cache, which grows with the
-       context as well: uncounted, 262,144 tokens of Qwen3-Next-80B put
-       1.08 GB of partial results in the margin left to other programs */
-    uint32_t n_head = 0;
-    snprintf(key, sizeof(key), "%.32s.attention.head_count", arch);
-    janas_jns_meta_u32(&j, key, &n_head);
-    uint64_t attn_part =
-        n_head && kv_heads && kv_len
-            ? janas_attn_part_bytes(n_head, kv_heads, kv_len, p.n_ctx)
-            : 0;
-    if (pat && n_head && kv_swa && len_swa)
-        attn_part += janas_attn_part_bytes(n_head, kv_swa, len_swa,
-                                           ring ? ring : p.n_ctx) +
-                     ring_bytes;
-    /* and the scratch of a pass, which grows with the prefill block
-       (janas_llm_model_max_block): per token, the rows of its experts (gate,
-       up, their product, down) and a few rows of the model's width. An
-       estimate from the shapes, on the generous side */
-    uint32_t embd = 0, ff = 0, k_used = 1;
-    snprintf(key, sizeof(key), "%.32s.embedding_length", arch);
-    janas_jns_meta_u32(&j, key, &embd);
-    snprintf(key, sizeof(key), "%.32s.expert_feed_forward_length", arch);
-    if (janas_jns_meta_u32(&j, key, &ff) != 0) {
-        snprintf(key, sizeof(key), "%.32s.feed_forward_length", arch);
-        const int32_t *ffs = NULL;
-        uint64_t n_ff = 0;
-        if (janas_jns_meta_u32(&j, key, &ff) != 0 &&
-            janas_jns_meta_ints(&j, key, &n_ff, &ffs) == 0 && ffs)
-            for (uint64_t i = 0; i < n_ff; i++) { /* E2B: the widest */
-                int32_t v;
-                memcpy(&v, ffs + i, sizeof(v));
-                if (v > 0 && (uint32_t)v > ff)
-                    ff = (uint32_t)v;
-            }
-    }
-    snprintf(key, sizeof(key), "%.32s.expert_used_count", arch);
-    janas_jns_meta_u32(&j, key, &k_used);
-    uint64_t blk = janas_llm_prefill_block(&j);
-    if (blk < 256)
-        blk = 256;
-    uint64_t scratch =
-        blk * (((uint64_t)k_used + 1) * (3ull * ff + embd) + 32ull * embd) *
-        sizeof(float);
+    struct mem_need e;
+    /* a vision encoder beside it whose pictures attend both ways: the
+       prefill block holds a picture whole */
+    uint32_t pic_block = janas_api_picture_block(path);
+    mem_need(&j, p.n_ctx, p.mtp_path != NULL, pic_block, &e);
     janas_jns_close(&j);
     if (rc != 0) {
         janas_tokenizer_destroy(llm->tok);
@@ -409,16 +613,58 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
             reserve = (uint64_t)2 << 30;
     }
     uint64_t cache = p.cache_bytes;
+    int no_npu = 0;
     if (cache == 0) {
-        uint64_t avail = janas_mem_available(), need = resident;
-        need += reserve;
-        need += (uint64_t)p.n_ctx * kv_token + attn_part + scratch;
-        if (p.mtp_path)
-            need += file_size(p.mtp_path) + ((uint64_t)256 << 20);
+        uint64_t avail = janas_mem_available(),
+                 need = mem_fixed(&e, &p) + reserve;
         cache = avail > need + ((uint64_t)1 << 30) ? avail - need
                                                    : (uint64_t)1 << 30;
-        if (cache > experts)
-            cache = experts;
+        /*
+         * The NPU's copies come out of the cache's share only where the
+         * cache still holds every expert without that memory (a dense
+         * model's feed-forwards are its experts): elsewhere the cache needs
+         * it more. Qwen3.8-27B wrote 1.7 tokens/s with a cache of 10.9 GiB,
+         * 5.4 GiB having gone to copies for an NPU the engine then left
+         * alone, the GPU reading its prompts faster; it wrote 4.4 without
+         * (21 Oct 2026). There the NPU stays off, unless the user asks it
+         * to read the prompts (--prompt-on npu).
+         */
+        if (e.npu && cache < e.experts) {
+            char why[96];
+            int on =
+                janas_devices_mask(getenv("JANAS_PROMPT_ON"), why, sizeof why);
+            if (on <= 0 || !(on & (1 << JANAS_DEV_NPU |
+                                   1 << (JANAS_DEV_GPU | JANAS_DEV_NPU)))) {
+                uint64_t need0 = need - e.npu;
+                no_npu = 1;
+                cache = avail > need0 + ((uint64_t)1 << 30) ? avail - need0
+                                                            : (uint64_t)1 << 30;
+            }
+        }
+        if (cache > e.experts)
+            cache = e.experts;
+    }
+    /*
+     * The per-layer table in memory where the machine holds it beside a
+     * cache of every expert - the experts first: a token reads hundreds of
+     * them and a few rows of the table (Qwen3.8-Flash-Next: 480 experts,
+     * 16 rows of 90 bytes) - read a row at a time from the file where the
+     * memory is short (the development laptop's 30 GB). JANAS_PLE_RAM=1
+     * asks for it, the cache giving it the room; 0 never.
+     */
+    int table_ram = 0;
+    if (e.table) {
+        const char *pr = getenv("JANAS_PLE_RAM");
+        /* the NPU's copies only where it stays on */
+        uint64_t avail = janas_mem_available();
+        uint64_t need =
+            mem_fixed(&e, &p) - (no_npu ? e.npu : 0) + reserve + e.table;
+        table_ram = pr ? atoi(pr) > 0
+                       : p.cache_bytes == 0 &&
+                             avail > need + e.experts + ((uint64_t)1 << 30);
+        if (table_ram && p.cache_bytes == 0 && cache + need > avail)
+            cache = avail > need + ((uint64_t)1 << 30) ? avail - need
+                                                       : (uint64_t)1 << 30;
     }
     /* compute: every usable core (the tuner picks how many per pass);
        I/O: the efficiency cores, or unpinned */
@@ -442,7 +688,15 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         .warm = !p.no_preload,
         .expert_bits = p.expert_bits,
         .attn_scores = p.attn_scores,
-        .head_bits = p.head_bits};
+        .head_bits = p.head_bits,
+        .min_quality = p.min_quality < JANAS_LLM_QUALITY_LOW ||
+                               p.min_quality > JANAS_LLM_QUALITY_HIGH
+                           ? JANAS_LLM_QUALITY_LOW
+                           : p.min_quality,
+        .no_npu = no_npu,
+        .ple_ram = table_ram,
+        .min_block = pic_block};
+    llm->path = strdup(path);
     llm->m = janas_llm_model_load(path, &mo, err, sizeof(err));
     if (!llm->m) {
         janas_tokenizer_destroy(llm->tok);
@@ -513,6 +767,11 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
         w += snprintf(bits + w, sizeof(bits) - (size_t)w,
                       ", output head at 4 bits (%.0f -> %.0f MB)", d0 / 1e6,
                       d1 / 1e6);
+    const char *hq = janas_llm_model_hc_quant(llm->m, &d0, &d1);
+    if (hq && w >= 0 && (size_t)w < sizeof(bits))
+        w += snprintf(bits + w, sizeof(bits) - (size_t)w,
+                      ", mixes of the streams %s (%.0f -> %.0f MB)", hq,
+                      d0 / 1e6, d1 / 1e6);
     int h16 = janas_llm_model_head16(llm->m, &d0, &d1);
     if (h16 && w >= 0 && (size_t)w < sizeof(bits))
         snprintf(bits + w, sizeof(bits) - (size_t)w,
@@ -520,9 +779,9 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
                  h16 == 30 ? "BF16" : "F16", d0 / 1e6, d1 / 1e6);
     llm->cache_bytes = cache;
     llm->reserve_bytes = reserve;
-    llm->kv_token = kv_token;
-    llm->kv_ring = ring;
-    llm->kv_ring_token = ring ? ring_bytes / ring : 0;
+    llm->kv_token = e.kv_token;
+    llm->kv_ring = e.ring;
+    llm->kv_ring_token = e.ring ? e.ring_bytes / e.ring : 0;
     llm->n_compute = mo.n_compute;
     snprintf(llm->arch, sizeof(llm->arch), "%s", arch);
     snprintf(llm->bits, sizeof(llm->bits), "%s", bits);
@@ -530,6 +789,54 @@ int32_t janas_llm_open(const char *path, const struct janas_llm_params *pp,
     *out = llm;
     janas_metrics_open(llm, janas_api_now() - t_open);
     return JANAS_LLM_OK;
+}
+
+int32_t janas_llm_estimate(const char *path, const struct janas_llm_params *pp,
+                           uint64_t *fixed, uint64_t *experts)
+{
+    struct janas_llm_params p;
+    janas_llm_params_default(&p);
+    if (!path)
+        return janas_api_fail(JANAS_LLM_EINVAL, "no path");
+    if (pp) {
+        if (pp->size < sizeof(uint32_t) || pp->size > sizeof(p))
+            return janas_api_fail(JANAS_LLM_EINVAL, "parameters: unknown size");
+        memcpy(&p, pp, pp->size);
+        p.size = sizeof(p);
+    }
+    if (p.n_ctx == 0)
+        p.n_ctx = 16384;
+    struct janas_jns j;
+    char err[256] = "";
+    if (janas_jns_open(path, &j, err, sizeof(err)) != 0)
+        return janas_api_fail(JANAS_LLM_EOPEN, "%s: %s", path, err);
+    struct mem_need e;
+    /* a vision encoder beside it whose pictures attend both ways: the
+       prefill block holds a picture whole */
+    uint32_t pic_block = janas_api_picture_block(path);
+    mem_need(&j, p.n_ctx, p.mtp_path != NULL, pic_block, &e);
+    janas_jns_close(&j);
+    if (fixed)
+        *fixed = mem_fixed(&e, &p);
+    if (experts)
+        *experts = e.experts;
+    return 0;
+}
+
+int32_t janas_llm_memory(const janas_llm *llm, uint64_t *resident,
+                         uint64_t *cache, uint64_t *kv)
+{
+    if (!llm)
+        return janas_api_fail(JANAS_LLM_EINVAL, "no model");
+    uint64_t r, c, k;
+    janas_llm_model_memory(llm->m, &r, &c, &k);
+    if (resident)
+        *resident = r;
+    if (cache)
+        *cache = c;
+    if (kv)
+        *kv = k;
+    return 0;
 }
 
 void janas_llm_close(janas_llm *llm)
@@ -542,6 +849,8 @@ void janas_llm_close(janas_llm *llm)
     janas_llm_model_free(llm->draft);
     janas_llm_model_free(llm->m);
     janas_tokenizer_destroy(llm->tok);
+    janas_vision_close(llm->vis);
+    free(llm->path);
     free(llm);
 }
 
@@ -604,6 +913,14 @@ int32_t janas_llm_preload(const janas_llm *llm, int64_t *done, int64_t *total)
     if (total)
         *total = (int64_t)janas_llm_model_warm(llm->m, NULL);
     return JANAS_LLM_OK;
+}
+
+int32_t janas_llm_npu_preparing(const janas_llm *llm, int32_t *done,
+                                int32_t *total, double *seconds)
+{
+    if (!llm)
+        return janas_api_fail(JANAS_LLM_EINVAL, "no model");
+    return janas_llm_model_npu_preparing(llm->m, done, total, seconds);
 }
 
 int32_t janas_llm_set_experts(janas_llm *llm, int32_t n)
@@ -683,7 +1000,7 @@ int32_t janas_llm_describe(const janas_llm *llm, char *buf, int32_t cap,
      * runs. The same goes for the attention, which the context decides.
      */
     janas_llm *w = (janas_llm *)llm;
-    char gpubuf[224];
+    char gpubuf[448];
     snprintf(gpubuf, sizeof(gpubuf), ", no GPU (%s)",
              janas_llm_model_gpu_why(llm->m));
     const char *gpu = gpubuf;
@@ -705,6 +1022,12 @@ int32_t janas_llm_describe(const janas_llm *llm, char *buf, int32_t cap,
             snprintf(gpubuf, sizeof(gpubuf), ", GPU present (active, on %s)",
                      list);
             gpu = gpubuf;
+        }
+        /* what the check on opening left out on this driver */
+        const char *note = janas_gpu_check_note(janas_llm_model_gpu(llm->m));
+        if (note[0] && gpu == gpubuf) {
+            size_t n = strlen(gpubuf);
+            snprintf(gpubuf + n - 1, sizeof(gpubuf) - n + 1, "; %s)", note);
         }
     }
     char attn[64] = "";

@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <cpuid.h>
 #include <powrprof.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -289,6 +290,26 @@ uint64_t janas_mem_total(void)
 {
     MEMORYSTATUSEX m = {.dwLength = sizeof m};
     return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;
+}
+
+uint64_t janas_rss_bytes(void)
+{
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)
+               ? pmc.WorkingSetSize
+               : 0;
+}
+
+size_t janas_l2_bytes(void)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD len = sizeof(info);
+    if (!GetLogicalProcessorInformation(info, &len))
+        return 0;
+    for (DWORD i = 0; i < len / sizeof(info[0]); i++)
+        if (info[i].Relationship == RelationCache && info[i].Cache.Level == 2)
+            return info[i].Cache.Size;
+    return 0;
 }
 
 #endif /* _WIN32 */

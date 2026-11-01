@@ -16,6 +16,11 @@
 
 struct srv_store;
 
+/* A document (its two texts) at most, and all of them in memory at most:
+   past the second the oldest go, whatever their kind. */
+#define SRV_STORE_DOC_MAX ((size_t)64 << 20)
+#define SRV_STORE_MAX ((size_t)1 << 30)
+
 /* cap: documents of each kind at most, the oldest dropped (0: 1000). In
    memory only. */
 struct srv_store *srv_store_new(size_t cap);
@@ -29,14 +34,15 @@ void srv_store_free(struct srv_store *st);
 size_t srv_store_count(struct srv_store *st);
 
 /* Keeps a copy (replacing one of the same kind and id); aux may be NULL.
-   0, or -1 on memory. */
+   0, -1 on memory, -3 larger than SRV_STORE_DOC_MAX. */
 int srv_store_put(struct srv_store *st, const char *kind, const char *id,
                   int64_t created, const char *json, const char *aux);
 /* Copies of the document (json, aux: either may be NULL, and *aux is NULL
    when there is none): 0, -1 not found, -2 memory. */
 int srv_store_get(struct srv_store *st, const char *kind, const char *id,
                   char **json, char **aux);
-/* New texts for a document (NULL: unchanged): 0, -1 not found, -2 memory. */
+/* New texts for a document (NULL: unchanged): 0, -1 not found, -2 memory,
+   -3 larger than SRV_STORE_DOC_MAX. */
 int srv_store_update(struct srv_store *st, const char *kind, const char *id,
                      const char *json, const char *aux);
 /* 0, or -1 not found. */

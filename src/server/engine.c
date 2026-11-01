@@ -28,8 +28,10 @@ struct srv_engine {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     struct srv_job *head, *tail;
+    struct srv_job *running; /* the job being run, or NULL */
     uint32_t queued, max_queue;
     int stop;
+    int closing; /* the server is stopping: no client's request taken */
     int verbose;
     uint32_t max_input, warn_input;
     struct srv_fim *fim; /* the windows of fill-in-the-middle requests */
@@ -98,6 +100,7 @@ void srv_job_release(struct srv_job *j)
         }
         free(m->call_name);
         free(m->call_args);
+        srv_imgs_free(m->imgs, m->n_imgs);
     }
     free(j->msg);
     for (int i = 0; i < j->n_prompts; i++) {
@@ -155,6 +158,13 @@ static int grow(char **buf, size_t *n, size_t *cap, const char *s, size_t k)
     *n += k;
     (*buf)[*n] = 0;
     return 0;
+}
+
+/* The client went away, or the submitter's flag says stop (j->mu held, or
+   the flag alone). */
+static int stopped(const struct srv_job *j)
+{
+    return j->cancel || (j->watch && atomic_load(j->watch));
 }
 
 /* The first of the stop strings in the answer at or after `from`, or -1. */
@@ -294,13 +304,12 @@ static int32_t setup(struct srv_engine *e, struct srv_job *j)
  */
 static int32_t ids_text(struct srv_engine *e, struct srv_prompt *pp)
 {
-    char buf[256];
+    char buf[1024]; /* as long as the library's longest token */
     size_t cap = 0;
     for (size_t i = 0; i < pp->n_ids; i++) {
         int32_t n = 0;
         if (janas_llm_token_text(e->llm, pp->ids[i], buf, sizeof(buf), &n) !=
-                JANAS_LLM_OK &&
-            n < (int32_t)sizeof(buf))
+            JANAS_LLM_OK)
             return JANAS_LLM_EINVAL; /* not a token of this model */
         if (pp->n + (size_t)n + 1 > cap) {
             cap = 2 * (pp->n + (size_t)n) + 256;
@@ -363,7 +372,12 @@ static int32_t load(struct srv_engine *e, struct srv_job *j, int k)
     int32_t rc = janas_llm_chat_begin(c);
     for (int32_t i = 0; rc == JANAS_LLM_OK && i < j->n_msg; i++) {
         const struct srv_msg *m = &j->msg[i];
-        rc = janas_llm_chat_add(c, m->role, m->text, (int32_t)m->n);
+        /* its pictures first: they go with the message added next */
+        for (int k = 0; rc == JANAS_LLM_OK && k < m->n_imgs; k++)
+            rc =
+                janas_llm_chat_image(c, m->imgs[k].data, (int64_t)m->imgs[k].n);
+        if (rc == JANAS_LLM_OK)
+            rc = janas_llm_chat_add(c, m->role, m->text, (int32_t)m->n);
         for (int k = 0; rc == JANAS_LLM_OK && k < m->n_calls; k++)
             rc = janas_llm_chat_add_call(c, m->call_name[k], -1,
                                          m->call_args[k], -1);
@@ -460,7 +474,7 @@ static int32_t run_one(struct srv_engine *e, struct srv_job *j, int k)
                     ch->by_stop = 1;
             }
         }
-        int quit = j->cancel || ch->by_stop || bad || rc == JANAS_LLM_DONE;
+        int quit = stopped(j) || ch->by_stop || bad || rc == JANAS_LLM_DONE;
         pthread_cond_broadcast(&j->cv);
         pthread_mutex_unlock(&j->mu);
         if (bad) {
@@ -505,7 +519,12 @@ static int32_t count(struct srv_engine *e, struct srv_job *j)
     int32_t rc = janas_llm_chat_begin(c), n = 0;
     for (int32_t i = 0; rc == JANAS_LLM_OK && i < j->n_msg; i++) {
         const struct srv_msg *m = &j->msg[i];
-        rc = janas_llm_chat_add(c, m->role, m->text, (int32_t)m->n);
+        /* its pictures first: they go with the message added next */
+        for (int k = 0; rc == JANAS_LLM_OK && k < m->n_imgs; k++)
+            rc =
+                janas_llm_chat_image(c, m->imgs[k].data, (int64_t)m->imgs[k].n);
+        if (rc == JANAS_LLM_OK)
+            rc = janas_llm_chat_add(c, m->role, m->text, (int32_t)m->n);
         for (int k = 0; rc == JANAS_LLM_OK && k < m->n_calls; k++)
             rc = janas_llm_chat_add_call(c, m->call_name[k], -1,
                                          m->call_args[k], -1);
@@ -539,10 +558,14 @@ static int32_t embed(struct srv_engine *e, struct srv_job *j)
     for (int i = 0; i < j->n_prompts && rc == JANAS_LLM_OK; i++) {
         struct srv_prompt *pp = &j->prompts[i];
         if (pp->ids && !pp->text) {
-            char buf[256];
+            char buf[1024]; /* as long as the library's longest token */
             for (size_t k = 0; k < pp->n_ids && rc == JANAS_LLM_OK; k++) {
                 int32_t n = 0;
-                janas_llm_token_text(e->emb, pp->ids[k], buf, sizeof(buf), &n);
+                if (janas_llm_token_text(e->emb, pp->ids[k], buf, sizeof(buf),
+                                         &n) != JANAS_LLM_OK) {
+                    rc = JANAS_LLM_EINVAL;
+                    break;
+                }
                 char *t = realloc(pp->text, pp->n + (size_t)n + 1);
                 if (!t) {
                     rc = JANAS_LLM_ENOMEM;
@@ -584,7 +607,7 @@ static void run(struct srv_engine *e, struct srv_job *j)
     for (; rc == JANAS_LLM_OK && k < j->n_choices; k++) {
         pthread_mutex_lock(&j->mu);
         j->cur = k;
-        int cancel = j->cancel;
+        int cancel = stopped(j);
         pthread_mutex_unlock(&j->mu);
         if (cancel)
             break;
@@ -646,12 +669,13 @@ static void *engine_main(void *arg)
         if (!e->head)
             e->tail = NULL;
         e->queued--;
+        e->running = j;
         number_queue(e);
         pthread_mutex_unlock(&e->mu);
         pthread_mutex_lock(&j->mu);
         j->started = 1;
         j->queue_pos = 0;
-        int skip = j->cancel; /* gone while it waited */
+        int skip = stopped(j); /* gone while it waited */
         pthread_mutex_unlock(&j->mu);
         if (skip) {
             pthread_mutex_lock(&j->mu);
@@ -663,15 +687,23 @@ static void *engine_main(void *arg)
         } else {
             run(e, j);
         }
+        pthread_mutex_lock(&e->mu);
+        e->running = NULL;
+        pthread_mutex_unlock(&e->mu);
         srv_job_release(j);
     }
     return NULL;
 }
 
+_Thread_local int srv_engine_low;
+_Thread_local const _Atomic int *srv_engine_watch;
+
 int srv_engine_submit(struct srv_engine *e, struct srv_job *j)
 {
+    j->low = srv_engine_low;
+    j->watch = srv_engine_watch;
     pthread_mutex_lock(&e->mu);
-    if (e->queued >= e->max_queue || e->stop) {
+    if (e->queued >= e->max_queue || e->stop || (e->closing && !j->low)) {
         pthread_mutex_unlock(&e->mu);
         return -1;
     }
@@ -679,11 +711,14 @@ int srv_engine_submit(struct srv_engine *e, struct srv_job *j)
     j->refs++; /* the engine's */
     pthread_mutex_unlock(&j->mu);
     j->next = NULL;
-    if (e->tail)
-        e->tail->next = j;
-    else
-        e->head = j;
-    e->tail = j;
+    /* a request of a client before the batches' waiting */
+    struct srv_job **at = &e->head;
+    while (*at && (j->low || !(*at)->low))
+        at = &(*at)->next;
+    j->next = *at;
+    *at = j;
+    if (!j->next)
+        e->tail = j;
     e->queued++;
     number_queue(e);
     pthread_cond_signal(&e->cv);
@@ -767,6 +802,33 @@ struct srv_engine *srv_engine_start(const struct srv_config *cfg, char *err,
         return NULL;
     }
     return e;
+}
+
+/* A client's job ended because the server stops: an error that says so,
+   for the client still there. */
+static void cancel_job(struct srv_job *j)
+{
+    pthread_mutex_lock(&j->mu);
+    j->cancel = 1;
+    if (j->err == JANAS_LLM_OK) {
+        j->err = JANAS_LLM_EFAIL;
+        snprintf(j->errmsg, sizeof(j->errmsg), "the server is stopping");
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
+void srv_engine_cancel_clients(struct srv_engine *e)
+{
+    if (!e)
+        return;
+    pthread_mutex_lock(&e->mu);
+    e->closing = 1;
+    if (e->running && !e->running->low)
+        cancel_job(e->running);
+    for (struct srv_job *j = e->head; j; j = j->next)
+        if (!j->low)
+            cancel_job(j);
+    pthread_mutex_unlock(&e->mu);
 }
 
 void srv_engine_stop(struct srv_engine *e)

@@ -358,8 +358,14 @@ static int connect_to(const struct janas_url *u, double end,
         snprintf(err, err_len, "%s: %s", u->host, gai_strerror(e));
         return -1;
     }
-    int fd = -1;
+    int fd = -1, refused = 0, tried = 0;
     for (struct addrinfo *a = res; a && fd < 0; a = a->ai_next) {
+        /* the address checked is the address connected to */
+        if (!janas_net_allowed(u->policy, u->host, u->port, a->ai_addr)) {
+            refused++;
+            continue;
+        }
+        tried++;
         fd = janas_sock_open(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0)
             continue;
@@ -378,6 +384,10 @@ static int connect_to(const struct janas_url *u, double end,
         fd = -1;
     }
     freeaddrinfo(res);
+    if (fd < 0 && refused && !tried)
+        snprintf(err, err_len,
+                 "%s:%s: not a public address, and not among those allowed",
+                 u->host, u->port);
     return fd;
 }
 

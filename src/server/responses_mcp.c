@@ -26,7 +26,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/mcp_client.h"
+#include "containers.h"
 #include "janas/mcp.h"
+#include "vectors.h"
+#include "web_search.h"
 
 #define MAX_ROUNDS 8
 #define CALL_SECONDS 120
@@ -47,11 +51,38 @@ struct server {
     struct filter always, never;
 };
 
+/* a source the web_search and file_search calls found: cited as [n], n
+   its place + 1; a page (url) or a file (file_id) */
+struct web_src {
+    char url[512], title[256];
+    char file_id[48];
+};
+
 struct resp_mcp {
     struct server *s;
     int n;
     int rounds;
+    int web; /* a web_search tool: the server searches */
+    struct web_src *src;
+    int n_src;
+    /* a file_search tool: its vector stores, results, filters, threshold */
+    char **vs;
+    int n_vs, fs_max;
+    char *fs_filters;
+    double fs_threshold;
+    /* a code_interpreter tool: its container, and the files the code
+       wrote (cited where the answer names them) */
+    char ci[48];
+    struct ci_file {
+        char id[48], name[256];
+    } *ci_files;
+    int n_ci_files;
 };
+
+#define WEB_NAME "web_search"
+#define FILE_NAME "file_search"
+#define CODE_NAME "python"
+#define WEB_HITS 5
 
 static void filter_free(struct filter *f)
 {
@@ -71,6 +102,12 @@ void resp_mcp_free(struct resp_mcp *mc)
         filter_free(&mc->s[i].never);
     }
     free(mc->s);
+    free(mc->src);
+    for (int i = 0; i < mc->n_vs; i++)
+        free(mc->vs[i]);
+    free(mc->vs);
+    free(mc->fs_filters);
+    free(mc->ci_files);
     free(mc);
 }
 
@@ -152,6 +189,12 @@ void resp_mcp_cancel(struct resp_mcp *mc)
 
 int resp_mcp_owns(const struct resp *x, const char *name)
 {
+    if (x->mcp && x->mcp->web && name && !strcmp(name, WEB_NAME))
+        return 1;
+    if (x->mcp && x->mcp->n_vs && name && !strcmp(name, FILE_NAME))
+        return 1;
+    if (x->mcp && x->mcp->ci[0] && name && !strcmp(name, CODE_NAME))
+        return 1;
     const char *tool;
     return x->mcp && owner(x->mcp, name, &tool) != NULL;
 }
@@ -264,6 +307,329 @@ static void run_call(yyjson_mut_doc *d, yyjson_mut_val *arr, struct server *s,
     if (*text)
         snprintf(*text, n, "Error: %s", why);
     free(out);
+}
+
+/* A web_search call: Wikipedia asked, a web_search_call item with its
+   sources, and for the model the pages' first sentences, numbered on from
+   the sources found before so that [n] means one page in the response. */
+static void run_web(struct resp_mcp *mc, yyjson_mut_doc *d, yyjson_mut_val *arr,
+                    const char *args, char **text)
+{
+    yyjson_doc *ad = yyjson_read(args, strlen(args), 0);
+    yyjson_val *a = yyjson_doc_get_root(ad);
+    const char *q = yyjson_get_str(yyjson_obj_get(a, "query"));
+    const char *lang = yyjson_get_str(yyjson_obj_get(a, "language"));
+    struct srv_web_hit hits[WEB_HITS];
+    char err[256] = "";
+    int n =
+        q && *q ? srv_web_search(q, lang, hits, WEB_HITS, err, sizeof err) : -1;
+    if (!q || !*q)
+        snprintf(err, sizeof err, "no query");
+    yyjson_mut_val *it = yyjson_mut_arr_add_obj(d, arr);
+    char id[48];
+    srv_new_id(id, sizeof(id), "ws_");
+    yyjson_mut_obj_add_strcpy(d, it, "id", id);
+    yyjson_mut_obj_add_str(d, it, "type", "web_search_call");
+    yyjson_mut_obj_add_str(d, it, "status", n >= 0 ? "completed" : "failed");
+    yyjson_mut_val *act = yyjson_mut_obj_add_obj(d, it, "action");
+    yyjson_mut_obj_add_str(d, act, "type", "search");
+    yyjson_mut_obj_add_strcpy(d, act, "query", q ? q : "");
+    yyjson_mut_val *srcs = yyjson_mut_obj_add_arr(d, act, "sources");
+    struct janas_buf t = {0};
+    if (n < 0) {
+        janas_buf_printf(&t, "The search failed: %s.", err);
+    } else if (n == 0) {
+        janas_buf_printf(&t, "Wikipedia has no page for \"%s\".", q);
+    } else {
+        janas_buf_printf(&t,
+                         "Wikipedia's pages for \"%s\", best first. Answer "
+                         "from them, and put the number of the page a fact "
+                         "comes from right after it, as [1].\n",
+                         q);
+        struct web_src *ns =
+            realloc(mc->src, (size_t)(mc->n_src + n) * sizeof(*ns));
+        for (int i = 0; ns && i < n; i++) {
+            mc->src = ns;
+            struct web_src *w = &mc->src[mc->n_src++];
+            snprintf(w->url, sizeof w->url, "%s", hits[i].url);
+            snprintf(w->title, sizeof w->title, "%s", hits[i].title);
+            yyjson_mut_val *o = yyjson_mut_arr_add_obj(d, srcs);
+            yyjson_mut_obj_add_str(d, o, "type", "url");
+            yyjson_mut_obj_add_strcpy(d, o, "url", hits[i].url);
+            janas_buf_printf(&t, "\n[%d] %s (%s)\n%s\n", mc->n_src,
+                             hits[i].title, hits[i].url, hits[i].text);
+        }
+    }
+    yyjson_doc_free(ad);
+    *text = t.oom ? NULL : (janas_buf_put(&t, "", 1), t.p);
+    if (t.oom)
+        janas_buf_free(&t);
+}
+
+/* A file_search call: the tool's vector stores searched, a
+   file_search_call item with the results, and for the model the chunks
+   numbered on from the sources found before. */
+static void run_file(struct resp_mcp *mc, yyjson_mut_doc *d,
+                     yyjson_mut_val *arr, const char *args, char **text)
+{
+    yyjson_doc *ad = yyjson_read(args, strlen(args), 0);
+    const char *q =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(ad), "query"));
+    yyjson_doc *fd =
+        mc->fs_filters ? yyjson_read(mc->fs_filters, strlen(mc->fs_filters), 0)
+                       : NULL;
+    /* every store's best, then the best of them all */
+    struct srv_vhit *all = NULL;
+    int n = 0;
+    char err[200] = "";
+    for (int i = 0; q && *q && i < mc->n_vs; i++) {
+        struct srv_vhit *h;
+        int k = srv_vectors_search(mc->vs[i], &q, 1, yyjson_doc_get_root(fd),
+                                   mc->fs_max, mc->fs_threshold, &h, err,
+                                   sizeof err);
+        if (k <= 0) {
+            srv_vhits_free(h, 0);
+            continue;
+        }
+        struct srv_vhit *t = realloc(all, (size_t)(n + k) * sizeof(*t));
+        if (!t) {
+            srv_vhits_free(h, k);
+            continue;
+        }
+        all = t;
+        memcpy(all + n, h, (size_t)k * sizeof(*h));
+        n += k;
+        free(h); /* the texts moved */
+    }
+    yyjson_doc_free(fd);
+    for (int i = 1; i < n; i++) /* best first, insertion: a few dozen */
+        for (int j = i; j > 0 && all[j].score > all[j - 1].score; j--) {
+            struct srv_vhit t = all[j];
+            all[j] = all[j - 1];
+            all[j - 1] = t;
+        }
+    int keep = n < mc->fs_max ? n : mc->fs_max;
+    yyjson_mut_val *it = yyjson_mut_arr_add_obj(d, arr);
+    char id[48];
+    srv_new_id(id, sizeof(id), "fs_");
+    yyjson_mut_obj_add_strcpy(d, it, "id", id);
+    yyjson_mut_obj_add_str(d, it, "type", "file_search_call");
+    yyjson_mut_obj_add_str(d, it, "status", q && *q ? "completed" : "failed");
+    yyjson_mut_val *qs = yyjson_mut_obj_add_arr(d, it, "queries");
+    yyjson_mut_arr_add_strcpy(d, qs, q ? q : "");
+    yyjson_mut_val *res = yyjson_mut_obj_add_arr(d, it, "results");
+    struct janas_buf t = {0};
+    if (!q || !*q)
+        janas_buf_printf(&t, "The search needs a query.");
+    else if (!keep)
+        janas_buf_printf(&t, "The files hold nothing about \"%s\".", q);
+    else
+        janas_buf_printf(&t,
+                         "The files' passages for \"%s\", best first. "
+                         "Answer from them, and put the number of the "
+                         "passage a fact comes from right after it, as "
+                         "[1].\n",
+                         q);
+    for (int i = 0; i < keep; i++) {
+        struct web_src *ns =
+            realloc(mc->src, (size_t)(mc->n_src + 1) * sizeof(*ns));
+        if (!ns)
+            break;
+        mc->src = ns;
+        struct web_src *w = &mc->src[mc->n_src++];
+        memset(w, 0, sizeof(*w));
+        snprintf(w->file_id, sizeof w->file_id, "%s", all[i].file_id);
+        snprintf(w->title, sizeof w->title, "%s", all[i].filename);
+        yyjson_mut_val *o = yyjson_mut_arr_add_obj(d, res);
+        yyjson_mut_obj_add_strcpy(d, o, "file_id", all[i].file_id);
+        yyjson_mut_obj_add_strcpy(d, o, "filename", all[i].filename);
+        yyjson_mut_obj_add_real(d, o, "score", all[i].score);
+        yyjson_mut_obj_add_strcpy(d, o, "text", all[i].text);
+        yyjson_doc *atd =
+            all[i].attributes
+                ? yyjson_read(all[i].attributes, strlen(all[i].attributes), 0)
+                : NULL;
+        if (atd)
+            yyjson_mut_obj_add_val(
+                d, o, "attributes",
+                yyjson_val_mut_copy(d, yyjson_doc_get_root(atd)));
+        yyjson_doc_free(atd);
+        janas_buf_printf(&t, "\n[%d] %s\n%s\n", mc->n_src, all[i].filename,
+                         all[i].text);
+    }
+    srv_vhits_free(all, n);
+    yyjson_doc_free(ad);
+    *text = t.oom ? NULL : (janas_buf_put(&t, "", 1), t.p);
+    if (t.oom)
+        janas_buf_free(&t);
+}
+
+/* The tail of t, at most max bytes (whole characters), into b. */
+static void put_tail(struct janas_buf *b, const char *t, size_t max)
+{
+    size_t n = strlen(t);
+    if (n > max) {
+        t += n - max;
+        while ((*t & 0xc0) == 0x80)
+            t++;
+        janas_buf_puts(b, "[...]\n");
+    }
+    janas_buf_puts(b, t);
+}
+
+/* A code_interpreter call: the code run in the container's session, a
+   code_interpreter_call item with its output and images, and for the model
+   what it printed, its error and the files it wrote. */
+static void run_code(struct resp_mcp *mc, yyjson_mut_doc *d,
+                     yyjson_mut_val *arr, const char *args, char **text)
+{
+    yyjson_doc *ad = yyjson_read(args, strlen(args), 0);
+    const char *code =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(ad), "code"));
+    struct srv_cell c = {0};
+    int rc = code ? srv_container_run(NULL, mc->ci, code, &c) : -1;
+    yyjson_mut_val *it = yyjson_mut_arr_add_obj(d, arr);
+    char id[48];
+    srv_new_id(id, sizeof(id), "ci_");
+    yyjson_mut_obj_add_strcpy(d, it, "id", id);
+    yyjson_mut_obj_add_str(d, it, "type", "code_interpreter_call");
+    yyjson_mut_obj_add_str(d, it, "status", rc == 0 ? "completed" : "failed");
+    yyjson_mut_obj_add_strcpy(d, it, "container_id", mc->ci);
+    yyjson_mut_obj_add_strcpy(d, it, "code", code ? code : "");
+    yyjson_mut_val *outs = yyjson_mut_obj_add_arr(d, it, "outputs");
+    struct janas_buf t = {0};
+    if (!code) {
+        janas_buf_puts(&t, "The call needs the code to run, as "
+                           "{\"code\": \"...\"}.");
+    } else if (rc != 0) {
+        janas_buf_puts(&t, "The container is gone (it expired): the code "
+                           "was not run.");
+    } else {
+        struct janas_buf lg = {0};
+        if (c.logs)
+            janas_buf_puts(&lg, c.logs);
+        if (c.error) {
+            if (lg.n && lg.p[lg.n - 1] != '\n')
+                janas_buf_put(&lg, "\n", 1);
+            janas_buf_puts(&lg, c.error);
+        }
+        janas_buf_put(&lg, "", 1);
+        yyjson_mut_val *o = yyjson_mut_arr_add_obj(d, outs);
+        yyjson_mut_obj_add_str(d, o, "type", "logs");
+        yyjson_mut_obj_add_strcpy(d, o, "logs", lg.oom ? "" : lg.p);
+        janas_buf_free(&lg);
+        if (c.logs && *c.logs) {
+            janas_buf_puts(&t, "Output:\n");
+            put_tail(&t, c.logs, 8000);
+            janas_buf_puts(&t, "\n");
+        }
+        if (c.error) {
+            janas_buf_puts(&t, "Error:\n");
+            put_tail(&t, c.error, 4000);
+            janas_buf_puts(&t, "\n");
+        }
+        for (int i = 0; i < c.n_files; i++) {
+            if (i < c.n_images) {
+                char url[200];
+                snprintf(url, sizeof url, "/v1/containers/%s/files/%s/content",
+                         mc->ci, c.file_id[i]);
+                yyjson_mut_val *im = yyjson_mut_arr_add_obj(d, outs);
+                yyjson_mut_obj_add_str(d, im, "type", "image");
+                yyjson_mut_obj_add_strcpy(d, im, "url", url);
+            }
+            janas_buf_printf(&t, "%s %s\n",
+                             i ? "     " : "Files written:", c.path[i]);
+            struct ci_file *nf = realloc(
+                mc->ci_files, (size_t)(mc->n_ci_files + 1) * sizeof(*nf));
+            if (nf) {
+                mc->ci_files = nf;
+                struct ci_file *f = &mc->ci_files[mc->n_ci_files++];
+                snprintf(f->id, sizeof f->id, "%s", c.file_id[i]);
+                const char *b = strrchr(c.path[i], '/');
+                snprintf(f->name, sizeof f->name, "%s", b ? b + 1 : c.path[i]);
+            }
+        }
+        if (!t.n)
+            janas_buf_puts(&t, "The code ran and printed nothing.");
+    }
+    srv_cell_free(&c);
+    yyjson_doc_free(ad);
+    janas_buf_put(&t, "", 1);
+    *text = t.oom ? NULL : t.p;
+    if (t.oom)
+        janas_buf_free(&t);
+}
+
+/* The files the code wrote, where the text names them: their
+   container_file_citation annotations (offsets in characters). */
+static void code_annotate(yyjson_mut_doc *d, yyjson_mut_val *arr,
+                          const struct resp_mcp *mc, const char *text, size_t n)
+{
+    for (int i = 0; i < mc->n_ci_files; i++) {
+        const struct ci_file *f = &mc->ci_files[i];
+        size_t fl = strlen(f->name);
+        const char *hit = NULL;
+        for (const char *p = text; fl && p + fl <= text + n; p++)
+            if (!memcmp(p, f->name, fl)) {
+                hit = p;
+                break;
+            }
+        if (!hit)
+            continue;
+        size_t at = 0, len = 0;
+        for (const char *p = text; p < hit; p++)
+            at += ((unsigned char)*p & 0xc0) != 0x80;
+        for (size_t k = 0; k < fl; k++)
+            len += ((unsigned char)f->name[k] & 0xc0) != 0x80;
+        yyjson_mut_val *o = yyjson_mut_arr_add_obj(d, arr);
+        yyjson_mut_obj_add_str(d, o, "type", "container_file_citation");
+        yyjson_mut_obj_add_strcpy(d, o, "container_id", mc->ci);
+        yyjson_mut_obj_add_strcpy(d, o, "file_id", f->id);
+        yyjson_mut_obj_add_strcpy(d, o, "filename", f->name);
+        yyjson_mut_obj_add_uint(d, o, "start_index", at);
+        yyjson_mut_obj_add_uint(d, o, "end_index", at + len);
+    }
+}
+
+void resp_web_annotate(yyjson_mut_doc *d, yyjson_mut_val *arr,
+                       const struct resp *x, const char *text, size_t n)
+{
+    if (!x || !x->mcp || !text)
+        return;
+    code_annotate(d, arr, x->mcp, text, n);
+    if (!x->mcp->n_src)
+        return;
+    /* offsets in characters, as OpenAI counts them, not bytes */
+    size_t chars = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (text[i] == '[') {
+            size_t k = i + 1;
+            long v = 0;
+            while (k < n && text[k] >= '0' && text[k] <= '9' && v < 100000)
+                v = v * 10 + (text[k++] - '0');
+            if (k > i + 1 && k < n && text[k] == ']' && v >= 1 &&
+                v <= x->mcp->n_src) {
+                const struct web_src *w = &x->mcp->src[v - 1];
+                yyjson_mut_val *o = yyjson_mut_arr_add_obj(d, arr);
+                if (w->file_id[0]) { /* a passage of a file */
+                    yyjson_mut_obj_add_str(d, o, "type", "file_citation");
+                    yyjson_mut_obj_add_strcpy(d, o, "file_id", w->file_id);
+                    yyjson_mut_obj_add_strcpy(d, o, "filename", w->title);
+                    yyjson_mut_obj_add_uint(d, o, "index", chars);
+                    if (((unsigned char)text[i] & 0xc0) != 0x80)
+                        chars++;
+                    continue;
+                }
+                yyjson_mut_obj_add_str(d, o, "type", "url_citation");
+                yyjson_mut_obj_add_uint(d, o, "start_index", chars);
+                yyjson_mut_obj_add_uint(d, o, "end_index", chars + (k + 1 - i));
+                yyjson_mut_obj_add_strcpy(d, o, "url", w->url);
+                yyjson_mut_obj_add_strcpy(d, o, "title", w->title);
+            }
+        }
+        if (((unsigned char)text[i] & 0xc0) != 0x80)
+            chars++;
+    }
 }
 
 /* The approval responses of the input: the calls they approve run now,
@@ -386,7 +752,8 @@ static int reach(struct srv_req *r, struct server *s, yyjson_val *t, int *ret)
             nh++;
         }
     }
-    int32_t rc = janas_mcp_open_url(s->label, url, nh, h, 30, &s->m);
+    int32_t rc = janas_mcp_open_url_policy(s->label, url, nh, h, 30,
+                                           &r->srv->cfg.mcp_policy, &s->m);
     for (int i = 0; i < nh; i++)
         free(own[i]);
     if (rc != JANAS_MCP_OK) {
@@ -402,16 +769,32 @@ static int reach(struct srv_req *r, struct server *s, yyjson_val *t, int *ret)
 int resp_mcp_read(struct srv_req *r, struct resp *x, yyjson_val *root, int *ret)
 {
     yyjson_val *tools = yyjson_obj_get(root, "tools");
-    size_t idx, max, count = 0;
+    size_t idx, max, count = 0, web = 0, files = 0, code = 0;
     yyjson_val *t;
     yyjson_arr_foreach(tools, idx, max, t)
     {
         const char *type = yyjson_get_str(yyjson_obj_get(t, "type"));
         count += type && !strcmp(type, "mcp");
+        /* web_search and its dated and preview names */
+        web += type && !strncmp(type, "web_search", 10);
+        files += type && !strcmp(type, "file_search");
+        code += type && !strcmp(type, "code_interpreter");
     }
-    if (!count)
+    if (!count && !web && !files && !code)
         return 0;
-    if (r->srv->cfg.no_mcp) {
+    if (code && srv_containers_off()) {
+        *ret = srv_reply_error(r, 400, "invalid_request_error",
+                               "unsupported_value", "%s", srv_containers_off());
+        return -1;
+    }
+    if (web && r->srv->cfg.no_web) {
+        *ret = srv_reply_error(r, 400, "invalid_request_error",
+                               "unsupported_value",
+                               "This server was started with --no-web: it "
+                               "does not search.");
+        return -1;
+    }
+    if (count && r->srv->cfg.no_mcp) {
         *ret = srv_reply_error(r, 400, "invalid_request_error",
                                "unsupported_value",
                                "This server was started with --no-mcp: it "
@@ -420,9 +803,62 @@ int resp_mcp_read(struct srv_req *r, struct resp *x, yyjson_val *root, int *ret)
     }
     x->mcp = calloc(1, sizeof(*x->mcp));
     if (x->mcp)
-        x->mcp->s = calloc(count, sizeof(*x->mcp->s));
+        x->mcp->s = calloc(count ? count : 1, sizeof(*x->mcp->s));
     if (!x->mcp || !x->mcp->s)
         goto oom;
+    x->mcp->web = web > 0;
+    yyjson_arr_foreach(tools, idx, max, t)
+    {
+        const char *type = yyjson_get_str(yyjson_obj_get(t, "type"));
+        if (!type || strcmp(type, "code_interpreter") != 0 || x->mcp->ci[0])
+            continue;
+        /* its container: one named, or one made now */
+        const char *why = NULL;
+        if (srv_container_for(r->srv, yyjson_obj_get(t, "container"),
+                              x->mcp->ci, sizeof x->mcp->ci, &why) != 0) {
+            *ret = srv_reply_error(r, 400, "invalid_request_error",
+                                   "invalid_value", "tools[%zu]: %s", idx, why);
+            return -1;
+        }
+    }
+    yyjson_arr_foreach(tools, idx, max, t)
+    {
+        const char *type = yyjson_get_str(yyjson_obj_get(t, "type"));
+        if (!type || strcmp(type, "file_search") != 0)
+            continue;
+        yyjson_val *ids = yyjson_obj_get(t, "vector_store_ids");
+        yyjson_val *mx = yyjson_obj_get(t, "max_num_results");
+        yyjson_val *f = yyjson_obj_get(t, "filters");
+        yyjson_val *th = yyjson_obj_get(yyjson_obj_get(t, "ranking_options"),
+                                        "score_threshold");
+        if (!yyjson_is_arr(ids) || !yyjson_arr_size(ids) ||
+            (mx && (!yyjson_is_int(mx) || yyjson_get_sint(mx) < 1 ||
+                    yyjson_get_sint(mx) > 50))) {
+            *ret = srv_reply_error(r, 400, "invalid_request_error",
+                                   "invalid_value",
+                                   "tools[%zu]: file_search needs "
+                                   "'vector_store_ids', and max_num_results "
+                                   "from 1 to 50.",
+                                   idx);
+            return -1;
+        }
+        size_t i2, m2;
+        yyjson_val *v;
+        yyjson_arr_foreach(ids, i2, m2, v)
+        {
+            char **nv =
+                realloc(x->mcp->vs, (size_t)(x->mcp->n_vs + 1) * sizeof(*nv));
+            if (!nv || !yyjson_is_str(v))
+                continue;
+            x->mcp->vs = nv;
+            x->mcp->vs[x->mcp->n_vs++] = strdup(yyjson_get_str(v));
+        }
+        /* a few passages a call: they all go into the model's context */
+        x->mcp->fs_max = mx ? (int)yyjson_get_sint(mx) : 6;
+        if (f && !yyjson_is_null(f))
+            x->mcp->fs_filters = yyjson_val_write(f, 0, NULL);
+        x->mcp->fs_threshold = th ? yyjson_get_num(th) : 0;
+    }
     yyjson_doc *cd = yyjson_read(x->context, strlen(x->context), 0);
     yyjson_val *ctx = yyjson_doc_get_root(cd);
     /* the model's tools: the functions of the request, then the servers' */
@@ -434,6 +870,63 @@ int resp_mcp_read(struct srv_req *r, struct resp *x, yyjson_val *root, int *ret)
     yyjson_mut_val *items = yyjson_mut_arr(d);
     yyjson_doc_free(fd);
     int rc = 0;
+    if (files) { /* the files' search, as a function the model calls */
+        static const char FILE_TOOL[] =
+            "{\"type\":\"function\",\"function\":{\"name\":\"" FILE_NAME
+            "\",\"description\":\"Search the user's files for passages "
+            "that answer the question. Returns the passages, numbered; cite "
+            "them as [1], [2] after the facts they give.\",\"parameters\":"
+            "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":"
+            "\"string\",\"description\":\"what to look for, in a few "
+            "words or a question\"}},\"required\":[\"query\"]}}}";
+        yyjson_doc *fd2 = yyjson_read(FILE_TOOL, sizeof(FILE_TOOL) - 1, 0);
+        if (!fd2)
+            goto oom_in;
+        yyjson_mut_arr_append(all,
+                              yyjson_val_mut_copy(d, yyjson_doc_get_root(fd2)));
+        yyjson_doc_free(fd2);
+    }
+    if (code) { /* the session, as a function the model calls */
+        static const char CODE_TOOL[] =
+            "{\"type\":\"function\",\"function\":{\"name\":\"" CODE_NAME
+            "\",\"description\":\"Run Python 3 code in a sandboxed session, "
+            "as in a Jupyter notebook: variables and imports stay from one "
+            "call to the next, the value of the last expression is shown, "
+            "and print() output is returned. numpy, scipy, sympy, "
+            "matplotlib and PIL are there; there is no internet. The user's "
+            "files are in /mnt/data; save there the files you make for the "
+            "user (plots drawn with matplotlib are saved there by "
+            "themselves). Use it for calculations, data analysis and "
+            "charts.\",\"parameters\":{\"type\":\"object\",\"properties\":"
+            "{\"code\":{\"type\":\"string\",\"description\":\"the Python "
+            "code to run\"}},\"required\":[\"code\"]}}}";
+        yyjson_doc *cd2 = yyjson_read(CODE_TOOL, sizeof(CODE_TOOL) - 1, 0);
+        if (!cd2)
+            goto oom_in;
+        yyjson_mut_arr_append(all,
+                              yyjson_val_mut_copy(d, yyjson_doc_get_root(cd2)));
+        yyjson_doc_free(cd2);
+    }
+    if (web) { /* the search, as a function the model calls */
+        static const char WEB_TOOL[] =
+            "{\"type\":\"function\",\"function\":{\"name\":\"" WEB_NAME
+            "\",\"description\":\"Search the web (Wikipedia) for facts to "
+            "answer with: people, places, history, science, definitions. "
+            "Returns the matching pages' first sentences, numbered; cite "
+            "them as [1], [2] after the facts they give. Not for news or "
+            "today's events.\",\"parameters\":{\"type\":\"object\","
+            "\"properties\":{\"query\":{\"type\":\"string\","
+            "\"description\":\"a few words, as for a search engine\"},"
+            "\"language\":{\"type\":\"string\",\"description\":\"the "
+            "Wikipedia to search, as a code: en, it, fr...; the user's "
+            "language\"}},\"required\":[\"query\"]}}}";
+        yyjson_doc *wd = yyjson_read(WEB_TOOL, sizeof(WEB_TOOL) - 1, 0);
+        if (!wd)
+            goto oom_in;
+        yyjson_mut_arr_append(all,
+                              yyjson_val_mut_copy(d, yyjson_doc_get_root(wd)));
+        yyjson_doc_free(wd);
+    }
     yyjson_arr_foreach(tools, idx, max, t)
     {
         const char *type = yyjson_get_str(yyjson_obj_get(t, "type"));
@@ -528,10 +1021,19 @@ int resp_mcp_read(struct srv_req *r, struct resp *x, yyjson_val *root, int *ret)
             yyjson_mut_val_write(items, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &n);
         if (!x->j->tools || !x->done_items)
             goto oom_in;
-        /* tool_choice {type: mcp, server_label, name} */
+        /* tool_choice {type: mcp, server_label, name}, {type: web_search} */
         yyjson_val *tc = yyjson_obj_get(root, "tool_choice");
         const char *tt = yyjson_get_str(yyjson_obj_get(tc, "type"));
-        if (tt && !strcmp(tt, "mcp")) {
+        if (tt && code && !strcmp(tt, "code_interpreter")) {
+            x->j->tool_choice = JANAS_LLM_TOOLS_FUNCTION;
+            snprintf(x->j->tool_name, sizeof(x->j->tool_name), "%s", CODE_NAME);
+        } else if (tt && files && !strcmp(tt, "file_search")) {
+            x->j->tool_choice = JANAS_LLM_TOOLS_FUNCTION;
+            snprintf(x->j->tool_name, sizeof(x->j->tool_name), "%s", FILE_NAME);
+        } else if (tt && web && !strncmp(tt, "web_search", 10)) {
+            x->j->tool_choice = JANAS_LLM_TOOLS_FUNCTION;
+            snprintf(x->j->tool_name, sizeof(x->j->tool_name), "%s", WEB_NAME);
+        } else if (tt && !strcmp(tt, "mcp")) {
             const char *l = yyjson_get_str(yyjson_obj_get(tc, "server_label"));
             const char *nm = yyjson_get_str(yyjson_obj_get(tc, "name"));
             if (l && nm) {
@@ -625,6 +1127,18 @@ int resp_mcp_round(struct resp *x)
     int pending = 0;
     for (int i = 0; texts && i < ch->n_calls; i++) {
         const struct srv_call *k = &ch->calls[i];
+        if (x->mcp->web && !strcmp(k->name, WEB_NAME)) {
+            run_web(x->mcp, d, arr, k->args, &texts[i]);
+            continue;
+        }
+        if (x->mcp->n_vs && !strcmp(k->name, FILE_NAME)) {
+            run_file(x->mcp, d, arr, k->args, &texts[i]);
+            continue;
+        }
+        if (x->mcp->ci[0] && !strcmp(k->name, CODE_NAME)) {
+            run_code(x->mcp, d, arr, k->args, &texts[i]);
+            continue;
+        }
         const char *tool;
         struct server *s = owner(x->mcp, k->name, &tool);
         if (!s)
