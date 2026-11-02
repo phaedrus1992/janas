@@ -15,11 +15,15 @@
 #define JANAS_SERVER_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include "common/mcp_policy.h"
 #include "janas/llm.h"
 #include "store.h"
+
+#include <yyjson.h>
 
 struct MHD_Connection;
 
@@ -41,23 +45,36 @@ struct srv_config {
                              for the model's own default */
     int reasoning_budget; /* the longest reasoning when a request does not
                              say, in tokens: -1 no limit (default), 0 none */
-    const char *embed_path; /* the embedding model, or NULL */
-    const char *embed_id;   /* its name for clients */
-    const char *store_dir;  /* where stored documents outlive the server;
-                               NULL: memory only (--no-store) */
-    int keep;               /* conversations kept computed besides the
-                               current one (default 8) */
-    uint64_t keep_bytes;    /* memory for them; 0: automatic */
-    uint64_t keep_disk;     /* disk for them, below the memory; 0: none
-                               (default 8 GiB) */
-    int no_mcp;             /* refuse the tools of type mcp (Responses):
-                               no connection goes out on a request's word */
-    uint32_t max_input;     /* longest prompt taken, tokens; 0: the context */
-    uint32_t warn_input;    /* prompts longer are taken, and said on stderr */
-    uint32_t fim_prefix;    /* fill in the middle: the tokens before the
-                               cursor read at most (0: all) */
-    uint32_t fim_suffix;    /* the lines after it (0: all) */
-    uint32_t fim_max;       /* the tokens it writes at most (0: as asked) */
+    const char *embed_path;  /* the embedding model, or NULL */
+    const char *embed_id;    /* its name for clients */
+    const char *speech_path; /* the speech-to-text model, or NULL */
+    const char *vad_path;    /* its voice activity detector, or NULL */
+    const char *speaker_path; /* its speaker embeddings, or NULL */
+    const char *speech_id;   /* its name for clients */
+    const char *store_dir;   /* where stored documents outlive the server;
+                                NULL: memory only (--no-store) */
+    int keep;                /* conversations kept computed besides the
+                                current one (default 8) */
+    uint64_t keep_bytes;     /* memory for them; 0: automatic */
+    uint64_t keep_disk;      /* disk for them, below the memory; 0: none
+                                (default 8 GiB) */
+    int no_web;              /* refuse the web_search tool (Responses) */
+    int code_interpreter;    /* run code (code_interpreter, containers) */
+    const char *code_python; /* the python3 of the cage, NULL: the system's */
+    const char *tls_cert, *tls_key; /* HTTPS (tls.c); NULL: HTTP */
+    int no_mcp;                     /* refuse the tools of type mcp (Responses):
+                                       no connection goes out on a request's word */
+    struct janas_net_policy mcp_policy; /* where they may: public addresses,
+                                           and those --mcp-allow names */
+    const char **allow_origin;          /* pages of other origins let in
+                                           (--allow-origin; "*": any) */
+    int n_allow_origin;
+    uint32_t max_input;  /* longest prompt taken, tokens; 0: the context */
+    uint32_t warn_input; /* prompts longer are taken, and said on stderr */
+    uint32_t fim_prefix; /* fill in the middle: the tokens before the
+                            cursor read at most (0: all) */
+    uint32_t fim_suffix; /* the lines after it (0: all) */
+    uint32_t fim_max;    /* the tokens it writes at most (0: as asked) */
 };
 
 /* Stop strings a request may give: OpenAI takes four, editors' extensions
@@ -76,13 +93,39 @@ void srv_reasoning_default(const struct srv_config *cfg,
                            struct janas_llm_chat_params *p);
 
 /* A message of a chat request, with the tool calls of an assistant's. */
+/* A picture of a message (images.c): its reference as the request gave it
+   (a data: or http(s) URL, or a file id), and its bytes once fetched. */
+/* a data: URL's bytes (base64) of at most max: 0, or -1 with the reason */
+int srv_data_url(const char *url, size_t len, size_t max, unsigned char **data,
+                 size_t *n_data, char *err, size_t el);
+
+struct srv_img {
+    char *ref;
+    int is_file;
+    unsigned char *data;
+    size_t n;
+};
+
 struct srv_msg {
     int32_t role; /* JANAS_LLM_ROLE_... */
     char *text;
     size_t n;
     int n_calls;
     char **call_name, **call_args;
+    struct srv_img *imgs; /* a user message's pictures, before its text */
+    int n_imgs;
 };
+
+/* images.c: a part that is a picture (chat's image_url, the Responses'
+   input_image) added to imgs: 1, 0 when the part is not a picture, -1 with
+   the reason; the pictures of a job's messages fetched (0, or -1 with the
+   reason); a list freed */
+int srv_image_part(yyjson_val *part, const char *type, struct srv_img **imgs,
+                   int *n_imgs, char *err, size_t el);
+struct srv_job;
+struct srv;
+int srv_images_fetch(struct srv *s, struct srv_job *j, char *err, size_t el);
+void srv_imgs_free(struct srv_img *imgs, int n);
 
 /* A prompt of a completion: text, or token ids (the engine turns them
    into text, which is where an echo finds it). */
@@ -183,14 +226,22 @@ struct srv_job {
     struct janas_llm_chat_stats st;               /* of the first reply */
     uint32_t prompt_tokens;                       /* of every prompt, once */
     uint32_t completion_tokens, reasoning_tokens; /* of all of them */
-    uint32_t queue_pos; /* requests ahead of it, while it waits */
-    int refs;           /* the handler and the engine: freed by the last one */
+    uint32_t queue_pos;       /* requests ahead of it, while it waits */
+    int low;                  /* a batch's: every other request goes first */
+    const _Atomic int *watch; /* its submitter's (srv_engine_watch): 1 stops
+                                 it as cancel does */
+    int refs; /* the handler and the engine: freed by the last one */
     struct srv_job *next;
 };
 
 struct srv_engine *srv_engine_start(const struct srv_config *cfg, char *err,
                                     size_t err_len);
 void srv_engine_stop(struct srv_engine *e);
+/* At stop, before the connections close: the clients' requests, running
+   and waiting, end at their next token, and no new one is taken, so no
+   connection waits for a whole reply that no one will read; the batches'
+   and the evals' go on (their workers stop them where they resume). */
+void srv_engine_cancel_clients(struct srv_engine *e);
 /* Whether an embedding model is open, and the length of its vectors. */
 int32_t srv_engine_embed_dim(const struct srv_engine *e);
 /* The model's description (janas_llm_describe), for /v1/models. */
@@ -204,8 +255,13 @@ struct srv_job *srv_job_new(void);
 void srv_job_release(struct srv_job *j);
 /* The choices the job's replies go into: 0, or -1 on memory. */
 int srv_job_choices(struct srv_job *j, int n, int keep);
-/* Queues the job; -1 when the queue is full. */
+/* Queues the job; -1 when the queue is full. A job submitted on a thread
+   that set srv_engine_low (the batches') waits behind every other. */
 int srv_engine_submit(struct srv_engine *e, struct srv_job *j);
+extern _Thread_local int srv_engine_low;
+/* A flag the jobs submitted on this thread watch: set to 1 elsewhere, they
+   end at their next token (a run of the Assistants API cancelled). */
+extern _Thread_local const _Atomic int *srv_engine_watch;
 /* How much of choice k's answer may be handed out now: while the reply
    runs, the end that could still turn out to be the start of a stop string
    is held back. Call with j->mu held. */
@@ -216,21 +272,43 @@ struct srv {
     struct srv_config cfg;
     struct srv_engine *engine;
     struct srv_store *store; /* completions, responses, conversations */
+    struct srv_files *files; /* uploaded files (files_store.h) */
     struct MHD_Daemon *mhd;
+    janas_llm_speech *speech;  /* --speech-model, or NULL */
+    pthread_mutex_t speech_mu; /* one transcription at a time */
 };
 
 struct sockaddr;
+/* tls.c: the certificate and key read (0, or -1 with the reason), the
+   listener of HTTPS on addr, and its end */
+int srv_tls_setup(const char *cert, const char *key, char *err, size_t err_len);
+int srv_tls_start(struct srv *s, const struct sockaddr *addr, char *err,
+                  size_t err_len);
+void srv_tls_stop(void);
 /* Listening on addr (the port inside it), and no longer. */
 int srv_http_start(struct srv *s, const struct sockaddr *addr, char *err,
                    size_t err_len);
 void srv_http_stop(struct srv *s);
 
 /* One request, as the handlers see it. */
+/* An answer kept instead of sent: a request the server makes of itself
+   (a batch's lines) */
+struct srv_capture {
+    unsigned status;
+    char *body; /* malloc'd, NUL-terminated */
+    size_t n;
+    /* when set, a stream's bytes go to it as they come instead of into
+       body (a run of the Assistants API reading /responses streamed) */
+    void (*on_data)(void *arg, const char *p, size_t n);
+    void *arg;
+};
+
 struct srv_req {
     struct srv *srv;
-    struct MHD_Connection *conn;
-    const char *method, *path; /* path without /v1 */
-    char param[2][256];        /* the {…} segments of the route, in order */
+    struct MHD_Connection *conn; /* NULL with cap */
+    struct srv_capture *cap;     /* the answer goes here when set */
+    const char *method, *path;   /* path without /v1 */
+    char param[3][256];          /* the {…} segments of the route, in order */
     int n_param;
     const char *body;
     size_t n_body;
@@ -239,6 +317,8 @@ struct srv_req {
 /* A handler answers through the functions below and returns their result
    (an MHD_Result). */
 typedef int (*srv_handler)(struct srv_req *r);
+/* The handler of method and path (without /v1), or NULL. */
+srv_handler srv_route_find(const char *method, const char *path);
 
 /* Answers: JSON text (taken over, freed here), an OpenAI error, or a
    stream of server-sent events. */
@@ -256,6 +336,11 @@ int srv_reply_limit(struct srv_req *r, const struct srv_job *j);
    end; done(ctx) is called once the connection is over. */
 typedef long (*srv_stream_next)(void *ctx, char *buf, size_t cap);
 typedef void (*srv_stream_done)(void *ctx);
+/* n bytes (taken over, freed here) of that Content-Type as the answer. */
+int srv_reply_bytes(struct srv_req *r, unsigned status, char *body, size_t n,
+                    const char *type);
+/* n bytes of an open file (taken over, closed here) as the answer. */
+int srv_reply_fd(struct srv_req *r, int fd, uint64_t n, const char *type);
 int srv_reply_stream(struct srv_req *r, srv_stream_next next,
                      srv_stream_done done, void *ctx);
 
@@ -264,6 +349,11 @@ int srv_models_list(struct srv_req *r);
 int srv_models_get(struct srv_req *r);
 int srv_models_delete(struct srv_req *r);
 int srv_embeddings_create(struct srv_req *r);
+/* audio.c: speech to text with the speech model (--speech-model) */
+int srv_audio_transcriptions(struct srv_req *r);
+int srv_audio_translations(struct srv_req *r);
+int srv_speech_start(struct srv *s, char *err, size_t err_len);
+void srv_speech_stop(struct srv *s);
 int srv_moderations_create(struct srv_req *r);
 int srv_chat_create(struct srv_req *r);
 int srv_completion_create(struct srv_req *r);
@@ -274,6 +364,106 @@ int srv_stored_get(struct srv_req *r);
 int srv_stored_update(struct srv_req *r);
 int srv_stored_delete(struct srv_req *r);
 int srv_stored_messages(struct srv_req *r);
+/* files.c: the Files API */
+int srv_files_create(struct srv_req *r);
+int srv_files_list_req(struct srv_req *r);
+int srv_files_retrieve(struct srv_req *r);
+int srv_files_delete_req(struct srv_req *r);
+int srv_files_content(struct srv_req *r);
+/* uploads.c: the Uploads API; a part's body may pass --max-body up to
+   SRV_UPLOAD_PART_MAX and a little for its envelope */
+#define SRV_UPLOAD_PART_MAX ((size_t)64 << 20)
+int srv_uploads_create(struct srv_req *r);
+int srv_uploads_part(struct srv_req *r);
+int srv_uploads_complete(struct srv_req *r);
+int srv_uploads_cancel(struct srv_req *r);
+void srv_uploads_shutdown(void);
+/* batches.c: the Batch API, and the thread that runs the batches (started
+   once the store, the files and the engine are there) */
+int srv_batches_create(struct srv_req *r);
+int srv_batches_get(struct srv_req *r);
+int srv_batches_cancel(struct srv_req *r);
+int srv_batches_list(struct srv_req *r);
+int srv_batches_start(struct srv *s);
+void srv_batches_stop(void);
+/* evals.c: the Evals API, and the thread that runs the evals' runs */
+int srv_evals_create(struct srv_req *r);
+int srv_evals_list(struct srv_req *r);
+int srv_evals_get(struct srv_req *r);
+int srv_evals_update(struct srv_req *r);
+int srv_evals_delete(struct srv_req *r);
+int srv_eval_runs_list(struct srv_req *r);
+int srv_eval_runs_create(struct srv_req *r);
+int srv_eval_runs_get(struct srv_req *r);
+int srv_eval_runs_cancel(struct srv_req *r);
+int srv_eval_runs_delete(struct srv_req *r);
+int srv_eval_items_list(struct srv_req *r);
+int srv_eval_items_get(struct srv_req *r);
+int srv_evals_start(struct srv *s);
+void srv_evals_stop(void);
+/* containers.c: the Containers API (containers.h), and the sessions of
+   code_interpreter, ended at stop */
+int srv_containers_create(struct srv_req *r);
+int srv_containers_list(struct srv_req *r);
+int srv_containers_get(struct srv_req *r);
+int srv_containers_delete(struct srv_req *r);
+int srv_container_files_create(struct srv_req *r);
+int srv_container_files_list(struct srv_req *r);
+int srv_container_files_get(struct srv_req *r);
+int srv_container_files_delete(struct srv_req *r);
+int srv_container_files_content(struct srv_req *r);
+int srv_containers_start(struct srv *s);
+void srv_containers_stop(void);
+/* assistants.c, runs.c: the Assistants API (assistants.h) */
+int srv_assistants_create(struct srv_req *r);
+int srv_assistants_list(struct srv_req *r);
+int srv_assistants_get(struct srv_req *r);
+int srv_assistants_modify(struct srv_req *r);
+int srv_assistants_delete(struct srv_req *r);
+int srv_threads_create(struct srv_req *r);
+int srv_threads_get(struct srv_req *r);
+int srv_threads_modify(struct srv_req *r);
+int srv_threads_delete(struct srv_req *r);
+int srv_messages_create(struct srv_req *r);
+int srv_messages_list(struct srv_req *r);
+int srv_messages_get(struct srv_req *r);
+int srv_messages_modify(struct srv_req *r);
+int srv_messages_delete(struct srv_req *r);
+int srv_runs_create(struct srv_req *r);
+int srv_runs_create_thread(struct srv_req *r);
+int srv_runs_list(struct srv_req *r);
+int srv_runs_get(struct srv_req *r);
+int srv_runs_modify(struct srv_req *r);
+int srv_runs_cancel(struct srv_req *r);
+int srv_runs_submit(struct srv_req *r);
+int srv_run_steps_list(struct srv_req *r);
+int srv_run_steps_get(struct srv_req *r);
+/* vectors_api.c: the Vector stores API */
+int srv_vs_create(struct srv_req *r);
+int srv_vs_list(struct srv_req *r);
+int srv_vs_get(struct srv_req *r);
+int srv_vs_modify(struct srv_req *r);
+int srv_vs_delete(struct srv_req *r);
+int srv_vs_file_create(struct srv_req *r);
+int srv_vs_files_list(struct srv_req *r);
+int srv_vs_file_get(struct srv_req *r);
+int srv_vs_file_delete(struct srv_req *r);
+int srv_vs_file_update(struct srv_req *r);
+int srv_vs_file_content(struct srv_req *r);
+int srv_vs_search(struct srv_req *r);
+int srv_vs_batch_create(struct srv_req *r);
+int srv_vs_batch_get(struct srv_req *r);
+int srv_vs_batch_cancel(struct srv_req *r);
+int srv_vs_batch_files(struct srv_req *r);
+/* A file attached to store vs (cs, attrs: the request's JSON or NULL): 0,
+   -1 refused (why says), -2 the disk. */
+struct yyjson_val;
+int srv_vs_attach(struct srv *srv, const char *vs, const char *file_id,
+                  struct yyjson_val *cs, struct yyjson_val *attrs,
+                  const char **why);
+/* A page of the files of store vs (ids not NULL: of these alone). */
+int srv_vs_files_page(struct srv_req *r, const char *vs, const char *const *ids,
+                      size_t n_ids);
 /* responses.c, conversations.c: OpenAI's Responses API */
 int srv_responses_create(struct srv_req *r);
 int srv_responses_get(struct srv_req *r);

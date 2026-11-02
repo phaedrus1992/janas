@@ -6,13 +6,27 @@
 // levels), 2 Q4_1 and 3 Q5_1 (d q + m, Q5_1 with a fifth bit per weight in
 // qh), 4 MXFP4 (17 bytes a block: its E8M0 byte, the power of two
 // 2^(e - 128) for a scale, then the nibbles, through MXFP4's table of 0 to
-// 12 and their negatives). As the CPU computes them (nib_dot_ref,
-// janas_mxfp4_dot_ref and dm_dot_ref in quant.c):
-// each block's integer dot in one fma into the accumulator of its position
-// in the group of eight, the minimum of Q4_1/Q5_1 (m times the block's
-// activation sum) in accumulators of its own, the eight added at the end as
-// janas_hsum8 does - the same float operations, so the results agree bit
-// for bit. Q4_0's q - 8 is folded as the exact integer sum q.a - 8 sum(a).
+// 12 and their negatives), 5 Q5_0 (22 bytes: d, qh, the nibbles; q - 16),
+// 6 Q2_0 (18 bytes for 64 weights: d, then two bits a weight, weight i in
+// bits 2 (i % 4) of byte i / 4; q - 1: each half of a block one block of
+// 32 here, with the block's d), 7 NVFP4 (36 bytes for 64 weights: four
+// UE4M3 scales, one a sub-block of 16, then sub-block s's codes in bytes
+// 8s to 8s + 7, low nibbles its first eight weights, high ones the next
+// eight, through MXFP4's table; each half of a block one block of 32
+// here, its two sub-blocks' dots each in its own fma, the first first, as
+// janas_nvfp4_dot_ref). As the CPU computes them (nib_dot_ref,
+// janas_mxfp4_dot_ref, dm_dot_ref, janas_q5_0_dot_ref and
+// janas_q2_0_dot_ref in quant.c): each block's integer dot in one fma into
+// the accumulator of its position in the group of eight, the minimum of
+// Q4_1/Q5_1 (m times the block's activation sum) in accumulators of its
+// own, the eight added at the end as janas_hsum8 does - the same float
+// operations, so the results agree bit for bit. Q4_0's q - 8, Q5_0's q - 16
+// and Q2_0's q - 1 are folded as the exact integer sum q.a - c sum(a).
+// A row may end inside a group of 256 (tail, blocks of 32 past the whole
+// groups: qwen4exp's widths of 640): those blocks are summed apart, from
+// zero, and added to the whole groups' sum, as janas_dot_rows_n sums the
+// group the CPU pads with empty blocks; the row is read no further than it
+// goes, rows of whole words (gpu.c janas_gpu_can).
 // The activations come in the 32-block layout (20 uvec4 a Q8_K block: qs32
 // in 16, bsums32 in 2, d32 in 2), shared across the subgroup as in
 // q4k_matvec.comp. The low nibbles of a block's 16 bytes are weights 0-15,
@@ -20,6 +34,9 @@
 // realigned by the byte, the others' by the half word. An E8M0 byte of 0 or
 // 1 is a subnormal scale, which a GPU may flush to zero where the CPU does
 // not: such blocks (weights under 2^-125) differ from the CPU's.
+// With ID (bit 8 of constant 2) a mixture's experts, the table of
+// *_mmid.comp (gpu_token_moe.c) in w, as q4k_matvec.comp reads it: x's
+// vectors nb blocks of 256 apart, one more with a tail.
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
@@ -29,23 +46,50 @@
 layout(local_size_x = 64) in;
 layout(constant_id = 0) const uint NV = 8;
 layout(constant_id = 1) const uint SG = 8;
-layout(constant_id = 2) const uint KIND = 0;
+layout(constant_id = 2) const uint KID = 0;
+const uint KIND = KID & 255u;
+const bool ID = (KID & 256u) != 0u;
 const uint NX = (20u + SG - 1u) / SG;
-/* bytes of a block, and of a group of eight in words */
-const uint S = KIND == 4u ? 17u : KIND == 3u ? 24u : KIND == 2u ? 20u : 18u;
+/* bytes of a block of 32 weights (Q2_0: half a block), and of a group of
+   eight in words */
+const uint S = KIND == 7u ? 18u
+             : KIND == 6u ? 9u
+             : KIND == 5u ? 22u
+             : KIND == 4u ? 17u
+             : KIND == 3u ? 24u
+             : KIND == 2u ? 20u
+                          : 18u;
 const uint GW = 2u * S;
 const bool DM = KIND == 2u || KIND == 3u;
-const bool TAB = KIND == 1u || KIND == 4u; /* levels through a table */
+const bool TAB = KIND == 1u || KIND == 4u || KIND == 7u; /* a table */
+const bool FIVE = KIND == 3u || KIND == 5u; /* a fifth bit in qh */
+/* the constant folded out of the weights' integer dot */
+const int OFF = KIND == 0u ? 8 : KIND == 5u ? 16 : KIND == 6u ? 1 : 0;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F { float v[]; };
 
-layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys; } p;
+layout(push_constant) uniform P {
+    uvec2 w, x, y;
+    uint rows, nb, nv, xs, ys, level;
+    uvec2 p1, p0;
+    uint tail; /* blocks of 32 past the whole groups, 0 to 7 */
+} p;
 
 const int IQ4[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
                             1, 13, 25, 38, 53, 69, 89, 113);
 const int MX[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+/* a UE4M3 byte as NVFP4's scale, times one half (quant.c
+   janas_ue4m3_half): exact */
+float ue4m3_half(uint x)
+{
+    if (x == 0u || x == 0x7fu)
+        return 0.0;
+    int e = int((x >> 3) & 15u), man = int(x & 7u);
+    return e == 0 ? ldexp(float(man), -10) : ldexp(float(8 + man), e - 11);
+}
 
 /* an E8M0 byte as MXFP4's scale, 2^(e - 128) (quant.c janas_e8m0_half) */
 float e8m0_half(uint e)
@@ -63,6 +107,13 @@ uint spread5(uint b)
     return ((b & 1u) << 4) | ((b & 2u) << 11) | ((b & 4u) << 18) | ((b & 8u) << 25);
 }
 
+/* a byte of Q2_0 (four weights of two bits) spread to a byte each */
+uint spread2(uint b)
+{
+    uint t = (b | (b << 12)) & 0x000f000fu;
+    return (t | (t << 6)) & 0x03030303u;
+}
+
 /* the table in the workgroup's shared memory: a constant array read at a
    varying index is far slower on some GPUs (iq4xs_matvec.comp) */
 shared uint T[16];
@@ -74,75 +125,142 @@ uint iq4(uint w)
            (T[(w >> 24) & 15u] << 24);
 }
 
+/* precise, as the accumulators below: no add fused with a product (a
+   tail's blocks are single products from zero, which a compiler may see) */
 float hsum8(float a[8])
 {
-    return ((a[0] + a[4]) + (a[2] + a[6])) + ((a[1] + a[5]) + (a[3] + a[7]));
+    precise float s = ((a[0] + a[4]) + (a[2] + a[6])) + ((a[1] + a[5]) + (a[3] + a[7]));
+    return s;
+}
+
+/* the word of wg at byte b, realigned by the half word */
+uint hword(uint wg[48], uint b)
+{
+    return (b & 2u) != 0u ? (wg[b >> 2] >> 16) | (wg[(b >> 2) + 1u] << 16) : wg[b >> 2];
 }
 
 void main()
 {
     if (gl_LocalInvocationID.x < 16u)
         T[gl_LocalInvocationID.x] =
-            uint(KIND == 4u ? MX[gl_LocalInvocationID.x] : IQ4[gl_LocalInvocationID.x]) & 0xffu;
+            uint(KIND == 4u || KIND == 7u ? MX[gl_LocalInvocationID.x]
+                                          : IQ4[gl_LocalInvocationID.x]) & 0xffu;
     barrier();
-    U1 W = U1(p.w);
-    U4 X = U4(p.x);
-    F Y = F(p.y);
+    uvec2 pw = p.w, px = p.x, py = p.y;
+    uint nv = p.nv, xs = p.xs, ys = p.ys, v0 = gl_WorkGroupID.x * NV;
+    if (ID) {
+        U4 Tb = U4(p.w);
+        uvec4 tl = Tb.v[p.nv + gl_WorkGroupID.z];
+        uvec4 t0 = Tb.v[3u * tl.x], t1 = Tb.v[3u * tl.x + 1u];
+        pw = t0.xy, px = t0.zw, py = t1.xy;
+        nv = t1.z, xs = p.nb + (p.tail != 0u ? 1u : 0u), ys = t1.w, v0 = tl.y;
+    }
+    U1 W = U1(pw);
+    U4 X = U4(px);
+    F Y = F(py);
     uint lane = gl_SubgroupInvocationID;
     /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
        of the same rows go out together and the weights the first reads
        from memory the others find in the L3 */
     uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
     uint row = min(grow, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
-        xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
-    float acc[NV][8], accm[NV][8];
-    for (uint v = 0; v < NV; v++)
+        xo[v] = min(v0 + v, nv - 1u) * xs * 20u;
+    /* precise: the CPU rounds every product and every sum apart; without
+       it a compiler may fuse a sum with a product before it (the tail's
+       accumulators start from zero in the loop, a known value: AMD's,
+       issue #46) */
+    precise float acc[NV][8], accm[NV][8], res[NV];
+    for (uint v = 0; v < NV; v++) {
+        res[v] = 0.0;
         for (uint k = 0; k < 8u; k++) {
             acc[v][k] = 0.0;
             accm[v][k] = 0.0;
         }
-    uint gw = row * p.nb * GW;
-    for (uint b = 0; b < p.nb; b++, gw += GW) {
+    }
+    /* words of the tail: whole Q2_0 blocks there, two blocks of 32 each */
+    uint tw = (KIND == 6u ? p.tail / 2u * 18u : p.tail * S) / 4u;
+    uint gw = row * (p.nb * GW + tw);
+    /* the whole groups, then the tail (p.nb: past the last whole group) */
+    for (uint b = 0; b <= p.nb; b++, gw += GW) {
+        bool last = b == p.nb;
+        if (last && p.tail == 0u)
+            break;
+        uint nk = last ? p.tail : 8u, nw = last ? tw : GW;
         uint wg[48];
         for (uint i = 0; i < GW; i++)
-            wg[i] = W.v[gw + i];
+            wg[i] = i < nw ? W.v[gw + i] : 0u;
         float d[8], m[8];
         uvec4 lo[8], hi[8];
         for (uint k = 0; k < 8u; k++) {
-            uint B = S * k; /* the block's first byte */
-            uint hw = wg[B >> 2];
-            if (KIND == 4u) {
-                d[k] = e8m0_half((hw >> (8u * (B & 3u))) & 0xffu);
+            /* the block's first byte, and that of its 16 bytes of quants
+               (Q2_0: of the 8 of its half) */
+            uint B = KIND == 6u || KIND == 7u ? 2u * S * (k / 2u) : S * k;
+            uint qb = KIND == 6u   ? B + 2u + 8u * (k % 2u)
+                      : KIND == 7u ? B + 4u + 16u * (k % 2u)
+                                   : B + S - 16u;
+            if (KIND == 7u) { /* the half's two sub-blocks' scales */
+                uint sb = B + 2u * (k % 2u);
+                d[k] = ue4m3_half((wg[sb >> 2] >> (8u * (sb & 3u))) & 0xffu);
+                m[k] = ue4m3_half((wg[sb >> 2] >> (8u * (sb & 3u) + 8u)) & 0xffu);
+            } else if (KIND == 4u) {
+                d[k] = e8m0_half((wg[B >> 2] >> (8u * (B & 3u))) & 0xffu);
                 m[k] = 0.0;
             } else {
-                vec2 dm = unpackHalf2x16((B & 2u) != 0u ? (hw >> 16) | (wg[(B >> 2) + 1u] << 16) : hw);
+                vec2 dm = unpackHalf2x16(hword(wg, B));
                 d[k] = dm.x;
                 m[k] = dm.y;
             }
-            uint qb = B + S - 16u, wi = qb >> 2, sh = 8u * (qb & 3u);
+            uint wi = qb >> 2, sh = 8u * (qb & 3u);
+            if (KIND == 6u) {
+                uint q0 = sh != 0u ? (wg[wi] >> sh) | (wg[wi + 1u] << (32u - sh)) : wg[wi];
+                uint q1 = sh != 0u ? (wg[wi + 1u] >> sh) | (wg[wi + 2u] << (32u - sh)) : wg[wi + 1u];
+                lo[k] = uvec4(spread2(q0 & 0xffu), spread2((q0 >> 8) & 0xffu),
+                              spread2((q0 >> 16) & 0xffu), spread2(q0 >> 24));
+                hi[k] = uvec4(spread2(q1 & 0xffu), spread2((q1 >> 8) & 0xffu),
+                              spread2((q1 >> 16) & 0xffu), spread2(q1 >> 24));
+                continue;
+            }
             uint q[4];
             for (uint i = 0; i < 4u; i++)
                 q[i] = sh != 0u ? (wg[wi + i] >> sh) | (wg[wi + i + 1u] << (32u - sh)) : wg[wi + i];
-            uint qh = KIND == 3u ? wg[(B + 4u) >> 2] : 0u;
+            uint qh = KIND == 3u ? wg[(B + 4u) >> 2] : KIND == 5u ? hword(wg, B + 2u) : 0u;
             for (uint i = 0; i < 4u; i++) {
                 uint l = q[i] & 0x0f0f0f0fu, h = (q[i] >> 4) & 0x0f0f0f0fu;
                 if (TAB) {
                     l = iq4(l);
                     h = iq4(h);
-                } else if (KIND == 3u) {
+                } else if (FIVE) {
                     l |= spread5((qh >> (4u * i)) & 15u);
                     h |= spread5((qh >> (16u + 4u * i)) & 15u);
                 }
                 q[i] = l;
+                if (KIND == 7u) {
+                    /* NVFP4: words 0-1 the first sub-block, low then high
+                       nibbles; words 2-3 the second */
+                    if (i == 0u) { lo[k].x = l; lo[k].z = h; }
+                    if (i == 1u) { lo[k].y = l; lo[k].w = h; }
+                    if (i == 2u) { hi[k].x = l; hi[k].z = h; }
+                    if (i == 3u) { hi[k].y = l; hi[k].w = h; }
+                    continue;
+                }
                 if (i == 0u) { lo[k].x = l; hi[k].x = h; }
                 if (i == 1u) { lo[k].y = l; hi[k].y = h; }
                 if (i == 2u) { lo[k].z = l; hi[k].z = h; }
                 if (i == 3u) { lo[k].w = l; hi[k].w = h; }
             }
         }
+        if (last)
+            /* the whole groups' sum aside, the tail's from zero */
+            for (uint v = 0; v < NV; v++) {
+                if (p.nb > 0u)
+                    res[v] = DM ? hsum8(acc[v]) + hsum8(accm[v]) : hsum8(acc[v]);
+                for (uint k = 0; k < 8u; k++) {
+                    acc[v][k] = 0.0;
+                    accm[v][k] = 0.0;
+                }
+            }
         for (uint v = 0; v < NV; v++) {
             uvec4 xr[NX];
             for (uint j = 0; j < NX; j++)
@@ -155,24 +273,38 @@ void main()
             uvec4 b0 = bc(xr, 16u), b1 = bc(xr, 17u);
             uint bw[8] = uint[8](b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w);
             for (uint k = 0; k < 8u; k++) {
+                if (KIND == 7u) {
+                    if (k < nk) {
+                        acc[v][k] = fma(d[k] * d32[k], float(dp4(lo[k], bc(xr, 2u * k))),
+                                        acc[v][k]);
+                        acc[v][k] = fma(m[k] * d32[k], float(dp4(hi[k], bc(xr, 2u * k + 1u))),
+                                        acc[v][k]);
+                    }
+                    continue;
+                }
                 int dot = dp4(lo[k], bc(xr, 2u * k)) + dp4(hi[k], bc(xr, 2u * k + 1u));
                 /* the block's activation sum: bsums32 of its two halves */
                 int asum = bitfieldExtract(int(bw[k]), 0, 16) + bitfieldExtract(int(bw[k]), 16, 16);
-                if (KIND == 0u)
-                    dot -= 8 * asum;
-                acc[v][k] = fma(d[k] * d32[k], float(dot), acc[v][k]);
-                if (DM)
-                    accm[v][k] = fma(m[k] * d32[k], float(asum), accm[v][k]);
+                if (OFF != 0)
+                    dot -= OFF * asum;
+                /* the tail's empty blocks: the CPU's zero blocks add 0 */
+                if (k < nk) {
+                    acc[v][k] = fma(d[k] * d32[k], float(dot), acc[v][k]);
+                    if (DM)
+                        accm[v][k] = fma(m[k] * d32[k], float(asum), accm[v][k]);
+                }
             }
             xo[v] += 20u;
         }
     }
     if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
-            if (v0 + v < p.nv) {
-                float r = hsum8(acc[v]);
+            if (v0 + v < nv) {
+                precise float r = hsum8(acc[v]);
                 if (DM)
                     r = r + hsum8(accm[v]);
-                Y.v[(v0 + v) * p.ys + row] = r;
+                if (p.tail != 0u)
+                    r = res[v] + r;
+                Y.v[(v0 + v) * ys + row] = r;
             }
 }

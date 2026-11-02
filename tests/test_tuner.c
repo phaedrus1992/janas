@@ -4,13 +4,15 @@
  * test_tuner.c - the self-tuner on simulated costs: it settles on the
  * fastest candidate, keeps the default on near ties, never picks a GPU
  * candidate when the GPU is not allowed, tries the others ever more rarely
- * while they lose, and its saved choices come back.
+ * while they lose, and its saved choices come back; the devices the user
+ * allows (common/devices.h) as written and as the tuner keeps to them.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "common/devices.h"
 #include "llm/tuner.h"
 
 static int failures;
@@ -230,6 +232,75 @@ int main(void)
     janas_tuner_force(&v, 1);
     for (int i = 0; i < 10; i++)
         CHECK(janas_tuner_pick(&v, 0) == 1, "forced candidate not used");
+
+    /* the user's devices: a class kept to the NPU runs it, slower or not;
+       a list chooses among its own; a fixed tuner runs the allowed */
+    const struct janas_tune_cand dc[4] = {{.threads = 12},
+                                          {.threads = 12, .gpu = 1},
+                                          {.threads = 12, .npu = 1},
+                                          {.threads = 12, .gpu = 1, .npu = 1}};
+    const int dd[JANAS_TUNE_CLASSES] = {0, 0, 0, 0};
+    struct janas_tuner d;
+    janas_tuner_init(&d, dc, 4, dd, 0);
+    janas_tuner_allow_gpu(&d, 1);
+    janas_tuner_allow(&d, 2, 1 << JANAS_DEV_NPU);
+    int elsewhere = 0;
+    for (int i = 0; i < 200; i++) {
+        int c = janas_tuner_pick(&d, 2);
+        elsewhere += c != 2;
+        janas_tuner_record(&d, 2, c, (const double[]){0.5, 0.4, 1.0, 0.9}[c]);
+    }
+    CHECK(!elsewhere && janas_tuner_best(&d, 2) == 2,
+          "npu: %d passes elsewhere, best %d", elsewhere,
+          janas_tuner_best(&d, 2));
+    janas_tuner_init(&d, dc, 4, dd, 0);
+    janas_tuner_allow_gpu(&d, 1);
+    janas_tuner_allow(&d, 2, 1 << JANAS_DEV_NPU | 1 << JANAS_DEV_GPU);
+    elsewhere = 0;
+    for (int i = 0; i < 200; i++) {
+        int c = janas_tuner_pick(&d, 2);
+        elsewhere += c == 0 || c == 3;
+        janas_tuner_record(&d, 2, c, (const double[]){0.3, 1.0, 0.6, 0.2}[c]);
+    }
+    CHECK(!elsewhere && janas_tuner_best(&d, 2) == 2,
+          "npu,gpu: %d passes elsewhere, best %d", elsewhere,
+          janas_tuner_best(&d, 2));
+    janas_tuner_init(&d, dc, 4, dd, 1);
+    janas_tuner_allow(&d, 2, 1 << (JANAS_DEV_GPU | JANAS_DEV_NPU));
+    CHECK(janas_tuner_pick(&d, 2) == 3, "fixed, npu+gpu: candidate %d",
+          janas_tuner_pick(&d, 2));
+    /* the devices as written */
+    char why[200], nm[64];
+    static const struct {
+        const char *spec;
+        int mask;
+    } specs[] = {{"auto", 0},
+                 {"", 0},
+                 {"cpu", 1},
+                 {"npu", 1 << 2},
+                 {"NPU+gpu", 1 << 3},
+                 {"gpu+cpu", 1 << 1},
+                 {"cpu,npu", 1 | 1 << 2},
+                 {"npu,gpu,npu+gpu", 1 << 1 | 1 << 2 | 1 << 3},
+                 {"tpu", -1},
+                 {"npu,", -1},
+                 {"+npu", -1},
+                 {"npu++gpu", -1},
+                 {"gpu,,npu", -1}};
+    for (size_t i = 0; i < sizeof specs / sizeof *specs; i++) {
+        int got = janas_devices_mask(specs[i].spec, why, sizeof why);
+        CHECK(got == specs[i].mask, "devices \"%s\": %d, want %d",
+              specs[i].spec, got, specs[i].mask);
+    }
+    CHECK(janas_devices_mask(NULL, why, sizeof why) == 0, "devices NULL");
+    janas_devices_name(1 << 2 | 1 << 3, nm, sizeof nm);
+    CHECK(!strcmp(nm, "npu,npu+gpu"), "name \"%s\"", nm);
+    janas_devices_name(0, nm, sizeof nm);
+    CHECK(!strcmp(nm, "auto"), "name \"%s\"", nm);
+    CHECK(janas_devices_option("--prompt-on", "tpu", why, sizeof why) < 0 &&
+              janas_devices_option("--ctx", "4096", why, sizeof why) == 0 &&
+              janas_devices_option("--reply-on", NULL, why, sizeof why) < 0,
+          "devices options");
 
     printf("test_tuner: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;

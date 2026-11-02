@@ -11,6 +11,15 @@
  *                    [--prompt <tokens>] [--gen <tokens>] [--ctx <tokens>]
  *                    [--cache <GiB>] [--reserve <GiB>]
  *                    [--rounds <n>] (default 3, alternating the order)
+ *                    [--no-npu] (without the NPU, as JANAS_NPU=0;
+ *                    with one, its configurations are measured too)
+ *                    [--prompt-on <devices>] [--drafts-on <devices>]
+ *                    [--reply-on <devices>] (as in janas-chat: the
+ *                    devices the engine may choose for each kind of pass;
+ *                    the rows measured are the configurations it may
+ *                    choose for some kind)
+ *                    [--npu-int8] (the NPU's rows with eight-bit
+ *                    activations)
  *                    [--settle <seconds>] (after the warm-up, wait up to
  *                    that long for the cache's background filling to end:
  *                    the configurations measured on a warm cache, as a
@@ -44,6 +53,7 @@
 #include <sys/utsname.h>
 #include <time.h>
 
+#include "common/devices.h"
 #include "common/env_names.h"
 #include "common/model_pick.h"
 #include "common/sysinfo.h"
@@ -53,6 +63,7 @@
 #include "llm/expert_cache.h"
 #include "llm/generate.h"
 #include "llm/gpu.h"
+#include "llm/tuner.h"
 
 #ifndef JANAS_VERSION
 #define JANAS_VERSION "unknown"
@@ -132,10 +143,13 @@ static int measure(struct janas_llm_model *m, const int32_t *prompt,
     struct janas_llm_session *s = janas_llm_session_create(m, &o);
     if (!s || janas_llm_session_append(s, prompt, n_prompt) != 0)
         return -1;
-    double t0 = now();
+    /* without the NPU's compilations (a matrix's first block, once a
+       session): said apart in the report */
+    double k0 = janas_llm_model_npu_compile_seconds(m), t0 = now();
     if (janas_llm_session_prefill(s) != 0)
         return -1;
     double t1 = now();
+    t0 += janas_llm_model_npu_compile_seconds(m) - k0;
     for (uint32_t i = 0; i < n_gen; i++) {
         int32_t t;
         if (janas_llm_session_next(s, &t) != 0)
@@ -197,9 +211,13 @@ int main(int argc, char **argv)
                 "usage: janas-bench [<model>] [--models <dir>] "
                 "[--mtp <file> | --no-mtp] [--prompt <tokens>] "
                 "[--gen <tokens>] [--ctx <tokens>] [--cache <GiB>] "
-                "[--reserve <GiB>] [--rounds <n>] [--settle <seconds>]\n"
+                "[--reserve <GiB>] [--rounds <n>] [--settle <seconds>] "
+                "[--no-npu] [--prompt-on <devices>] [--drafts-on <devices>] "
+                "[--reply-on <devices>] [--npu-int8]\n"
                 "<model>: a .jns file, or a name of the models Janas knows "
-                "(downloaded if it is not there yet); none: the list\n");
+                "(downloaded if it is not there yet); none: the list\n"
+                "<devices>: auto (default), cpu, gpu, npu, npu+gpu (both in "
+                "each pass), or a list apart by commas to choose from\n");
         return 2;
     }
     struct janas_llm_params p;
@@ -212,8 +230,9 @@ int main(int argc, char **argv)
     const char *model = NULL, *models = NULL;
     int no_mtp = 0;
     static const char *const options[] = {
-        "--mtp", "--no-mtp", "--models", "--prompt",  "--gen",
-        "--ctx", "--rounds", "--cache",  "--reserve", "--settle"};
+        "--mtp",    "--no-mtp",    "--models",    "--prompt",   "--gen",
+        "--ctx",    "--rounds",    "--cache",     "--reserve",  "--settle",
+        "--no-npu", "--prompt-on", "--drafts-on", "--reply-on", "--npu-int8"};
     for (int i = 1; i < argc; i += 2) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         char why[200] = "";
@@ -229,6 +248,23 @@ int main(int argc, char **argv)
             i--;
             continue;
         }
+        if (strcmp(a, "--no-npu") == 0) {
+            setenv("JANAS_NPU", "0", 1); /* read when the model opens */
+            i--;
+            continue;
+        }
+        if (strcmp(a, "--npu-int8") == 0) {
+            setenv("JANAS_NPU_A8", "1", 1); /* so is this */
+            i--;
+            continue;
+        }
+        int dk = janas_devices_option(a, v, why, sizeof why);
+        if (dk < 0) {
+            fprintf(stderr, "janas-bench: %s\n", why);
+            return 2;
+        }
+        if (dk > 0)
+            continue;
         if (strcmp(a, "--mtp") == 0 && v)
             p.mtp_path = v;
         else if (strcmp(a, "--models") == 0 && v)
@@ -326,7 +362,24 @@ int main(int argc, char **argv)
         out("GPU:     %s\n", janas_gpu_name(gpu));
     else
         out("GPU:     none usable: %s\n", janas_llm_model_gpu_why(m));
+    const char *npu = janas_llm_model_npu_name(m);
+    if (npu)
+        out("NPU:     %s\n", npu);
+    else
+        out("NPU:     none usable: %s\n", janas_llm_model_npu_why(m));
     out("model:   %s\n", desc);
+    /* the user's devices, as this machine has them (the engine said on
+       stderr what it could not take) */
+    int on_p = janas_llm_model_devices(m, 2),
+        on_d = janas_llm_model_devices(m, 1),
+        on_r = janas_llm_model_devices(m, 0);
+    if (on_p || on_d || on_r) {
+        char dp[64], dd[64], dr[64];
+        janas_devices_name(on_p, dp, sizeof dp);
+        janas_devices_name(on_d, dd, sizeof dd);
+        janas_devices_name(on_r, dr, sizeof dr);
+        out("devices: prompts %s, drafts %s, replies %s\n", dp, dd, dr);
+    }
 
     /* the prompt: the text once, repeated only when more is asked for */
     struct janas_tokenizer *tok = janas_llm_internal_tokenizer(llm);
@@ -391,16 +444,46 @@ int main(int argc, char **argv)
         }
     }
 
-    int th[16], gp[16];
-    int nc = janas_llm_model_candidates(m, th, gp, 16);
-    struct run sum[16];
+    int th[JANAS_TUNE_MAX_CANDS], gp[JANAS_TUNE_MAX_CANDS],
+        np[JANAS_TUNE_MAX_CANDS];
+    int nc = janas_llm_model_candidates(m, th, gp, np, JANAS_TUNE_MAX_CANDS);
+    /* the rows: the configurations the engine may choose for some kind of
+       pass, every one unless the devices are limited - the NPU's for
+       blocks only, the GPU's for replies only where it takes single
+       tokens */
+    int rows[JANAS_TUNE_MAX_CANDS], n_rows = 0, npu_row = -1;
+    int gpu_one = gpu && janas_gpu_min_n(gpu) <= 1;
+    for (int c = 0; c < nc; c++) {
+        rows[c] = !on_p || on_p >> (gp[c] | np[c] << 1) & 1;
+        if (!np[c])
+            rows[c] |= (!on_d || on_d >> gp[c] & 1) ||
+                       ((!gp[c] || gpu_one) && (!on_r || on_r >> gp[c] & 1));
+        n_rows += rows[c];
+        if (rows[c] && np[c] && npu_row < 0)
+            npu_row = c;
+    }
+    /* the NPU's copies of the weights and its graphs made (and with
+       --npu-int8 the scales of the activations taken) before the rows, as
+       a chat has them after its first prompt */
+    if (npu_row >= 0) {
+        out("warming up the NPU...\n");
+        janas_llm_model_force(m, npu_row);
+        if (measure(m, prompt, n_prompt, n_gen, NULL, &d) != 0) {
+            out("generation failed\n");
+            return 1;
+        }
+        janas_llm_model_force(m, -1);
+    }
+    struct run sum[JANAS_TUNE_MAX_CANDS];
     memset(sum, 0, sizeof(sum));
     uint64_t drafted = 0, accepted = 0, drafted_s = 0, accepted_s = 0;
     /* several rounds, every other one in reverse order: heat and cache
        drift affect every configuration alike */
-    out("measuring %d configurations, %d rounds...\n", nc, rounds);
+    out("measuring %d configurations, %d rounds...\n", n_rows, rounds);
     for (int k = 0; k < rounds * nc; k++) {
         int c = (k / nc) % 2 ? nc - 1 - k % nc : k % nc;
+        if (!rows[c])
+            continue;
         janas_llm_model_force(m, c);
         struct janas_expert_cache_stats s0, s1;
         janas_expert_cache_stats(janas_llm_model_cache(m), &s0);
@@ -428,8 +511,13 @@ int main(int argc, char **argv)
     for (int c = 0; c < nc; c++) {
         const struct run *r = &sum[c];
         char name[64];
+        if (!rows[c])
+            continue;
         snprintf(name, sizeof(name), "%d threads%s", th[c],
-                 gp[c] ? " + GPU" : "");
+                 gp[c] && np[c] ? " + GPU + NPU"
+                 : gp[c]        ? " + GPU"
+                 : np[c]        ? " + NPU"
+                                : "");
         char mt[32] = "", ms[32] = "";
         if (has_mtp) {
             snprintf(mt, sizeof(mt), "%.1f tok/s", r->mtp);
@@ -444,7 +532,7 @@ int main(int argc, char **argv)
        GPU of no help where it read the prompt 5.2 times faster) */
     int cpu_rows = 0;
     for (int c = 0; c < nc; c++)
-        cpu_rows += !gp[c];
+        cpu_rows += rows[c] && !gp[c];
     if (cpu_rows && janas_llm_model_gpu_prompts(m))
         out("note:    in every row the GPU reads a prompt's blocks of %d "
             "tokens or more (the fast prompt); \"+ GPU\" also gives it a "
@@ -454,6 +542,28 @@ int main(int argc, char **argv)
                 ? ", from 2 tokens on: a reply's single tokens are the "
                   "CPU's in every row"
                 : "");
+    if (npu_row >= 0)
+        out("note:    \"+ NPU\": the NPU computes the products of blocks of "
+            "%s tokens or more whose weights stay in memory (attention, "
+            "recurrent layers, shared experts, a dense model's "
+            "feed-forwards; a dense model's layers whole where nine in ten "
+            "fit%s), the CPU%s the "
+            "rest%s; its preparation (copies of the weights, graphs: %.1f s "
+            "in all) is in a warm-up of its own, not in the rows\n",
+            getenv("JANAS_NPU_MIN_N") ? getenv("JANAS_NPU_MIN_N") : "64",
+            getenv("JANAS_NPU_A8") && atoi(getenv("JANAS_NPU_A8")) > 0
+                ? ", with eight-bit activations"
+                : "",
+            janas_llm_model_gpu_prompts(m) ? " and the GPU's fast prompt" : "",
+            janas_llm_model_gpu_prompts(m)
+                ? " (--prompt-on npu for the CPU and the NPU alone)"
+                : "",
+            janas_llm_model_npu_compile_seconds(m));
+    if (npu_row >= 0 && !janas_llm_model_npu_auto(m) && !on_p)
+        out("note:    the engine does not give the NPU this model's blocks by "
+            "itself: in products on Gemma 4 the NPU's answers measured below "
+            "the CPU's against llama.cpp's (26B-A4B, E2B); --prompt-on npu "
+            "asks for it\n");
     janas_llm_model_force(m, -1);
     char tune[512];
     int32_t tn;
@@ -465,10 +575,11 @@ int main(int argc, char **argv)
     int row[3];
     for (int k = 0; k < 3; k++) {
         int t = janas_llm_model_threads(m, k),
-            g = (janas_llm_model_gpu_used(m) >> k) & 1;
+            g = (janas_llm_model_gpu_used(m) >> k) & 1,
+            u = (janas_llm_model_npu_used(m) >> k) & 1;
         row[k] = 0;
         for (int c = 0; c < nc; c++)
-            if (th[c] == t && gp[c] == g)
+            if (rows[c] && th[c] == t && gp[c] == g && np[c] == u)
                 row[k] = c;
     }
     out("\nresult:  prefill %.1f tok/s, decode %.1f tok/s", sum[row[2]].prefill,

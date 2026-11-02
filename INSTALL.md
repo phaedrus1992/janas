@@ -9,6 +9,7 @@ Janas-LLM runs large mixture-of-experts language models on ordinary computers: t
 - **Memory:** at least 16 GB; 32 GB or more for large models (Qwen3-Next-80B-A3B: about 2 GB of resident weights, plus as much expert cache as the memory allows).
 - **Disk:** the model on an **NVMe SSD** (the experts are read directly from it while generating).
 - **GPU (optional):** an integrated or discrete GPU with a **Vulkan 1.3** driver. The engine works fully without one; it measures whether the GPU helps on your machine and uses it only then.
+- **NPU (optional, Linux):** the NPU of an Intel Core Ultra, with Intel's NPU driver (below). It reads prompts; the engine measures it as it does the GPU.
 
 ## Building
 
@@ -25,6 +26,8 @@ On Fedora: `sudo dnf install gcc make` and, for the GPU, `vulkan-loader-devel gl
 The shaders need glslang 15.2 or later (`glslangValidator --version`). Ubuntu 24.04's `glslang-tools` is 15.1, too old: the build then goes on without the GPU and says why. A newer one is the prebuilt release from <https://github.com/KhronosGroup/glslang/releases> (`glslang-16.6.0-linux-x86_64-release.tar.gz`, the one Janas's own packages are built with): unpack it and put its `bin/` first in the `PATH` before building.
 
 The GPU also needs its Vulkan driver: Mesa (`mesa-vulkan-drivers` on Debian/Ubuntu) for Intel and AMD, the proprietary driver for NVIDIA. `vulkaninfo --summary` should list your GPU with Vulkan 1.3 or later. When the engine takes none, `janas-bench` and the model's description say why: a build without GPU support (`glslangValidator` missing or older than 15.2: see above, and build again), no Vulkan loader, a GPU whose driver lacks something (named), or the GPU turned off.
+
+The NPU needs nothing at build time: the engine opens Intel's Level Zero driver when a model opens, if it is installed, and goes on without it otherwise. To use it, install the `intel-level-zero-npu` and `intel-driver-compiler-npu` packages of a release of [linux-npu-driver](https://github.com/intel/linux-npu-driver) (1.38.0 was tried, with its packages for Ubuntu 24.04 on Debian 13) and a Level Zero loader, `libze1` (1.32.0 was tried), and add your user to the `render` group (`sudo usermod -aG render $USER`, then log in again), which may open the NPU's device. `janas-bench` names the NPU on its `NPU:` line, or says why there is none to use. `JANAS_NPU_LOADER` names a loader outside the library path, such as one unpacked without installing (`dpkg -x`, with `LD_LIBRARY_PATH` pointing at the driver's libraries); `JANAS_NPU=0` keeps the engine off the NPU. Only the first generation's NPU (Meteor Lake) has been tried.
 
 Then, in the source directory:
 

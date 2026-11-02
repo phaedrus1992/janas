@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 #include "model.h"
 
+#include "janas/llm.h" /* JANAS_LLM_QUALITY_* */
+
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -19,6 +21,7 @@
 #include <unistd.h>
 
 #include "attention.h"
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "common/sysinfo.h"
 #include "deltanet.h"
@@ -62,8 +65,10 @@ static const struct janas_jns_tensor *need(const struct janas_jns *j,
         ok = ok && t->type == 0;
     else if (kind == T_F16)
         ok = ok && t->type == 1;
-    else
-        ok = ok && janas_qtype_block_size((int)t->type) != 0;
+    else /* the bit planes are the experts' alone: a resident tensor in
+            them could be neither unpacked (janas_dequantize) nor read */
+        ok = ok && janas_qtype_block_size((int)t->type) != 0 &&
+             t->type != JANAS_Q6_K_P && t->type != JANAS_Q6_K_PN;
     if (!ok) {
         snprintf(err, err_len, "tensor %s: unexpected type or shape", name);
         return NULL;
@@ -86,6 +91,7 @@ static int load_ssm_params(struct janas_llm_model *m)
         return -1;
     m->conv_ch = 2 * m->n_kh * m->ds + m->d_inner;
     m->qkvz_dim = 2 * m->n_kh * m->ds + 2 * m->d_inner;
+    m->ssm_per = (size_t)m->n_vh * m->ds * m->ds;
     return 0;
 }
 
@@ -189,23 +195,26 @@ static int rows_f32(struct janas_llm_model *m, const struct janas_jns *j,
  * Where the head is the token embeddings (Qwen3-0.6B and 4B, Qwen3.5-0.8B
  * and 2B) the table is requantized in place, so the embeddings read at four
  * bits too, as in the larger models' files: Qwen3.5-2B +9%, the most
- * likely token 352 where 376 (8 Oct 2026).
+ * likely token 352 where 376 (8 Oct 2026). A head at five bits (Q5_K,
+ * Qwen3.8-Flash-Next's from ISTA, 437 MB read at every token) is
+ * requantized the same way.
  */
 struct rq_job {
     const uint8_t *src;
     uint8_t *dst;
     size_t first, count; /* blocks of JANAS_QK weights */
+    int type;            /* the source's: Q6_K or Q5_K */
 };
 
 static void *rq_worker(void *arg)
 {
     struct rq_job *r = arg;
     float buf[JANAS_QK * 16];
-    size_t sb = janas_qtype_block_size(JANAS_Q6_K),
+    size_t sb = janas_qtype_block_size(r->type),
            db = janas_qtype_block_size(JANAS_Q4_K);
     for (size_t b = r->first; b < r->first + r->count; b += 16) {
         size_t nb = r->first + r->count - b < 16 ? r->first + r->count - b : 16;
-        janas_dequantize(JANAS_Q6_K, r->src + b * sb, buf, nb * JANAS_QK);
+        janas_dequantize(r->type, r->src + b * sb, buf, nb * JANAS_QK);
         janas_q4k_quantize_fast(
             buf, (struct janas_block_q4k *)(r->dst + b * db), nb * JANAS_QK);
     }
@@ -299,14 +308,15 @@ static void requant_head(struct janas_llm_model *m)
     if (!t)
         t = (struct janas_jns_tensor *)janas_jns_tensor(&m->j,
                                                         "token_embd.weight");
-    if (!t || t->type != JANAS_Q6_K || t->dims[0] % JANAS_QK ||
-        t->offset < m->j.h.resident_offset ||
+    if (!t || (t->type != JANAS_Q6_K && t->type != JANAS_Q5_K) ||
+        t->dims[0] % JANAS_QK || t->offset < m->j.h.resident_offset ||
         t->offset + t->bytes > m->j.h.resident_offset + m->j.h.resident_bytes)
         return;
     enum { NT = 16 };
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     int nt = cpus < 1 ? 1 : cpus > NT ? NT : (int)cpus;
-    size_t nb = t->bytes / janas_qtype_block_size(JANAS_Q6_K);
+    int type = (int)t->type;
+    size_t nb = t->bytes / janas_qtype_block_size(type);
     uint8_t *src = (uint8_t *)data(m, t);
     uint8_t *dst = malloc(nb * janas_qtype_block_size(JANAS_Q4_K));
     if (!dst)
@@ -316,8 +326,8 @@ static void requant_head(struct janas_llm_model *m)
     int started = 0;
     for (int k = 0; k < nt; k++) {
         size_t a = nb * k / nt, b = nb * (k + 1) / nt;
-        jb[k] =
-            (struct rq_job){.src = src, .dst = dst, .first = a, .count = b - a};
+        jb[k] = (struct rq_job){
+            .src = src, .dst = dst, .first = a, .count = b - a, .type = type};
         if (pthread_create(&th[k], NULL, rq_worker, &jb[k]) == 0)
             started |= 1 << k;
         else
@@ -353,7 +363,10 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
     snprintf(name, sizeof(name), "blk.%u." suffix, l);                         \
     if (!(var = need(j, name, T_F32, d0, 0, err, err_len)))                    \
         return -1;
-    NEED(attn_norm, "attn_norm.weight", T_F32, dm, 0)
+    /* qwen4exp: the hyper-connections' mixes in place of the norms */
+    if (!m->a->hc) {
+        NEED(attn_norm, "attn_norm.weight", T_F32, dm, 0)
+    }
     if (ly->rec) {
         uint32_t s = m->ds;
         if (m->a->rec == JANAS_REC_Q35) {
@@ -394,7 +407,9 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
     } else {
         NEED(wq, "attn_q.weight", T_QUANT, dm, qd * (m->a->attn_gate ? 2 : 1))
         NEED(wo, "attn_output.weight", T_QUANT, qd, dm)
-        NEED(q_norm, "attn_q_norm.weight", T_F32, ly->hd, 0)
+        if (!m->a->no_qk_norm) {
+            NEED(q_norm, "attn_q_norm.weight", T_F32, ly->hd, 0)
+        }
         /* a layer reading an earlier one's keys and values has no use for
            its k and v, even where the file has them */
         if (!m->n_kv_layers || l < m->n_kv_layers) {
@@ -403,7 +418,9 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
             if (!m->a->swa || janas_jns_tensor(j, name)) {
                 NEED(wv, "attn_v.weight", T_QUANT, dm, kvd)
             }
-            NEED(k_norm, "attn_k_norm.weight", T_F32, ly->hd, 0)
+            if (!m->a->no_qk_norm) {
+                NEED(k_norm, "attn_k_norm.weight", T_F32, ly->hd, 0)
+            }
         }
     }
     if (m->ple_dim) {
@@ -433,7 +450,10 @@ static int load_layer(struct janas_llm_model *m, const struct janas_jns *j,
         if (os && os->type == 0 && os->dims[0] == 1)
             ly->out_scale = f32(m, os)[0];
     }
-    if (m->a->post_attn_norm) {
+    if (m->a->hc) {
+        if (janas_m_hc_layer_load(m, j, l, ly, err, err_len) != 0)
+            return -1;
+    } else if (m->a->post_attn_norm) {
         NEED(ffn_norm, "post_attention_norm.weight", T_F32, dm, 0)
     } else {
         NEED(ffn_norm, "ffn_norm.weight", T_F32, dm, 0)
@@ -569,7 +589,7 @@ static int load_mtp(struct janas_llm_model *m, const char *path, char *err,
         snprintf(err, err_len, "%s: not an MTP block of this model", path);
         return -1;
     }
-    m->mtp_res = aligned_alloc(4096, h->resident_bytes);
+    m->mtp_res = janas_aligned_alloc(4096, h->resident_bytes);
     if (!m->mtp_res) {
         snprintf(err, err_len, "out of memory for the MTP block");
         return -1;
@@ -593,9 +613,34 @@ static int load_mtp(struct janas_llm_model *m, const char *path, char *err,
     if (load_layer(m, &m->mtp_j, 0, &m->mtp_layer, err, err_len) != 0 ||
         !(m->eh_proj = need(&m->mtp_j, "mtp.eh_proj.weight", T_QUANT, 2 * dm,
                             dm, err, err_len)) ||
-        !(m->enorm = need(&m->mtp_j, "mtp.enorm.weight", T_F32, dm, 0, err,
-                          err_len)) ||
-        !(m->hnorm = need(&m->mtp_j, "mtp.hnorm.weight", T_F32, dm, 0, err,
+        !(m->enorm =
+              need(&m->mtp_j, "mtp.enorm.weight", T_F32, dm, 0, err, err_len)))
+        return -1;
+    if (m->a->hc) {
+        /* qwen4exp's block (unsloth's GGUF heads, hf2jns_mtp): a norm for
+           each of the trunk's streams, and a final mix of its own in place
+           of a norm */
+        uint32_t hd = m->hc_n * dm;
+        if (!(m->hnorm = need(&m->mtp_j, "mtp.hnorm.weight", T_F32, hd, 0, err,
+                              err_len)) ||
+            !(m->mtp_hco_norm = need(&m->mtp_j, "mtp.hc_head_norm.weight",
+                                     T_F32, hd, 0, err, err_len)))
+            return -1;
+        m->mtp_hco_down =
+            janas_jns_tensor(&m->mtp_j, "mtp.hc_head_down.weight");
+        m->mtp_hco_up = janas_jns_tensor(&m->mtp_j, "mtp.hc_head_up.weight");
+        if (!m->mtp_hco_down || !m->mtp_hco_up ||
+            m->mtp_hco_down->dims[0] != hd ||
+            m->mtp_hco_down->dims[1] != m->hc_rank ||
+            m->mtp_hco_up->dims[0] != m->hc_rank ||
+            m->mtp_hco_up->dims[1] != hd) {
+            snprintf(err, err_len, "%s: its final mix missing or unexpected",
+                     path);
+            return -1;
+        }
+        return 0;
+    }
+    if (!(m->hnorm = need(&m->mtp_j, "mtp.hnorm.weight", T_F32, dm, 0, err,
                           err_len)) ||
         !(m->mtp_norm =
               need(&m->mtp_j, "mtp.norm.weight", T_F32, dm, 0, err, err_len)))
@@ -662,15 +707,32 @@ int janas_m_init_draft_head(struct janas_llm_model *m, const uint8_t *src,
     return 0;
 }
 
+uint32_t janas_llm_main_layers(const struct janas_jns *j)
+{
+    const struct janas_arch *a = janas_arch_find(j->h.arch, sizeof(j->h.arch));
+    char key[128];
+    uint32_t nextn = 0;
+    snprintf(key, sizeof(key), "%.32s.nextn_predict_layers", j->h.arch);
+    if (a && a->nextn_in_file && janas_jns_meta_u32(j, key, &nextn) == 0 &&
+        nextn < j->h.n_layer)
+        return j->h.n_layer - nextn; /* the file's last blocks predict ahead */
+    return j->h.n_layer;
+}
+
 /* A buffer a product writes: whole pages, so that the GPU can be given it
    (janas_gpu_import), listed for that. */
 static float *out_alloc(struct janas_llm_model *m, size_t bytes)
 {
     bytes = (bytes + 4095) & ~(size_t)4095;
-    float *p = aligned_alloc(4096, bytes ? bytes : 4096);
+    float *p = janas_aligned_alloc(4096, bytes ? bytes : 4096);
     if (p && m->n_out < (int)(sizeof(m->out) / sizeof(*m->out)))
         m->out[m->n_out++] = (struct janas_out_buf){p, bytes};
     return p;
+}
+
+float *janas_m_out_alloc(struct janas_llm_model *m, size_t bytes)
+{
+    return out_alloc(m, bytes);
 }
 
 struct janas_llm_model *janas_llm_model_load(const char *path,
@@ -689,31 +751,52 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         snprintf(err, err_len, "architecture %.32s not supported", m->j.h.arch);
         goto fail;
     }
-    m->n_layer = m->j.h.n_layer;
-    uint32_t nextn = 0;
-    if (m->a->nextn_in_file &&
-        meta_u32(m, "nextn_predict_layers", &nextn) == 0 && nextn < m->n_layer)
-        m->n_layer -= nextn; /* the file's last blocks predict ahead */
+    if (!m->j.h.n_layer) { /* resident tensors only: a vision encoder */
+        snprintf(err, err_len, "%s holds no layers: not a language model",
+                 path);
+        goto fail;
+    }
+    m->n_layer = janas_llm_main_layers(&m->j);
     m->d_model = m->j.h.d_model;
     m->n_expert = m->j.h.n_expert;
     m->k = m->j.h.n_expert_used;
     m->d_ff = m->j.layers[0].m[JANAS_JNS_GATE].rows;
     uint32_t interval = 4;
     const uint8_t *swa_pat = NULL;
-    if (meta_u32(m, "attention.head_count", &m->n_head) ||
-        (m->a->swa ? load_swa_params(m, &swa_pat)
-                   : meta_u32(m, "attention.head_count_kv", &m->n_head_kv)) ||
-        meta_u32(m, "attention.key_length", &m->head_dim) ||
-        meta_f32(m, "attention.layer_norm_rms_epsilon", &m->eps) ||
-        meta_f32(m, "rope.freq_base", &m->rope_base) || m->k > MAX_K ||
-        m->n_head_kv == 0 || m->n_head % m->n_head_kv || m->head_dim % 8 ||
-        m->d_model % JANAS_QK || (m->n_head * m->head_dim) % JANAS_QK ||
-        m->d_ff % JANAS_QK || (m->a->rec && load_ssm_params(m) != 0)) {
+    if (m->a->nh
+            ? janas_m_nh_params(m) != 0
+            : meta_u32(m, "attention.head_count", &m->n_head) ||
+                  (m->a->swa ? load_swa_params(m, &swa_pat)
+                             : meta_u32(m, "attention.head_count_kv",
+                                        &m->n_head_kv)) ||
+                  meta_u32(m, "attention.key_length", &m->head_dim) ||
+                  meta_f32(m, "attention.layer_norm_rms_epsilon", &m->eps) ||
+                  meta_f32(m, "rope.freq_base", &m->rope_base) ||
+                  m->k > MAX_K || m->n_head_kv == 0 ||
+                  m->n_head % m->n_head_kv || m->head_dim % 8 ||
+                  m->d_model % JANAS_QK ||
+                  (m->n_head * m->head_dim) % JANAS_QK ||
+                  (m->d_ff % JANAS_QK && !m->a->hc) ||
+                  (m->a->rec && load_ssm_params(m) != 0)) {
         snprintf(err, err_len, "missing or inconsistent hyperparameters");
         goto fail;
     }
     if (meta_u32(m, "rope.dimension_count", &m->n_rot) != 0)
         m->n_rot = m->head_dim;
+    /* the multimodal RoPE's sections, where the model has them */
+    {
+        char key[128];
+        uint64_t ns = 0;
+        const int32_t *sec = NULL;
+        snprintf(key, sizeof(key), "%.32s.rope.dimension_sections",
+                 m->j.h.arch);
+        if (janas_jns_meta_ints(&m->j, key, &ns, &sec) == 0 && ns >= 3)
+            for (int i = 0; i < 3; i++) {
+                int32_t v;
+                memcpy(&v, sec + i, sizeof v);
+                m->mrope[i] = v > 0 ? (uint32_t)v : 0;
+            }
+    }
     if (m->a->rec)
         meta_u32(m, "full_attention_interval", &interval);
     if (m->n_rot == 0 || m->n_rot % 2 || m->n_rot > m->head_dim ||
@@ -721,6 +804,8 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         snprintf(err, err_len, "inconsistent rotary or layer pattern");
         goto fail;
     }
+    if (m->a->hc && janas_m_hc_load(m, err, err_len) != 0)
+        goto fail;
     m->hd_max = m->head_dim > m->head_swa ? m->head_dim : m->head_swa;
     m->kvd_max = m->n_head_kv * m->head_dim;
     if (m->n_kv_swa * m->head_swa > m->kvd_max)
@@ -728,10 +813,25 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     /* the experts of a mixture are alike; a dense model's feed-forward
        may widen from one layer to the next (Gemma 4's E2B: 6144, then
        12288): the buffers take the widest */
-    for (uint32_t l = 0; l < m->n_layer; l++) {
+    for (uint32_t l = 0; l < m->n_layer && !m->a->nh; l++) {
         uint32_t r = m->j.layers[l].m[JANAS_JNS_GATE].rows;
-        if ((r != m->d_ff && m->n_expert > 1) || r % JANAS_QK ||
-            m->j.layers[l].m[JANAS_JNS_DOWN].rows != m->d_model) {
+        const struct janas_jns_matrix *gt = &m->j.layers[l].m[JANAS_JNS_GATE];
+        const struct janas_jns_matrix *up = &m->j.layers[l].m[JANAS_JNS_UP];
+        const struct janas_jns_matrix *dn = &m->j.layers[l].m[JANAS_JNS_DOWN];
+        /* by neuron (tools/jns_neurons.c), its rows are the gate's */
+        int by_neuron = dn->type == JANAS_Q6_K_PN;
+        /* a width that is no multiple of 256 (qwen4exp's 640): the down
+           matrix's rows end inside a group, which the types in blocks of
+           32 or 64 can do (janas_dot_rows_n) */
+        int narrow = r % JANAS_QK != 0;
+        /* every matrix the shape the buffers are made for: the file says
+           the shapes, and only the gate's rows were asked before */
+        if (gt->type == 0 || r == 0 || (r != m->d_ff && m->n_expert > 1) ||
+            gt->cols != m->d_model || up->rows != r || up->cols != m->d_model ||
+            (narrow &&
+             (!m->a->hc || janas_qtype_row_bytes((int)dn->type, r) == 0)) ||
+            (by_neuron ? dn->rows != r || dn->cols != m->d_model
+                       : dn->rows != m->d_model || dn->cols != r)) {
             snprintf(err, err_len, "layer %u: expert shapes differ", l);
             goto fail;
         }
@@ -755,6 +855,8 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
                    janas_jns_tensor(&m->j, "per_layer_token_embd.weight")) ||
              m->ple_tok->dims[0] != (uint64_t)m->n_layer * m->ple_dim ||
              janas_qtype_block_size((int)m->ple_tok->type) == 0 ||
+             m->ple_tok->type == JANAS_Q6_K_P ||
+             m->ple_tok->type == JANAS_Q6_K_PN ||
              !(m->ple_model =
                    janas_jns_tensor(&m->j, "per_layer_model_proj.weight")) ||
              m->ple_model->type != 30 || m->ple_model->dims[0] != m->d_model ||
@@ -791,7 +893,7 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     }
     /* on 2 MB boundaries: see janas_m_huge_pages */
     if (!m->resident)
-        m->resident = aligned_alloc(
+        m->resident = janas_aligned_alloc(
             JANAS_HUGE_PAGE, (m->j.h.resident_bytes + JANAS_HUGE_PAGE - 1) /
                                  JANAS_HUGE_PAGE * JANAS_HUGE_PAGE);
     if (!m->resident) {
@@ -799,7 +901,11 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         goto fail;
     }
     /* all of it but the per-layer embeddings' table, read a row at a time
-       where it is (model_ple.c): its pages, never touched, take no memory */
+       where it is (model_ple.c, model_hc.c): its pages, never touched, take
+       no memory - unless the machine holds it (ple_ram, JANAS_PLE_RAM):
+       then it is read with the rest, and its rows come from memory */
+    const char *pre = getenv("JANAS_PLE_RAM");
+    m->ple_ram = m->ple_tok && (pre ? atoi(pre) > 0 : o->ple_ram);
     uint64_t skip_a = m->j.h.resident_bytes, skip_b = skip_a;
     if (m->ple_tok && m->ple_tok->offset >= m->j.h.resident_offset) {
         skip_a = (m->ple_tok->offset - m->j.h.resident_offset) & ~4095ull;
@@ -808,13 +914,15 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             ~4095ull;
         if (skip_b < skip_a)
             skip_b = skip_a;
+        m->res_hole[0] = skip_a, m->res_hole[1] = skip_b;
     }
     for (uint64_t done = 0; done < m->j.h.resident_bytes;) {
-        if (done == skip_a && skip_b > skip_a) {
+        if (done == skip_a && skip_b > skip_a && !m->ple_ram) {
             done = skip_b;
             continue;
         }
-        uint64_t end = done < skip_a ? skip_a : m->j.h.resident_bytes;
+        uint64_t end =
+            done < skip_a && !m->ple_ram ? skip_a : m->j.h.resident_bytes;
         ssize_t r = pread(m->j.fd, m->resident + done, end - done,
                           (off_t)(m->j.h.resident_offset + done));
         if (r <= 0) {
@@ -828,13 +936,15 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     const char *hbe = getenv("JANAS_HEAD_BITS");
     if ((hbe ? atoi(hbe) : o->head_bits) == 4 && !m->resident_gpu)
         requant_head(m);
+    if (m->a->hc && janas_m_hc_requant(m, err, err_len) != 0)
+        goto fail;
 
     uint32_t dm = m->d_model, qd = m->n_head * m->hd_max, kvd = m->kvd_max,
              ff = m->d_ff;
     if (!(m->tok_embd =
               need(&m->j, "token_embd.weight", T_QUANT, dm, 0, err, err_len)) ||
-        !(m->out_norm =
-              need(&m->j, "output_norm.weight", T_F32, dm, 0, err, err_len)))
+        (!m->a->hc && !(m->out_norm = need(&m->j, "output_norm.weight", T_F32,
+                                           dm, 0, err, err_len))))
         goto fail;
     /* tied embeddings (the dense Qwen3): the table is also the output head */
     m->output = janas_jns_tensor(&m->j, "output.weight")
@@ -853,6 +963,21 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     for (uint32_t l = 0; l < m->n_layer; l++) {
         struct layer *ly = &m->layers[l];
         ly->rec = m->a->rec && (l + 1) % interval != 0;
+        if (m->a->nh) {
+            /* one part a layer: only the Mamba-2 ones keep a state, only
+               the attentions keys and values */
+            ly->nh_kind = janas_m_nh_kind(m, l);
+            ly->rec = ly->nh_kind == JANAS_NH_MAMBA;
+            ly->hd = m->head_dim;
+            ly->n_kv = (uint32_t)m->n_head_kv;
+            ly->n_rot = 0; /* no RoPE */
+            ly->slot = ly->rec                        ? m->n_rec++
+                       : ly->nh_kind == JANAS_NH_ATTN ? m->n_attn++
+                                                      : UINT32_MAX;
+            if (janas_m_nh_layer_load(m, l, ly, err, err_len) != 0)
+                goto fail;
+            continue;
+        }
         if (swa_pat) {
             ly->swa = swa_pat[l] != 0;
             ly->hd = ly->swa ? m->head_swa : m->head_dim;
@@ -896,9 +1021,10 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     if (!m->mtp && m->j.h.n_layer > m->n_layer &&
         load_mtp_internal(m, err, err_len) != 0)
         goto fail;
-    if (m->a->swa) {
+    {
         /* the full layers' RoPE factors (theta divided by them, pair by
-           pair: Gemma 4 turns only the first quarter of a head) */
+           pair: Gemma 4 turns only the first quarter of a head; Llama 3's
+           long context) */
         const struct janas_jns_tensor *rf =
             janas_jns_tensor(&m->j, "rope_freqs.weight");
         if (rf && (rf->type != 0 || rf->dims[0] != m->n_rot / 2)) {
@@ -913,7 +1039,7 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         const char *kv = getenv("JANAS_KV");
         m->kv16 = kv ? atoi(kv) == 16 : m->a->kv16;
     }
-    m->blk = janas_llm_prefill_block(&m->j);
+    m->blk = janas_llm_prefill_block(&m->j, o ? o->min_block : 0);
     /* the sliding-window layers keep a ring of positions, not the whole
        context: the window and a prefill block (JANAS_SWA_RING=0 keeps
        every position, as the full layers do) */
@@ -939,7 +1065,8 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     }
     for (uint32_t l = 0; l <= m->n_layer; l++) {
         const struct layer *ly = l < m->n_layer ? &m->layers[l] : &m->mtp_layer;
-        if (ly->rec || (l == m->n_layer && !m->mtp))
+        if (ly->rec || (l == m->n_layer && !m->mtp) ||
+            (m->a->nh && l < m->n_layer && ly->nh_kind == JANAS_NH_MOE))
             continue;
         m->kv_hd[ly->slot] = ly->hd;
         m->kv_heads[ly->slot] = ly->n_kv;
@@ -961,10 +1088,10 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
        (gpu_token.h) */
     size_t kvb = (kv_len + 4095) / 4096 * 4096,
            ksb = (ks_len * sizeof(float) + 4095) / 4096 * 4096;
-    m->kcache = aligned_alloc(4096, kvb ? kvb : 4096);
-    m->vcache = aligned_alloc(4096, kvb ? kvb : 4096);
-    m->kscale = aligned_alloc(4096, ksb ? ksb : 4096);
-    m->vscale = aligned_alloc(4096, ksb ? ksb : 4096);
+    m->kcache = janas_aligned_alloc(4096, kvb ? kvb : 4096);
+    m->vcache = janas_aligned_alloc(4096, kvb ? kvb : 4096);
+    m->kscale = janas_aligned_alloc(4096, ksb ? ksb : 4096);
+    m->vscale = janas_aligned_alloc(4096, ksb ? ksb : 4096);
     m->kv_bytes = kvb;
     m->ks_bytes = ksb;
     /* a pair's rows: the experts', or a wider shared feed-forward's */
@@ -972,6 +1099,9 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     for (uint32_t l = 0; l < m->n_layer; l++)
         if (m->layers[l].sh_w[0] && m->layers[l].sh_mx[0].rows > m->ff_buf)
             m->ff_buf = m->layers[l].sh_mx[0].rows;
+    /* in whole groups of 256: a narrower width's activations are quantized
+       with zeros after them (model_ffn.c) */
+    m->ff_buf = (m->ff_buf + JANAS_QK - 1) / JANAS_QK * JANAS_QK;
     ff = m->ff_buf;
     size_t B = m->blk, P = B * (m->k + 1);
     size_t inner = m->d_inner > qd ? m->d_inner : qd;
@@ -1018,6 +1148,18 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     m->gate = out_alloc(m, P * ff * sizeof(float));
     m->up = out_alloc(m, P * ff * sizeof(float));
     m->h = malloc(P * ff * sizeof(float));
+    if (janas_m_ana_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the Ana-Net probe");
+        goto fail;
+    }
+    if (janas_m_janet_init(m) != 0) {
+        snprintf(err, err_len, "the Janet probe could not start");
+        goto fail;
+    }
+    if (janas_m_neurons_init(m, P) != 0) {
+        snprintf(err, err_len, "out of memory for the neurons' levels");
+        goto fail;
+    }
     m->dout = out_alloc(m, P * dm * sizeof(float));
     m->xg = malloc(P * dm / JANAS_QK * sizeof(*m->xg));
     m->hq = malloc(P * ff / JANAS_QK * sizeof(*m->hq));
@@ -1053,7 +1195,10 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
                memory, since then nothing is read while generating anyway;
                otherwise four bits, which read a third to a half fewer bytes
                and cost five to seven positions in four hundred */
-            bits = o->cache_bytes >= m->j.h.experts_bytes ? 6 : 4;
+            bits = o->cache_bytes >= m->j.h.experts_bytes ||
+                           o->min_quality >= JANAS_LLM_QUALITY_HIGH
+                       ? 6
+                       : 4;
             m->exp_auto = 1;
         }
         m->exp_level = bits == 2 ? 1 : bits == 4 ? 2 : 3;
@@ -1080,7 +1225,8 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
      */
     if (o->cache_bytes && m->j.h.experts_bytes) {
         double cover = (double)o->cache_bytes / (double)m->j.h.experts_bytes;
-        if (cover < 0.20) {
+        /* below MEDIUM only: the caller's floor (min_quality) */
+        if (cover < 0.20 && o->min_quality < JANAS_LLM_QUALITY_MEDIUM) {
             m->miss_skip = (cover < 0.10 ? 0.95f : 0.8f) / (float)m->k;
             m->k_auto = 1;
         }
@@ -1113,10 +1259,21 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             goto fail;
         }
     }
+    /* the experts' input and output: the model's width, the block, x
+       (Nemotron-H's mixtures switch to their latent ones for a call) */
+    m->moe_w = dm;
+    m->moe_xq = m->xq;
+    m->moe_out = m->x;
+    if (m->a->nh && janas_m_nh_alloc(m) != 0) {
+        snprintf(err, err_len, "out of memory");
+        goto fail;
+    }
+    if (m->a->hc && (janas_m_hc_alloc(m, err, err_len) != 0 ||
+                     janas_m_qsa_load(m, err, err_len) != 0))
+        goto fail;
     if (m->a->rec) {
         /* the GPU reads and writes them too (gpu_token.c): imported */
-        size_t sb = 2 * (size_t)m->n_rec * m->n_vh * m->ds * m->ds *
-                    sizeof(uint16_t),
+        size_t sb = 2 * (size_t)m->n_rec * m->ssm_per * sizeof(uint16_t),
                cb = 2 * (size_t)m->n_rec * m->conv_ch * (m->d_conv - 1) *
                     sizeof(float);
         m->ssm_buf = (uint16_t *)out_alloc(m, sb);
@@ -1206,8 +1363,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         m->caller_pinned = janas_cpus_save(m->caller_cpus) == 0;
         janas_pin_current_thread(pin);
     }
-    m->cache = janas_expert_cache_create(&m->j, o->cache_bytes, m->exp_level,
-                                         m->io, err, err_len);
+    /* an MTP block in the file has its experts in this cache, in slots of
+       their own where they are larger (issue #34); one in a file of its own
+       has a cache of its own, and the file's block is never asked for */
+    m->cache = janas_expert_cache_create_split(
+        &m->j, m->mtp_own_cache ? m->n_layer : m->j.h.n_layer, m->n_layer,
+        o->cache_bytes, m->exp_level, m->io, err, err_len);
     if (!m->cache)
         goto fail;
     /* reads ahead (model_ffn.c janas_m_prefetch): where they pay, of the
@@ -1265,17 +1426,35 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
         }
     }
     if (m->mtp) {
-        m->hid = malloc(B * dm * sizeof(float));
-        m->mtp_hid = malloc(B * dm * sizeof(float));
+        /* qwen4exp: the residual's streams a row, and the block's input a
+           stream at a time (model_hc.c janas_m_hc_mtp) */
+        size_t hw = m->hc_n ? m->hc_n : 1;
+        m->hid = malloc(B * hw * dm * sizeof(float));
+        m->mtp_hid = malloc(B * hw * dm * sizeof(float));
         m->cat = malloc(B * 2 * dm * sizeof(float));
-        m->catq = malloc(B * 2 * dm / JANAS_QK * sizeof(*m->catq));
-        /* its own experts' cache, or the main one (block in the file) */
+        m->catq = malloc(B * hw * 2 * dm / JANAS_QK * sizeof(*m->catq));
+        /* its own experts' cache, or the main one (block in the file). Its
+           own holds every expert unless the caller says otherwise - the
+           API counts the whole file in the memory it plans (api.c
+           mem_fixed) - and never fewer than a block of tokens asks for at
+           once (model_ffn.c): 256 MiB, the old default, held 74 of
+           Qwen3.8-Flash-Next's experts of 3.6 MB, and a block asks for up
+           to JANAS_EXPERT_CHUNK */
+        uint64_t mtp_budget = 0;
+        if (m->mtp_own_cache) {
+            uint32_t ne = (uint32_t)m->mtp_j.h.n_expert;
+            uint64_t all =
+                janas_expert_cache_room(&m->mtp_j, 1, 1, m->exp_level);
+            uint64_t least =
+                all / ne * (ne < JANAS_EXPERT_CHUNK ? ne : JANAS_EXPERT_CHUNK);
+            mtp_budget = o->mtp_cache_bytes ? o->mtp_cache_bytes : all;
+            if (mtp_budget < least)
+                mtp_budget = least;
+        }
         m->mtp_cache =
             m->mtp_own_cache
-                ? janas_expert_cache_create(
-                      &m->mtp_j,
-                      o->mtp_cache_bytes ? o->mtp_cache_bytes : 256ull << 20,
-                      m->exp_level, m->io, err, err_len)
+                ? janas_expert_cache_create(&m->mtp_j, mtp_budget, m->exp_level,
+                                            m->io, err, err_len)
                 : m->cache;
         if (!m->hid || !m->mtp_hid || !m->cat || !m->catq || !m->mtp_cache ||
             init_draft_head(m, dvocab) != 0)
@@ -1288,7 +1467,13 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
            flushed out of the CPU's caches before the GPU reads it */
         if (m->resident_gpu)
             janas_gpu_flush(m->gpu, m->resident, m->j.h.resident_bytes);
-        else if (janas_m_huge_pages(m->resident, m->j.h.resident_bytes),
+        else if (janas_m_huge_pages(m->resident, m->res_hole[1] > 0
+                                                     ? m->res_hole[0]
+                                                     : m->j.h.resident_bytes),
+                 janas_m_huge_pages(m->resident + m->res_hole[1],
+                                    m->res_hole[1] > 0
+                                        ? m->j.h.resident_bytes - m->res_hole[1]
+                                        : 0),
                  janas_m_gpu_import(m, m->resident, m->j.h.resident_bytes, 0) !=
                      0)
             m->gpu_off = 1;
@@ -1307,6 +1492,12 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
             for (int i = 0; i < m->n_out; i++)
                 janas_gpu_import(m->gpu, m->out[i].p, m->out[i].bytes);
     }
+    if (o->no_npu)
+        snprintf(m->npu_why, sizeof m->npu_why,
+                 "left off: the expert cache needs the memory its copies "
+                 "would take (--prompt-on npu asks for it)");
+    else
+        janas_m_npu_open(m);
     janas_m_init_tuner(m);
     return m;
 
@@ -1317,8 +1508,21 @@ fail:
 
 void janas_llm_model_free(struct janas_llm_model *m)
 {
+    if (m)
+        janas_m_media_free(m);
     if (janas_m_exp_tracing())
         janas_m_exp_report();
+    if (m && getenv("JANAS_GPU_VERBOSE") &&
+        (m->gtok_runs[0] | m->gtok_runs[1] | m->gtok_runs[2]))
+        fprintf(stderr,
+                "janas: whole on the GPU %llu single tokens, %llu passes of "
+                "2-16, %llu blocks; the state %s (%llu there, %llu back)\n",
+                (unsigned long long)m->gtok_runs[0],
+                (unsigned long long)m->gtok_runs[1],
+                (unsigned long long)m->gtok_runs[2],
+                m->gtok_dev ? "copied to the card's memory" : "shared",
+                (unsigned long long)m->gtok_push,
+                (unsigned long long)m->gtok_pull);
     if (m && m->skip_asked && (getenv("JANAS_MISS_SKIP") || m->trace))
         fprintf(stderr,
                 "janas: experts not in RAM below %.3f left out: %llu of %llu "
@@ -1339,11 +1543,14 @@ void janas_llm_model_free(struct janas_llm_model *m)
         free(m->use_count);
         m->use_count = NULL;
     }
+    janas_m_npu_close(m);
     janas_gpu_tok_destroy(m->gpu, m->gtok);
     free(m->gtok_layers);
     free(m->gblk_layers);
     janas_gpu_destroy(m->gpu); /* before the memory it imported; frees
                                   the resident region it allocated */
+    janas_aligned_free(m->gtok_att_in);
+    free(m->gtok_ix_rope);
     janas_expert_cache_destroy(m->cache);
     if (m->mtp_own_cache)
         janas_expert_cache_destroy(m->mtp_cache);
@@ -1353,7 +1560,10 @@ void janas_llm_model_free(struct janas_llm_model *m)
         janas_pool_destroy(m->compute);
     janas_pool_destroy(m->io);
     if (!m->resident_gpu)
-        free(m->resident);
+        janas_aligned_free(m->resident);
+    janas_m_hc_free(m);
+    janas_m_nh_free(m);
+    janas_m_qsa_free(m);
     if (m->layers)
         for (uint32_t l = 0; l < m->n_layer; l++) {
             free(m->layers[l].sh_gate);
@@ -1363,16 +1573,19 @@ void janas_llm_model_free(struct janas_llm_model *m)
             free(m->layers[l].beta_own);
         }
     free(m->layers);
-    float *fl[] = {
-        m->conv_buf, m->x,     m->xn,        m->q,        m->kk,
-        m->vv,       m->att,   m->router,    m->rope_cos, m->rope_sin,
-        m->big,      m->qgate, m->ba,        m->mixed,    m->conv_out,
-        m->beta,     m->decay, m->pair_w,    m->gate,     m->up,
-        m->h,        m->dout,  m->log_mixed, m->log_beta, m->log_decay};
+    float *fl[] = {m->att,   m->router, m->rope_cos, m->rope_sin,
+                   m->qgate, m->ba,     m->mixed,    m->conv_out,
+                   m->beta,  m->decay,  m->pair_w,   m->h};
     for (size_t i = 0; i < sizeof(fl) / sizeof(fl[0]); i++)
         free(fl[i]);
-    free(m->kscale);
-    free(m->vscale);
+    /* the products' buffers (out_alloc) and the KV cache: aligned */
+    void *al[] = {m->conv_buf,  m->x,      m->xn,        m->q,
+                  m->kk,        m->vv,     m->big,       m->gate,
+                  m->up,        m->dout,   m->log_mixed, m->log_beta,
+                  m->log_decay, m->ple,    m->ple_g,     m->ssm_buf,
+                  m->kcache,    m->vcache, m->kscale,    m->vscale};
+    for (size_t i = 0; i < sizeof(al) / sizeof(al[0]); i++)
+        janas_aligned_free(al[i]);
     free(m->kv_off);
     free(m->ks_off);
     free(m->kv_cap);
@@ -1381,17 +1594,15 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->kv_hd);
     free(m->kv_heads);
     free(m->rope_cos_swa);
-    free(m->ple);
-    free(m->ple_g);
     free(m->ple_row);
     free(m->ple_q);
     free(m->rope_sin_swa);
     free(m->xres);
     free(m->xbr);
     free(m->hlen);
-    free(m->kcache);
-    free(m->vcache);
-    free(m->ssm_buf);
+    janas_m_ana_free(m);
+    janas_m_janet_free(m);
+    janas_m_neurons_free(m);
     free(m->xq);
     free(m->attq);
     free(m->pair_tok);
@@ -1407,7 +1618,7 @@ void janas_llm_model_free(struct janas_llm_model *m)
     janas_m_assist_free(m);
     if (m->mtp_open)
         janas_jns_close(&m->mtp_j);
-    free(m->mtp_res);
+    janas_aligned_free(m->mtp_res);
     free(m->hid);
     free(m->mtp_hid);
     free(m->cat);
@@ -1416,7 +1627,14 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->dh_in);
     free(m->dh_ids);
     free(m->dh_logits);
+    free(m->vs_w);
+    free(m->vs_ids);
+    free(m->vs_y);
     free(m->mtp_layer.sh_gate);
+    free(m->mtp_layer.router_own);
+    free(m->mtp_layer.conv_t);
+    free(m->mtp_layer.alpha_own);
+    free(m->mtp_layer.beta_own);
     janas_jns_close(&m->j);
     free(m);
 }
@@ -1637,9 +1855,19 @@ int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
     int huge =
         ((uintptr_t)p & (JANAS_HUGE_PAGE - 1)) == 0 &&
         !(getenv("JANAS_GPU_HUGE") && atoi(getenv("JANAS_GPU_HUGE")) == 0);
+    /* the resident region's hole left out (a region after it may start
+       up to 2 MB into it, its huge page's boundary) */
+    uint64_t ha = bytes, hb = bytes;
+    if (p == m->resident && m->res_hole[1] > m->res_hole[0])
+        ha = m->res_hole[0], hb = m->res_hole[1];
     for (uint64_t at = 0; at < bytes;) {
-        uint64_t from, end = janas_m_import_next(at, bytes, unit, huge, &from);
-        if (!unit && end < bytes)
+        if (at == ha) {
+            at = hb;
+            continue;
+        }
+        uint64_t lim = at < ha ? ha : bytes;
+        uint64_t from, end = janas_m_import_next(at, lim, unit, huge, &from);
+        if (!unit && end < lim)
             end = resident_cut(m, at, end - at);
         /* whole pages, the last one's length rounded up (the allocations
            are) */
@@ -1659,7 +1887,7 @@ int janas_m_gpu_import(struct janas_llm_model *m, const uint8_t *p,
  * others. Checked after each pass until then; one change of a slot later
  * (a new level of bits) and the GPU's copy is no longer used.
  */
-uint32_t janas_llm_prefill_block(const struct janas_jns *j)
+uint32_t janas_llm_prefill_block(const struct janas_jns *j, uint32_t at_least)
 {
     /* 512 where the GPU takes the feed-forwards whole: a mixture's experts
        (gpu.c experts_id) get some 32 tokens each, not 16, and fill its
@@ -1686,6 +1914,8 @@ uint32_t janas_llm_prefill_block(const struct janas_jns *j)
     }
     const char *pb = getenv("JANAS_PREFILL_BLOCK");
     long v = pb ? atol(pb) : fast ? 512 : 256;
+    if (v < (long)at_least)
+        v = (long)at_least;
     return v < JANAS_LLM_MAX_BLOCK ? JANAS_LLM_MAX_BLOCK
            : v > 4096              ? 4096
                                    : (uint32_t)v;
@@ -1695,6 +1925,16 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
 {
     if (!m->gpu || m->gpu_off || !m->cache || m->arena_gpu < 0)
         return;
+    /* a mixture on a card with memory of its own: its experts through the
+       tier the whole pass keeps there (gpu_token_moe.c), not a copy of the
+       arena beside it */
+    if (m->arena_gpu == 0 && janas_m_gpu_tier(m)) {
+        m->arena_gpu = -1;
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr, "arena: not copied, the experts through the "
+                            "card's tier\n");
+        return;
+    }
     if (m->arena_gpu == 1) {
         if (!m->arena_stale && !m->arena_in_place &&
             janas_expert_cache_loads(m->cache) != m->arena_loads)
@@ -1756,6 +1996,11 @@ void janas_m_arena_to_gpu(struct janas_llm_model *m)
                     in_place ? " (in place)" : "");
     } else {
         m->arena_gpu = -1; /* no room for it: the CPU goes on alone */
+        if (getenv("JANAS_GPU_VERBOSE"))
+            fprintf(stderr,
+                    "arena: %.1f GB not imported: the experts stay "
+                    "on the CPU\n",
+                    bytes / 1e9);
     }
 }
 

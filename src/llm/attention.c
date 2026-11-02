@@ -10,12 +10,16 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
 
+#include "common/sysinfo.h"
+#include "jmath.h"
 #include "quant.h"
+#include "tuner.h"
 #include "vmath.h"
 
 #define ATT_CHUNK 256 /* positions per work item */
@@ -37,13 +41,20 @@ struct janas_attn {
     int16_t *qi; /* q to 16 bits: MAX_BLOCK x n_head x hd */
     float *qs;   /* its scale, one per token and head */
     int n_threads;
-    int scores;        /* JANAS_ATTN_FLOAT or JANAS_ATTN_INT16, resolved */
-    int scores_auto;   /* 1: the engine chose it */
-    float scale;       /* of the scores: 1 / sqrt(head_dim) unless set */
-    int kv16;          /* keys and values of sixteen bits, not eight */
-    int ring;          /* position p in row p mod n_ctx (with a window) */
-    uint32_t window;   /* a token sees the last window positions; 0: all */
-    atomic_uint *done; /* chunks finished, per (KV head, subgroup) */
+    int scores;           /* JANAS_ATTN_FLOAT or JANAS_ATTN_INT16, resolved */
+    int scores_auto;      /* 1: the engine chose it */
+    float scale;          /* of the scores: 1 / sqrt(head_dim) unless set */
+    int kv16;             /* keys and values of sixteen bits, not eight */
+    int ring;             /* position p in row p mod n_ctx (with a window) */
+    uint32_t window;      /* a token sees the last window positions; 0: all */
+    const uint32_t *last; /* the next call's last position a token sees
+                             (janas_attn_set_last); NULL: its own */
+    atomic_uint *done;    /* chunks finished, per (KV head, subgroup) */
+    /* the engine's choice (scores_auto): the sixteen-bit query from this
+       position on, a token's calls [0] and a block's [1] (UINT32_MAX:
+       never), measured once before the first call (attn_calibrate) */
+    uint32_t from16[2];
+    int calibrated;
 };
 
 struct attn_job {
@@ -55,10 +66,18 @@ struct attn_job {
     const float *ks, *vs; /* one scale per position and KV head */
     float *out;
     uint32_t n, pos0, n_chunks, split;
-    uint32_t c0;      /* the first chunk any token of the call sees */
-    int fuse;         /* 1: the last chunk of a subgroup merges it */
-    atomic_uint next; /* next item to claim */
+    uint32_t c0;          /* the first chunk any token of the call sees */
+    const uint32_t *last; /* token j sees up to last[j]; NULL: pos0 + j */
+    int fuse;             /* 1: the last chunk of a subgroup merges it */
+    atomic_uint next;     /* next item to claim */
 };
+
+/* The last position token j of a call sees: its own, or beyond it in a
+   span that attends both ways (a picture's tokens) */
+static uint32_t last_seen(const struct attn_job *a, uint32_t j)
+{
+    return a->last ? a->last[j] : a->pos0 + j;
+}
 
 /* The partial of chunk c for token j and query head g of KV head kvh:
    largest score, sum of weights, then head_dim weighted values. */
@@ -550,7 +569,7 @@ static float att_weights_ref(float *row, uint32_t nt, uint32_t vis, float *mx)
             m = row[t];
     for (uint32_t t = 0; t < nt; t++) {
         float d = row[t] - m;
-        row[t] = t >= vis || d < -80.0f ? 0.0f : expf(d);
+        row[t] = t >= vis || d < -80.0f ? 0.0f : janas_exp_det(d);
         sum[t % 8] += row[t];
     }
     *mx = m;
@@ -614,8 +633,8 @@ static void attn_item(struct attn_job *a, uint32_t it, float *sc, int avx,
     uint32_t sub = it % a->split, c = a->c0 + it / a->split % span;
     uint32_t kvh = it / a->split / span, g0 = sub * gs;
     uint32_t t0 = c * ATT_CHUNK, t1 = t0 + ATT_CHUNK;
-    if (t1 > a->pos0 + a->n)
-        t1 = a->pos0 + a->n;
+    if (t1 > last_seen(a, a->n - 1) + 1)
+        t1 = last_seen(a, a->n - 1) + 1;
     uint32_t nt = t1 - t0;
     /* sixteen-bit weights for the values too (att_wquant_ref) */
     const int fastv = A->scores == JANAS_ATTN_INT16 && !A->kv16;
@@ -627,9 +646,13 @@ static void attn_item(struct attn_job *a, uint32_t it, float *sc, int avx,
     const int8_t *V = a->v + row0;
     const float *ks = a->ks + r0;
     const float *vs = a->vs + r0;
-    /* token j sees positions up to pos0 + j: tokens before jlo see
-       nothing of this chunk */
+    /* token j sees positions up to pos0 + j (or last[j], never less and
+       never less than the token before's): tokens before jlo see nothing
+       of this chunk */
     uint32_t jlo = t0 > a->pos0 ? t0 - a->pos0 : 0;
+    if (a->last)
+        for (jlo = 0; jlo < a->n && a->last[jlo] < t0; jlo++)
+            ;
     for (uint32_t j = 0; j < jlo && j < a->n; j++)
         for (uint32_t g = g0; g < g0 + gs; g++) {
             float *pm = att_partial(A, kvh, c, j, g);
@@ -694,7 +717,7 @@ static void attn_item(struct attn_job *a, uint32_t it, float *sc, int avx,
     /* per slot: largest visible score, weights and their sum */
     for (uint32_t sl = 0; sl < ns; sl++) {
         uint32_t j = jlo + sl / gs;
-        uint32_t vis = a->pos0 + j + 1 - t0; /* visible positions */
+        uint32_t vis = last_seen(a, j) + 1 - t0; /* visible positions */
         float *pm = att_partial(A, kvh, c, j, g0 + sl % gs);
         if (A->window && a->pos0 + j + 1 > A->window) {
             /* a sliding window: the positions before its start weigh
@@ -834,7 +857,7 @@ static void merge_one(struct attn_job *a, uint32_t j, uint32_t h)
     uint32_t hd = A->hd, qd = A->n_head * hd;
     uint32_t group = A->n_head / A->n_kv;
     uint32_t kvh = h / group, g = h % group;
-    uint32_t nc = (a->pos0 + j + ATT_CHUNK) / ATT_CHUNK;
+    uint32_t nc = (last_seen(a, j) + ATT_CHUNK) / ATT_CHUNK;
     float mx = -INFINITY, sum = 0.0f;
     for (uint32_t c = a->c0; c < nc; c++) {
         float v = att_partial(A, kvh, c, j, g)[0];
@@ -861,7 +884,7 @@ static void merge_one(struct attn_job *a, uint32_t j, uint32_t h)
     memset(out, 0, hd * sizeof(float));
     for (uint32_t c = a->c0; c < nc; c++) {
         const float *pm = att_partial(A, kvh, c, j, g);
-        float w = expf(pm[0] - mx);
+        float w = janas_expf(pm[0] - mx);
         sum += w * pm[1];
         janas_axpy_f32(out, w, pm + 2, hd);
     }
@@ -918,13 +941,10 @@ static void attn_worker(void *arg, int tid, int n_threads)
 }
 
 /*
- * Which way the scores go, when the caller leaves it open: the sixteen-bit
- * query where the arithmetic for it is there and the caller asked for more
- * context than the usual sixteen thousand tokens. A context is a ceiling,
- * not a promise: a conversation that stays short pays the query's
- * quantization for a gain it never sees, so the engine waits to be asked for
- * a long one - there attention is the greater part of a token, and the
- * sixteen-bit query takes a fifth to a quarter off it.
+ * Which way the scores go: asked by the caller (or JANAS_ATTN), else the
+ * engine's, measured on the calls (attn_tune_pick) - this, the way until
+ * the first measures: the sixteen-bit query where the arithmetic for it is
+ * there and the context is long.
  */
 static int scores_choice(int asked, uint32_t head_dim, uint32_t n_ctx,
                          int *chosen_here)
@@ -978,13 +998,16 @@ struct janas_attn *janas_attn_create(uint32_t n_head, uint32_t n_head_kv,
     A->scr = malloc((size_t)n_threads * (JANAS_ATTN_MAX_BLOCK * group + 2) *
                     ATT_CHUNK * sizeof(float));
     A->done = malloc(n_head * sizeof(*A->done));
-    if (A->scores == JANAS_ATTN_INT16) {
+    /* the sixteen-bit query's room wherever it may be used: chosen by the
+       engine, it can change from call to call */
+    int i16 =
+        A->scores == JANAS_ATTN_INT16 || (A->scores_auto && head_dim % 16 == 0);
+    if (i16) {
         A->qi = malloc((size_t)JANAS_ATTN_MAX_BLOCK * n_head * head_dim *
                        sizeof(int16_t));
         A->qs = malloc((size_t)JANAS_ATTN_MAX_BLOCK * n_head * sizeof(float));
     }
-    if (!A->part || !A->scr || !A->done ||
-        (A->scores == JANAS_ATTN_INT16 && (!A->qi || !A->qs))) {
+    if (!A->part || !A->scr || !A->done || (i16 && (!A->qi || !A->qs))) {
         janas_attn_destroy(A);
         return NULL;
     }
@@ -994,6 +1017,11 @@ struct janas_attn *janas_attn_create(uint32_t n_head, uint32_t n_head_kv,
 void janas_attn_set_scale(struct janas_attn *a, float scale)
 {
     a->scale = scale;
+}
+
+void janas_attn_set_last(struct janas_attn *a, const uint32_t *last)
+{
+    a->last = last;
 }
 
 void janas_attn_set_window(struct janas_attn *a, uint32_t window)
@@ -1043,13 +1071,191 @@ void janas_attn_destroy(struct janas_attn *A)
     free(A);
 }
 
+/*
+ * The attention's scores: over the query as it is, or over the query at
+ * sixteen bits (an integer sum, a relative 3e-5 of error where the eight-bit
+ * keys carry 4e-3: the most likely token the same at 2,961 of 3,200
+ * positions against llama.cpp as at 2,963 in float, Qwen3 0.6B and 4B,
+ * Qwen3.5 0.8B and 2B, two texts each, 26 Oct 2026). Which is faster
+ * depends on the processor (AVX-VNNI or not, its cores) and grows with the
+ * position. Measured on the calls themselves (until 28 Oct 2026) the way
+ * changed between passes, and so did the results; now it is measured once,
+ * before the first call, on made-up keys of this attention's geometry at
+ * contexts of 1,024 positions and up (a token's calls to 65,536, a block's
+ * of 64 to 16,384): the sixteen-bit way from the shortest at which it wins
+ * there and at every longer one. The result is kept in ~/.cache/janas
+ * (attn.txt) by processor, threads and geometry, so every session uses the
+ * same. JANAS_ATTN=float or int16 fixes it.
+ */
+static double attn_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static void run_way(struct janas_attn *A, struct janas_pool *pool,
+                    const float *q, const int8_t *k, const float *ks,
+                    const int8_t *v, const float *vs, uint32_t n, uint32_t pos0,
+                    float *out);
+
+static void calib_key(const struct janas_attn *A, char *key, size_t len)
+{
+    char cpu[128];
+    janas_cpu_name(cpu, sizeof(cpu));
+    for (char *c = cpu; *c; c++)
+        if (*c == ' ' || *c == '\t')
+            *c = '_';
+    snprintf(key, len, "%s|%d|%u/%u/%u|%u|%u", cpu, A->n_threads, A->n_head,
+             A->n_kv, A->hd, A->window, A->n_ctx);
+}
+
+static int calib_load(struct janas_attn *A, const char *key)
+{
+    char path[1024], line[512];
+    if (janas_cache_dir(path, sizeof(path), 0) != 0)
+        return -1;
+    strcat(path, "/attn.txt");
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    int found = -1;
+    while (fgets(line, sizeof(line), f)) {
+        char k[400];
+        unsigned a, b;
+        if (sscanf(line, "%399s %u %u", k, &a, &b) == 3 && !strcmp(k, key)) {
+            A->from16[0] = a;
+            A->from16[1] = b;
+            found = 0;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void calib_save(const struct janas_attn *A, const char *key)
+{
+    char path[1024];
+    if (janas_cache_dir(path, sizeof(path), 1) != 0)
+        return;
+    strcat(path, "/attn.txt");
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    fprintf(f, "%s %u %u\n", key, A->from16[0], A->from16[1]);
+    fclose(f);
+}
+
+/* seconds of the faster of three calls of this way */
+static double time_way(struct janas_attn *A, struct janas_pool *pool, int way,
+                       const float *q, const int8_t *k, const float *ks,
+                       const int8_t *v, const float *vs, uint32_t n,
+                       uint32_t pos0, float *out)
+{
+    double best = 1e30;
+    A->scores = way;
+    for (int r = 0; r < 3; r++) {
+        double t0 = attn_now();
+        run_way(A, pool, q, k, ks, v, vs, n, pos0, out);
+        double t = attn_now() - t0;
+        if (t < best)
+            best = t;
+    }
+    return best;
+}
+
+static void attn_calibrate(struct janas_attn *A, struct janas_pool *pool)
+{
+    char key[512];
+    A->calibrated = 1;
+    A->from16[0] = A->from16[1] = UINT32_MAX;
+    calib_key(A, key, sizeof(key));
+    if (calib_load(A, key) == 0)
+        return;
+    uint32_t nb = JANAS_ATTN_MAX_BLOCK < 64 ? JANAS_ATTN_MAX_BLOCK : 64;
+    /* made-up rows only as far as measured: the layout's stride shortened
+       for the while (a ring keeps its own) */
+    uint32_t keep_ctx = A->n_ctx, keep_chunks = A->chunks;
+    if (!A->ring && A->n_ctx > 65536 + nb) {
+        A->n_ctx = 65536 + nb;
+        A->chunks = (A->n_ctx + ATT_CHUNK - 1) / ATT_CHUNK;
+    }
+    uint32_t top = A->n_ctx;
+    size_t cells = (size_t)A->n_kv * A->n_ctx;
+    int8_t *k = malloc(cells * A->hd), *v = malloc(cells * A->hd);
+    float *ks = malloc(cells * sizeof(float)),
+          *vs = malloc(cells * sizeof(float));
+    size_t qn = (size_t)nb * A->n_head * A->hd;
+    float *q = malloc(qn * sizeof(float)), *out = malloc(qn * sizeof(float));
+    if (!k || !v || !ks || !vs || !q || !out)
+        goto done;
+    uint32_t r = 12345;
+    for (size_t i = 0; i < cells * A->hd; i++) {
+        r = r * 1103515245u + 12345u;
+        k[i] = (int8_t)((r >> 16) % 255 - 127);
+        v[i] = (int8_t)((r >> 8) % 255 - 127);
+    }
+    for (size_t i = 0; i < cells; i++)
+        ks[i] = vs[i] = 0.01f;
+    for (size_t i = 0; i < qn; i++) {
+        r = r * 1103515245u + 12345u;
+        q[i] = (float)((int)(r >> 16) % 2001 - 1000) / 500.0f;
+    }
+    for (int c = 0; c < 2; c++) {
+        uint32_t n = c ? nb : 1, limit = c ? 16384 : 65536;
+        uint32_t from = UINT32_MAX;
+        for (uint32_t p = 1024; p + n <= top && p <= limit; p *= 2) {
+            double tf =
+                time_way(A, pool, JANAS_ATTN_FLOAT, q, k, ks, v, vs, n, p, out);
+            double ti =
+                time_way(A, pool, JANAS_ATTN_INT16, q, k, ks, v, vs, n, p, out);
+            if (ti < tf) {
+                if (from == UINT32_MAX)
+                    from = p;
+            } else {
+                from = UINT32_MAX; /* it must win at every longer one */
+            }
+        }
+        A->from16[c] = from;
+    }
+    calib_save(A, key);
+done:
+    A->n_ctx = keep_ctx;
+    A->chunks = keep_chunks;
+    free(k);
+    free(v);
+    free(ks);
+    free(vs);
+    free(q);
+    free(out);
+}
+
 void janas_attn_run(struct janas_attn *A, struct janas_pool *pool,
                     const float *q, const int8_t *k, const float *ks,
                     const int8_t *v, const float *vs, uint32_t n, uint32_t pos0,
                     float *out)
 {
+    /* the engine's choice: measured once (attn_calibrate) */
+    if (A->scores_auto && A->qi && !A->kv16) {
+        if (!A->calibrated)
+            attn_calibrate(A, pool);
+        A->scores =
+            pos0 >= A->from16[n > 1] ? JANAS_ATTN_INT16 : JANAS_ATTN_FLOAT;
+    }
+    run_way(A, pool, q, k, ks, v, vs, n, pos0, out);
+}
+
+static void run_way(struct janas_attn *A, struct janas_pool *pool,
+                    const float *q, const int8_t *k, const float *ks,
+                    const int8_t *v, const float *vs, uint32_t n, uint32_t pos0,
+                    float *out)
+{
+    /* the positions seen: up to the last token's, or past it */
+    const uint32_t *last = A->last;
+    A->last = NULL;
+    uint32_t end = last ? last[n - 1] + 1 : pos0 + n;
     /* enough items for every thread: split the query heads of a group */
-    uint32_t n_chunks = (pos0 + n + ATT_CHUNK - 1) / ATT_CHUNK, split = 1;
+    uint32_t n_chunks = (end + ATT_CHUNK - 1) / ATT_CHUNK, split = 1;
     uint32_t group = A->n_head / A->n_kv;
     /* with a window, the chunks wholly before the first token's are never
        read: at a long context most of them */
@@ -1076,6 +1282,7 @@ void janas_attn_run(struct janas_attn *A, struct janas_pool *pool,
                            .pos0 = pos0,
                            .n_chunks = n_chunks,
                            .c0 = c0,
+                           .last = last,
                            .split = split};
     job.qi = A->qi;
     job.qs = A->qs;
