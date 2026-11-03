@@ -7,7 +7,11 @@
  * the GPU takes from its first byte, end on a slot, and leave no gap. From
  * 13 to 14 October 2026 the overlap was not counted, and Qwen3.6-35B-A3B's
  * MXFP4 experts (slots of 1,671,168 bytes) got a second region of 4 GiB and
- * 1.9 MB, which the GPU refused. No GPU needed.
+ * 1.9 MB, which the GPU refused. Until 21 October a region could be 4 GiB
+ * exactly, which Mesa's Intel driver gave the kernel as 0 bytes: unsloth's
+ * 3-bit Qwen3-30B-A3B (slots of 2,236,416 bytes, 1,920 of them 1 MB short
+ * of 4 GiB) got one as its second, and its experts stayed off the GPU. No
+ * GPU needed.
  */
 #include <stdio.h>
 
@@ -17,13 +21,14 @@ static int failures;
 
 static void check(uint64_t unit, uint64_t bytes, int huge)
 {
-    const uint64_t mb2 = (uint64_t)2 << 20;
+    const uint64_t mb2 = (uint64_t)2 << 20, gib4 = (uint64_t)4 << 30;
     uint64_t at = 0;
     int n = 0;
     while (at < bytes) {
         uint64_t from, end = janas_m_import_next(at, bytes, unit, huge, &from);
         int bad = from > at || end <= at || end > bytes ||
                   end - from > JANAS_M_REGION_MAX ||
+                  ((end - from + 4095) & ~(uint64_t)4095) >= gib4 ||
                   (huge && from % mb2 != 0) || (!huge && from != at) ||
                   (end != bytes && (end - at) % unit != 0);
         if (bad) {
@@ -43,16 +48,19 @@ static void check(uint64_t unit, uint64_t bytes, int huge)
 int main(void)
 {
     /* the slots of Qwen3.6-35B-A3B MXFP4_MOE, of its Q4_K_M at six bits,
-       of a page, of 2 MB and around it, of a dense layer's feed-forward */
-    static const uint64_t units[] = {1671168,   2039808, 4096,
-                                     2097152,   2101248, 2093056,
-                                     157286400, 1179648, 3014656};
+       of a page, of 2 MB and around it, of a dense layer's feed-forward, of
+       unsloth's 3-bit Qwen3-30B-A3B */
+    static const uint64_t units[] = {1671168, 2039808, 4096,      2097152,
+                                     2101248, 2093056, 157286400, 1179648,
+                                     3014656, 2236416};
     for (size_t u = 0; u < sizeof(units) / sizeof(units[0]); u++)
         for (uint64_t slots = 1; slots <= 40000; slots = slots * 3 + 7)
             for (int huge = 0; huge < 2; huge++)
                 check(units[u], slots * units[u], huge);
     /* the arena of the 35B's MXFP4 experts, every slot of its 40 layers */
     check(1671168, (uint64_t)40 * 256 * 1671168, 1);
+    /* and the 3-bit 30B's, its 48 layers' 128 experts and the guard */
+    check(2236416, (uint64_t)48 * 128 * 2236416 + 4096, 1);
     printf("test_import_regions: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

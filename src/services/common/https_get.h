@@ -10,6 +10,8 @@
 
 #include "llm/json.h"
 
+struct janas_net_policy;
+
 /* GET of url (https), following redirects, the body into out (with a 0
    after it, not counted). The HTTP status (200...), or -1 with the reason
    in err. */
@@ -21,5 +23,12 @@ int janas_https_get(const char *url, const char *const *headers,
 int janas_https_get_ms(const char *url, const char *const *headers,
                        size_t n_headers, int timeout_ms, struct janas_buf *out,
                        char *err, size_t err_len);
+/* The same for a URL someone else gave (http too): every address it and
+   its redirects resolve to checked against policy (common/mcp_policy.h),
+   the connection made only to one that passed. */
+int janas_https_get_policy(const char *url,
+                           const struct janas_net_policy *policy,
+                           int timeout_ms, struct janas_buf *out, char *err,
+                           size_t err_len);
 
 #endif
