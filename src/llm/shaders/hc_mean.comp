@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's mix, its last step (model_hc.c mean_worker): the sublayer's
+// input, the mean over a token's hc streams of each normalized stream (xn)
+// times sigmoid of its gate (g), into out (d floats a token), for
+// norm_quant.comp to quantize. A thread per number (x) and token (y).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+
+// xn, g: n rows of hc x d floats; out: n rows of d
+layout(push_constant) uniform P { uvec2 xn, g, out_; uint d, hc; } p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x, j = gl_WorkGroupID.y;
+    if (i >= p.d)
+        return;
+    F XN = F(p.xn), G = F(p.g);
+    uint o = j * p.hc * p.d + i;
+    float s = 0.0;
+    for (uint c = 0u; c < p.hc; c++)
+        s += XN.v[o + c * p.d] / (1.0 + exp(-G.v[o + c * p.d]));
+    W(p.out_).v[j * p.d + i] = s / float(p.hc);
+}

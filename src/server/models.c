@@ -24,6 +24,17 @@ static yyjson_mut_val *embed_obj(struct srv_req *r, yyjson_mut_doc *d)
     return o;
 }
 
+/* The speech model, when there is one. */
+static yyjson_mut_val *speech_obj(struct srv_req *r, yyjson_mut_doc *d)
+{
+    yyjson_mut_val *o = yyjson_mut_obj(d);
+    yyjson_mut_obj_add_str(d, o, "id", r->srv->cfg.speech_id);
+    yyjson_mut_obj_add_str(d, o, "object", "model");
+    yyjson_mut_obj_add_int(d, o, "created", srv_engine_created(r->srv->engine));
+    yyjson_mut_obj_add_str(d, o, "owned_by", "janas");
+    return o;
+}
+
 static yyjson_mut_val *model_obj(struct srv_req *r, yyjson_mut_doc *d)
 {
     yyjson_mut_val *o = yyjson_mut_obj(d);
@@ -61,6 +72,8 @@ int srv_models_list(struct srv_req *r)
     yyjson_mut_arr_append(arr, model_obj(r, d));
     if (r->srv->cfg.embed_id)
         yyjson_mut_arr_append(arr, embed_obj(r, d));
+    if (r->srv->cfg.speech_id)
+        yyjson_mut_arr_append(arr, speech_obj(r, d));
     return reply_doc(r, d);
 }
 
@@ -69,6 +82,11 @@ int srv_models_get(struct srv_req *r)
     if (r->srv->cfg.embed_id && !strcmp(r->param[0], r->srv->cfg.embed_id)) {
         yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
         yyjson_mut_doc_set_root(d, embed_obj(r, d));
+        return reply_doc(r, d);
+    }
+    if (r->srv->cfg.speech_id && !strcmp(r->param[0], r->srv->cfg.speech_id)) {
+        yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
+        yyjson_mut_doc_set_root(d, speech_obj(r, d));
         return reply_doc(r, d);
     }
     if (strcmp(r->param[0], r->srv->cfg.model_id) != 0)
