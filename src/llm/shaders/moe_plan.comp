@@ -1,0 +1,137 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// A mixture's plan on the GPU (gpu_token_moe.c), when the card's tier
+// holds every expert: what plan() writes on the CPU between two
+// submissions, the same words in the same places. The router's choice pe
+// (n tokens, k experts each) sorted by expert - each row's token gt[r] and
+// each pair's row inv[p], an expert's rows in its pairs' order - the
+// tables of the gate and up products and of the down ones with their tiles
+// of s1 and s2 vectors, and the sizes of the two indirect dispatches. at:
+// the layer's experts in the tier, 3 uvec4 each: (gate, up), (down, p0),
+// (p1, 0). One workgroup: the sort, a few hundred steps, by its first
+// lane, the tables by all.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U1 { uint v[]; };
+
+layout(push_constant) uniform P {
+    uvec2 at, b;
+    uint pe, gt, inv, t1, t2, ind, xg, egu, eh, dout; /* bytes from b */
+    uint n, k, ne, nbd, nbf, ep, dm, eff, s1, s2, tiles1, tiles2;
+} p;
+
+const uint MAXE = 512u; /* experts a layer at most (gpu_token_moe.c) */
+/* the experts' first rows (cnt[e], rows up to cnt[e + 1]), the experts
+   chosen in order, the next row of each, the first tile of each chosen */
+shared uint cnt[MAXE + 1u], ids[MAXE], fill[MAXE], tile1[MAXE + 1u],
+    tile2[MAXE + 1u];
+shared uint nd;
+
+/* a + o, 64 bits as two words */
+uvec2 add(uvec2 a, uint o)
+{
+    uint c, lo = uaddCarry(a.x, o, c);
+    return uvec2(lo, a.y + c);
+}
+
+/* gpu_token_moe.c table_entry: weights, activations, outputs, vectors, ys
+   floats apart, p0, p1 - word e on of T */
+void entry(U1 T, uint e, uvec2 w, uvec2 x, uvec2 y, uint nv, uint ys, uvec2 p0,
+           uvec2 p1)
+{
+    T.v[e] = w.x;
+    T.v[e + 1u] = w.y;
+    T.v[e + 2u] = x.x;
+    T.v[e + 3u] = x.y;
+    T.v[e + 4u] = y.x;
+    T.v[e + 5u] = y.y;
+    T.v[e + 6u] = nv;
+    T.v[e + 7u] = ys;
+    T.v[e + 8u] = p0.x;
+    T.v[e + 9u] = p0.y;
+    T.v[e + 10u] = p1.x;
+    T.v[e + 11u] = p1.y;
+}
+
+void main()
+{
+    uint lane = gl_LocalInvocationID.x, np = p.n * p.k;
+    U1 PE = U1(add(p.b, p.pe)), GT = U1(add(p.b, p.gt)),
+       INV = U1(add(p.b, p.inv)), T1 = U1(add(p.b, p.t1)),
+       T2 = U1(add(p.b, p.t2)), IND = U1(add(p.b, p.ind));
+    U4 AT = U4(p.at);
+    for (uint e = lane; e <= p.ne; e += 64u)
+        cnt[e] = 0u;
+    barrier();
+    if (lane == 0u) {
+        /* the counts, their running sums, the experts chosen in order */
+        for (uint q = 0u; q < np; q++)
+            cnt[min(PE.v[q], p.ne - 1u) + 1u]++;
+        uint m = 0u, n1 = 0u, n2 = 0u;
+        for (uint e = 0u; e < p.ne; e++) {
+            uint c = cnt[e + 1u];
+            if (c != 0u) {
+                tile1[m] = n1;
+                tile2[m] = n2;
+                n1 += 2u * ((c + p.s1 - 1u) / p.s1);
+                n2 += (c + p.s2 - 1u) / p.s2;
+                ids[m++] = e;
+            }
+            cnt[e + 1u] += cnt[e];
+            fill[e] = cnt[e];
+        }
+        nd = m;
+        tile1[m] = n1;
+        tile2[m] = n2;
+        for (uint q = 0u; q < np; q++) {
+            uint r = fill[min(PE.v[q], p.ne - 1u)]++;
+            GT.v[r] = q / p.k;
+            INV.v[q] = r;
+        }
+        /* a matvec's rows in its workgroups' y, a *_mmid's in x */
+        bool r1 = p.s1 != 16u, r2 = p.s2 != 16u;
+        uint g1 = (p.eff + 63u) / 64u, g2 = (p.dm + 63u) / 64u;
+        IND.v[0] = r1 ? 1u : g1;
+        IND.v[1] = r1 ? g1 : 1u;
+        IND.v[2] = n1;
+        IND.v[4] = r2 ? 1u : g2;
+        IND.v[5] = r2 ? g2 : 1u;
+        IND.v[6] = n2;
+    }
+    barrier();
+    /* an expert chosen a lane: its three entries and its tiles */
+    for (uint i = lane; i < nd; i += 64u) {
+        uint e = ids[i], a = cnt[e], nv = cnt[e + 1u] - a;
+        uvec4 w0 = AT.v[3u * e], w1 = AT.v[3u * e + 1u], w2 = AT.v[3u * e + 2u];
+        uvec2 x = add(p.b, p.xg + a * p.nbd * 320u), z = uvec2(0u);
+        entry(T1, 12u * (2u * i), w0.xy, x, add(p.b, p.egu + a * p.ep * 4u), nv,
+              p.ep, z, z);
+        entry(T1, 12u * (2u * i + 1u), w0.zw, x,
+              add(p.b, p.egu + (np + a) * p.ep * 4u), nv, p.ep, z, z);
+        entry(T2, 12u * i, w1.xy, add(p.b, p.eh + a * p.nbf * 320u),
+              add(p.b, p.dout + a * p.dm * 4u), nv, p.dm, w1.zw, w2.xy);
+        uint u = 4u * (p.tiles1 + tile1[i]);
+        for (uint v = 0u; v < nv; v += p.s1, u += 8u) {
+            T1.v[u] = 2u * i;
+            T1.v[u + 1u] = v;
+            T1.v[u + 2u] = 0u;
+            T1.v[u + 3u] = 0u;
+            T1.v[u + 4u] = 2u * i + 1u;
+            T1.v[u + 5u] = v;
+            T1.v[u + 6u] = 0u;
+            T1.v[u + 7u] = 0u;
+        }
+        u = 4u * (p.tiles2 + tile2[i]);
+        for (uint v = 0u; v < nv; v += p.s2, u += 4u) {
+            T2.v[u] = i;
+            T2.v[u + 1u] = v;
+            T2.v[u + 2u] = 0u;
+            T2.v[u + 3u] = 0u;
+        }
+    }
+}

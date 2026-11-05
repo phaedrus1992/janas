@@ -1,0 +1,50 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's indexer, third step (model_qsa.c score_worker): for token j
+// of a block (workgroup y) at p = pos + j, the score of each complete block
+// b < (p + 1) / r it may choose among, the sum over its nh query heads of
+// relu(q_h . pool_b), into row j of sc (nbs a row); a thread a block,
+// workgroup x the blocks 256 x .. 256 x + 255. A token whose blocks are no
+// more than keep attends to every position (the dense attention): none.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer R4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RU { uint v[]; };
+
+layout(push_constant) uniform P {
+    uvec2 q, pool, sc, pos;
+    uint nh, d, r, keep, nbs, qs;
+} p;
+
+shared vec4 sq[512]; /* nh x d numbers, at most 2048 (gpu_token.c) */
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x, j = gl_WorkGroupID.y;
+    uint pp = RU(p.pos).v[0] + j, blocks = (pp + 1u) / p.r;
+    uint b = gl_WorkGroupID.x * 256u + t;
+    if (blocks <= p.keep || gl_WorkGroupID.x * 256u >= blocks)
+        return; /* the whole workgroup */
+    uint d4 = p.d / 4u;
+    R4 Q = R4(p.q);
+    for (uint k = t; k < p.nh * d4; k += 256u)
+        sq[k] = Q.v[(j * p.qs) / 4u + k];
+    barrier();
+    if (b >= blocks)
+        return;
+    R4 K = R4(p.pool);
+    float sum = 0.0;
+    for (uint h = 0; h < p.nh; h++) {
+        float e = 0.0;
+        for (uint i = 0; i < d4; i++)
+            e += dot(sq[h * d4 + i], K.v[b * d4 + i]);
+        sum += max(e, 0.0);
+    }
+    W(p.sc).v[j * p.nbs + b] = sum;
+}

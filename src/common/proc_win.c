@@ -60,9 +60,9 @@ static void putc_(struct str *s, char c)
 
 /* One argument quoted as CommandLineToArgvW and the C runtime read it:
    backslashes are literal except before a quote. */
-static void quote(struct str *s, const char *a)
+static void quote_as(struct str *s, const char *a, int always)
 {
-    if (*a && !strpbrk(a, " \t\n\v\"")) {
+    if (!always && *a && !strpbrk(a, " \t\n\v\"")) {
         put(s, a, strlen(a));
         return;
     }
@@ -89,6 +89,11 @@ static void quote(struct str *s, const char *a)
         }
     }
     putc_(s, '"');
+}
+
+static void quote(struct str *s, const char *a)
+{
+    quote_as(s, a, 0);
 }
 
 static int ends_with(const char *s, const char *tail)
@@ -193,17 +198,31 @@ int janas_proc_start(struct janas_proc *p, const char *const argv[],
         return -1;
     }
     int script = ends_with(prog, ".cmd") || ends_with(prog, ".bat");
+    /* cmd.exe reads the line before the program does: & | < > ^ ( ) are
+       inert only inside quotes, so every argument is quoted; a quote of
+       the argument's own would end that, and % (and ! with delayed
+       expansion) expands even inside: those are refused, never passed
+       (BatBadBut) */
+    for (size_t i = 1; script && argv[i]; i++)
+        if (strpbrk(argv[i], "\"%!\r\n")) {
+            snprintf(err, err_len,
+                     "cannot start %s: an argument holds a character "
+                     "cmd.exe would act on (\" %% ! or a newline)",
+                     argv[0]);
+            errno = EINVAL;
+            return -1;
+        }
     struct str cmd = {0};
     if (script) {
         /* cmd.exe /s /c "the whole line": its first and last quote go */
         put(&cmd, "cmd.exe /d /s /c \"", 18);
-        quote(&cmd, prog);
+        quote_as(&cmd, prog, 1);
     } else {
         quote(&cmd, prog);
     }
     for (size_t i = 1; argv[i]; i++) {
         putc_(&cmd, ' ');
-        quote(&cmd, argv[i]);
+        quote_as(&cmd, argv[i], script);
     }
     if (script)
         putc_(&cmd, '"');
