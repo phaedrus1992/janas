@@ -226,6 +226,24 @@ long janas_tls_write(struct janas_tls *t, const void *p, size_t n)
     return -1;
 }
 
+void janas_tls_lock(void)
+{
+    pthread_mutex_lock(&lock);
+}
+
+void janas_tls_unlock(void)
+{
+    pthread_mutex_unlock(&lock);
+}
+
+int janas_tls_crypto(void)
+{
+    static int started;
+    if (!started && psa_crypto_init() == PSA_SUCCESS)
+        started = 1;
+    return started ? 0 : -1;
+}
+
 void janas_tls_close(struct janas_tls *t)
 {
     if (!t)
