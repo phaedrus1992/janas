@@ -231,7 +231,9 @@ void janas_cpu_name(char *buf, size_t len)
 
 int janas_on_mains(void)
 {
-    /* every power supply of type Mains; on mains if any is online */
+    /* every power supply of type Mains, and the USB ones (a laptop fed
+       by USB-C may have its Mains offline): on mains if any is online;
+       on battery only if there is a Mains and none is */
     DIR *d = opendir("/sys/class/power_supply");
     if (!d)
         return -1;
@@ -249,16 +251,17 @@ int janas_on_mains(void)
         if (!fgets(type, sizeof(type), f))
             type[0] = 0;
         fclose(f);
-        if (strncmp(type, "Mains", 5) != 0)
+        int mains = strncmp(type, "Mains", 5) == 0;
+        if (!mains && strncmp(type, "USB", 3) != 0)
             continue;
-        found = 1;
+        found |= mains;
         snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online",
                  e->d_name);
         if (read_long(path) > 0)
             online = 1;
     }
     closedir(d);
-    return found ? online : -1;
+    return online ? 1 : found ? 0 : -1;
 }
 
 /* A field of /proc/meminfo, in bytes (0 if missing). */
@@ -286,6 +289,42 @@ uint64_t janas_mem_available(void)
 uint64_t janas_mem_total(void)
 {
     return meminfo("MemTotal");
+}
+
+uint64_t janas_rss_bytes(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    unsigned long long size = 0, resident = 0;
+    int ok = fscanf(f, "%llu %llu", &size, &resident) == 2;
+    fclose(f);
+    long page = sysconf(_SC_PAGESIZE);
+    return ok && page > 0 ? (uint64_t)resident * (uint64_t)page : 0;
+}
+
+size_t janas_l2_bytes(void)
+{
+    for (int i = 0; i < 8; i++) {
+        char path[96], buf[32];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        if (read_long(path) != 2)
+            continue;
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            return 0;
+        char *ok = fgets(buf, sizeof(buf), f);
+        fclose(f);
+        char *end;
+        unsigned long v = ok ? strtoul(buf, &end, 10) : 0;
+        if (!ok || end == buf)
+            return 0;
+        return *end == 'K' ? v << 10 : *end == 'M' ? v << 20 : v;
+    }
+    return 0;
 }
 
 #endif /* !_WIN32 */
