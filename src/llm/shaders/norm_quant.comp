@@ -2,11 +2,18 @@
    Copyright (C) 2026 Maurizio Cammalleri */
 #version 450
 // A vector of d floats on its way into the products: x + add (the
-// residual, if add is set) stored at xo (if set), then v = rms_norm(x) * w
+// residual, if add is set; times os if os is not 0: Gemma 4's output
+// scale) stored at xo (if set), then v = rms_norm(x) * w
 // (if w is set; else v = x), quantized to Q8_K in the product shaders'
 // layouts - q256 (qs, bsums, d: janas_q8k_quantize_det) and q32 (the eight
 // blocks of 32 with a scale each, if q32 is set), and v itself at xn (if
-// set: a recurrent layer's f32 products, an MTP block's hidden states). One workgroup per block
+// set: a recurrent layer's f32 products, an MTP block's hidden states). With
+// det 0 (the norms) the same bits as the CPU's rms_norm and
+// janas_q8k_quantize: the sum of squares in two floats (some 48 bits, as
+// the CPU's double), its mean rounded once, the square root, the
+// reciprocal and amax / 127 correctly rounded (a product, then the
+// remainder by fma); det 1, the deterministic quantization
+// (janas_q8k_quantize_det: an activation). One workgroup per block
 // of 256 values: each one makes the whole vector's sum of squares, the
 // same operations in the same order, so the same bits, then normalizes and
 // quantizes its own block, a value a thread. x is only read: the residual
@@ -26,7 +33,7 @@ layout(local_size_x = 256) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U { uint v[]; };
 
-layout(push_constant) uniform P { uvec2 x, add, w, xo, q256, q32, xn; uint d; float eps; } p;
+layout(push_constant) uniform P { uvec2 x, add, w, xo, q256, q32, xn; uint d; float eps, os, ps; uint det; } p;
 
 /* The workgroup's sum: each subgroup's in one operation, then the
    subgroups' in a fixed order. */
@@ -58,6 +65,54 @@ float recip_det(float d)
     return y;
 }
 
+/* a / b correctly rounded (b normal, positive): the product with the
+   reciprocal, then the remainder's share */
+float div_cr(float a, float b)
+{
+    precise float r = recip_det(b);
+    precise float q = a * r;
+    precise float e = fma(-q, b, a);
+    return fma(e, r, q);
+}
+
+/* sqrt(a) correctly rounded (a normal, positive) */
+float sqrt_cr(float a)
+{
+    precise float y = inversesqrt(a);
+    precise float s = a * y;
+    precise float h = 0.5 * y;
+    precise float r = fma(-s, s, a);
+    return fma(r, h, s);
+}
+
+/* the CPU's scale of janas_q8k_quantize (amax / 127) and its reciprocal,
+   or the deterministic ones */
+float q_scale(float m)
+{
+    if (p.det != 0u)
+        return m * 0.007874015718698502;
+    return div_cr(m, 127.0);
+}
+
+float q_inv(float d)
+{
+    if (d <= 0.0)
+        return 0.0;
+    return p.det != 0u ? recip_det(d) : div_cr(1.0, d);
+}
+
+/* hi + lo as two floats, exactly */
+void two_sum(inout float hi, inout float lo, float b)
+{
+    precise float s = hi + b;
+    precise float bb = s - hi;
+    precise float e = (hi - (s - bb)) + (b - bb);
+    hi = s;
+    lo = lo + e;
+}
+
+shared float ss_hi[256], ss_lo[256];
+
 int q8(float v, float id)
 {
     precise float q = roundEven(v * id);
@@ -73,12 +128,52 @@ void main()
     F X = F(p.x), A = F(p.add), Wt = F(p.w), XO = F(p.xo);
     U Q = U(p.q256), Q32 = U(p.q32);
     float scale = 1.0;
-    if (set(p.w)) {
+    if (set(p.w) && p.det == 0u) {
+        /* the squares exactly (product and fma), summed in two floats,
+           each thread's then the threads' in order */
+        float hi = 0.0, lo = 0.0;
+        for (uint i = t; i < d; i += 256u) {
+            precise float xv = X.v[xo0 + i];
+            if (set(p.add))
+                xv = xv + A.v[xo0 + i];
+            if (p.os != 0.0)
+                xv = xv * p.os;
+            precise float sq = xv * xv;
+            precise float se = fma(xv, xv, -sq);
+            two_sum(hi, lo, sq);
+            lo = lo + se;
+        }
+        ss_hi[t] = hi;
+        ss_lo[t] = lo;
+        barrier();
+        /* the threads' two floats added in a tree */
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) {
+                float h = ss_hi[t], l = ss_lo[t];
+                two_sum(h, l, ss_hi[t + s]);
+                ss_hi[t] = h;
+                ss_lo[t] = l + ss_lo[t + s];
+            }
+            barrier();
+        }
+        hi = ss_hi[0];
+        lo = ss_lo[0];
+        barrier();
+        /* the mean rounded once, as (float)(ss / n) */
+        precise float fd = float(d);
+        precise float q0 = div_cr(hi, fd);
+        precise float rem = fma(-q0, fd, hi) + lo;
+        precise float mean = q0 + rem / fd;
+        precise float sc = div_cr(1.0, sqrt_cr(mean + p.eps));
+        scale = sc;
+    } else if (set(p.w)) {
         float ss = 0.0;
         for (uint i = t; i < d; i += 256u) {
             precise float xv = X.v[xo0 + i];
             if (set(p.add))
                 xv = xv + A.v[xo0 + i];
+            if (p.os != 0.0)
+                xv = xv * p.os;
             ss += xv * xv;
         }
         ss = wg_sum(ss);
@@ -90,11 +185,15 @@ void main()
     precise float xv = X.v[xo0 + e];
     if (set(p.add))
         xv = xv + A.v[xo0 + e];
+    if (p.os != 0.0)
+        xv = xv * p.os;
     if (set(p.xo))
         XO.v[xo0 + e] = xv;
     float v = xv;
     if (set(p.w)) {
         precise float vs = xv * scale;
+        if (p.ps != 0.0) /* Gemma 4's router: times 1 / sqrt(d) first */
+            vs = vs * p.ps;
         v = vs * Wt.v[e];
     }
     if (set(p.xn))
@@ -109,10 +208,10 @@ void main()
     float m256 = 0.0;
     for (uint k = 0; k < 32u; k++)
         m256 = max(m256, m8[k]);
-    precise float dd = m256 * 0.007874015718698502;
-    float id = dd > 0.0 ? recip_det(dd) : 0.0;
-    precise float d32 = m32 * 0.007874015718698502;
-    float id32 = d32 > 0.0 ? recip_det(d32) : 0.0;
+    precise float dd = q_scale(m256);
+    float id = q_inv(dd);
+    precise float d32 = q_scale(m32);
+    float id32 = q_inv(d32);
     int qa = q8(v, id), qb = q8(v, id32);
     /* four quants a word, from four neighbouring threads */
     uint wa = subgroupClusteredOr((uint(qa) & 0xffu) << (8u * (t % 4u)), 4u);
@@ -137,8 +236,7 @@ void main()
             int sb0 = s8b[4u * t] + s8b[4u * t + 1u], sb1 = s8b[4u * t + 2u] + s8b[4u * t + 3u];
             Q32.v[base + 64u + t] = (uint(sb0) & 0xffffu) | (uint(sb1) << 16);
             precise float dt =
-                max(max(m8[4u * t], m8[4u * t + 1u]), max(m8[4u * t + 2u], m8[4u * t + 3u])) *
-                0.007874015718698502;
+                q_scale(max(max(m8[4u * t], m8[4u * t + 1u]), max(m8[4u * t + 2u], m8[4u * t + 3u])));
             Q32.v[base + 72u + t] = floatBitsToUint(dt);
         }
     }
