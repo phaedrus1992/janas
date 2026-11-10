@@ -83,34 +83,36 @@ static int take_items(yyjson_mut_doc *d, yyjson_mut_val *arr, yyjson_val *in,
 
 int conv_append(struct srv *srv, const char *conv, const char *items_json)
 {
+    /* two arrays as texts joined: no reading back and writing again of a
+       conversation that only grows */
+    size_t nb = strlen(items_json);
+    if (nb < 2 || items_json[0] != '[' || items_json[nb - 1] != ']')
+        return -2;
     pthread_mutex_lock(&conv_mu);
     char *items = NULL;
     int rc = srv_store_get(srv->store, CONV_KIND, conv, NULL, &items);
-    yyjson_doc *a =
-        rc == 0 && items ? yyjson_read(items, strlen(items), 0) : NULL;
-    yyjson_doc *b = yyjson_read(items_json, strlen(items_json), 0);
-    free(items);
-    if (rc == 0) {
-        yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
-        yyjson_mut_val *arr = yyjson_mut_arr(d);
-        size_t idx, max;
-        yyjson_val *it;
-        yyjson_arr_foreach(yyjson_doc_get_root(a), idx, max, it)
-            yyjson_mut_arr_append(arr, yyjson_val_mut_copy(d, it));
-        yyjson_arr_foreach(yyjson_doc_get_root(b), idx, max, it)
-            yyjson_mut_arr_append(arr, yyjson_val_mut_copy(d, it));
-        size_t n;
+    if (rc == 0 && nb > 2) {
+        const char *a = items ? items : "[]";
+        size_t na = strlen(a);
         char *out =
-            yyjson_mut_val_write(arr, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &n);
-        rc =
-            out ? srv_store_update(srv->store, CONV_KIND, conv, NULL, out) : -1;
-        free(out);
-        yyjson_mut_doc_free(d);
+            na >= 2 && a[0] == '[' && a[na - 1] == ']' ? malloc(na + nb) : NULL;
+        if (!out)
+            rc = -2;
+        else {
+            size_t w = na - 1;
+            memcpy(out, a, w); /* without its ']' */
+            if (na > 2)
+                out[w++] = ',';
+            memcpy(out + w, items_json + 1, nb - 1); /* without the '[' */
+            w += nb - 1;
+            out[w] = 0;
+            rc = srv_store_update(srv->store, CONV_KIND, conv, NULL, out);
+            free(out);
+        }
     }
-    yyjson_doc_free(a);
-    yyjson_doc_free(b);
+    free(items);
     pthread_mutex_unlock(&conv_mu);
-    return rc == 0 ? 0 : -1;
+    return rc;
 }
 
 char *conv_items(struct srv *srv, const char *conv)
@@ -311,6 +313,11 @@ int srv_conv_items_create(struct srv_req *r)
     if (rc != 0) {
         free(its);
         yyjson_mut_doc_free(d);
+        if (rc == -3)
+            return srv_reply_error(r, 400, "invalid_request_error",
+                                   "conversation_too_large",
+                                   "The conversation '%s' would pass %zu MiB.",
+                                   r->param[0], SRV_STORE_DOC_MAX >> 20);
         return rc == -1 ? no_conv(r) : oom(r);
     }
     yyjson_doc *added = yyjson_read(its, n, 0);

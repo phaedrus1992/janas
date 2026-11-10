@@ -22,6 +22,7 @@
 layout(local_size_x = 64) in;
 layout(constant_id = 0) const uint NV = 8;
 layout(constant_id = 1) const uint SG = 8;
+layout(constant_id = 2) const uint ID = 0;
 const uint NX = (19u + SG - 1u) / SG;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
@@ -30,6 +31,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F 
 
 // level 3, 2 or 1: the planes present; p1 (level >= 2) and p0 (level 3) the
 // bare planes of the first row, nb * 64 bytes a row
+// With ID (constant 2) a mixture's experts, the table of *_mmid.comp
+// (gpu_token_moe.c) in w: 3 uvec4 an expert, (w, x), (y, nv, ys), (the
+// bare planes p1, p0: the level they make), then from uvec4 nv on one a
+// workgroup's z, (expert, first vector); x's vectors nb blocks apart.
 layout(push_constant) uniform P { uvec2 w, x, y; uint rows, nb, nv, xs, ys, level; uvec2 p1, p0; } p;
 
 int dp(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
@@ -37,31 +42,42 @@ uvec4 bc(uvec4 xr[NX], uint k) { return subgroupBroadcast(xr[k / SG], k % SG); }
 
 void main()
 {
-    U4 P1 = U4(p.p1), P0 = U4(p.p0);
-    U4 X = U4(p.x);
-    F Y = F(p.y);
+    uvec2 wa = p.w, px = p.x, py = p.y, a1 = p.p1, a0 = p.p0;
+    uint nv = p.nv, xs = p.xs, ys = p.ys, level = p.level,
+         v0 = gl_WorkGroupID.x * NV;
+    if (ID != 0u) {
+        U4 T = U4(p.w);
+        uvec4 tl = T.v[p.nv + gl_WorkGroupID.z];
+        uvec4 t0 = T.v[3u * tl.x], t1 = T.v[3u * tl.x + 1u],
+              t2 = T.v[3u * tl.x + 2u];
+        wa = t0.xy, px = t0.zw, py = t1.xy, a1 = t2.xy, a0 = t2.zw;
+        nv = t1.z, xs = p.nb, ys = t1.w, v0 = tl.y;
+        level = a0 != uvec2(0u) ? 3u : a1 != uvec2(0u) ? 2u : 1u;
+    }
+    U4 P1 = U4(a1), P0 = U4(a0);
+    U4 X = U4(px);
+    F Y = F(py);
     uint lane = gl_SubgroupInvocationID;
     /* workgroup y: 64 rows; x: a group of NV vectors, so that the groups
        of the same rows go out together and the weights the first reads
        from memory the others find in the L3 */
     uint grow = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
     uint row = min(grow, p.rows - 1u);
-    uint v0 = gl_WorkGroupID.x * NV;
     uint xo[NV];
     for (uint v = 0; v < NV; v++)
-        xo[v] = min(v0 + v, p.nv - 1u) * p.xs * 20u;
+        xo[v] = min(v0 + v, nv - 1u) * xs * 20u;
     float acc[NV];
     for (uint v = 0; v < NV; v++)
         acc[v] = 0.0;
-    uint shk = p.level == 3u ? 1u : p.level == 2u ? 3u : 5u;
-    int c = p.level == 3u ? 64 : p.level == 2u ? 61 : 49;
+    uint shk = level == 3u ? 1u : level == 2u ? 3u : 5u;
+    int c = level == 3u ? 64 : level == 2u ? 61 : 49;
     uint off = row * p.nb * 82u;  /* bytes */
     uint pw = row * p.nb * 4u;    /* uvec4 of the bare planes */
     for (uint b = 0; b < p.nb; b++, off += 82u, pw += 4u) {
         /* the block's 20 words (80 bytes) and d, realigned from the 16-byte
            boundary s bytes below it (s even) */
-        uint lo = p.w.x + off;
-        U4 B = U4(uvec2(lo & ~15u, p.w.y + (lo < p.w.x ? 1u : 0u)));
+        uint lo = wa.x + off;
+        U4 B = U4(uvec2(lo & ~15u, wa.y + (lo < wa.x ? 1u : 0u)));
         uint s = lo & 15u;
         uint rw[25];
         for (uint k = 0; k < 6u; k++) {
@@ -85,8 +101,8 @@ void main()
                 sc[4u * k + j] = bitfieldExtract(int(wd[16u + k]), int(8u * j), 8);
         uint w1[16], w0[16];
         for (uint k = 0; k < 4u; k++) {
-            uvec4 a1 = p.level >= 2u ? P1.v[pw + k] : uvec4(0u);
-            uvec4 a0 = p.level >= 3u ? P0.v[pw + k] : uvec4(0u);
+            uvec4 a1 = level >= 2u ? P1.v[pw + k] : uvec4(0u);
+            uvec4 a0 = level >= 3u ? P0.v[pw + k] : uvec4(0u);
             w1[4u * k] = a1.x; w1[4u * k + 1u] = a1.y; w1[4u * k + 2u] = a1.z; w1[4u * k + 3u] = a1.w;
             w0[4u * k] = a0.x; w0[4u * k + 1u] = a0.y; w0[4u * k + 2u] = a0.z; w0[4u * k + 3u] = a0.w;
         }
@@ -106,9 +122,9 @@ void main()
                     for (uint k = 0; k < 8u; k++) {
                         uint i = 8u * n + k;
                         uint q = (wd[i] >> hsh) & 0x03030303u;
-                        if (p.level >= 2u)
+                        if (level >= 2u)
                             q = (q << 2) | ((w1[i] >> hsh) & 0x03030303u);
-                        if (p.level >= 3u)
+                        if (level >= 3u)
                             q = (q << 2) | ((w0[i] >> hsh) & 0x03030303u);
                         if (k < 4u)
                             dot0 += dp(q, a[k]);
@@ -132,6 +148,6 @@ void main()
     }
     if (grow < p.rows)
         for (uint v = 0; v < NV; v++)
-            if (v0 + v < p.nv)
-                Y.v[(v0 + v) * p.ys + row] = acc[v];
+            if (v0 + v < nv)
+                Y.v[(v0 + v) * ys + row] = acc[v];
 }

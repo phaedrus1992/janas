@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <cpuid.h>
 #include <powrprof.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -289,6 +290,50 @@ uint64_t janas_mem_total(void)
 {
     MEMORYSTATUSEX m = {.dwLength = sizeof m};
     return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;
+}
+
+uint64_t janas_rss_bytes(void)
+{
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)
+               ? pmc.WorkingSetSize
+               : 0;
+}
+
+size_t janas_l2_bytes(void)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD len = sizeof(info);
+    if (!GetLogicalProcessorInformation(info, &len))
+        return 0;
+    for (DWORD i = 0; i < len / sizeof(info[0]); i++)
+        if (info[i].Relationship == RelationCache && info[i].Cache.Level == 2)
+            return info[i].Cache.Size;
+    return 0;
+}
+
+double janas_cpu_seconds(void)
+{
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+        return -1;
+    ULARGE_INTEGER kk = {.LowPart = k.dwLowDateTime,
+                         .HighPart = k.dwHighDateTime};
+    ULARGE_INTEGER uu = {.LowPart = u.dwLowDateTime,
+                         .HighPart = u.dwHighDateTime};
+    return (double)(kk.QuadPart + uu.QuadPart) * 1e-7; /* 100 ns units */
+}
+
+int janas_cpu_count(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors ? (int)si.dwNumberOfProcessors : 1;
+}
+
+double janas_package_joules(void)
+{
+    return -1; /* not readable without a driver */
 }
 
 #endif /* _WIN32 */
