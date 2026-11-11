@@ -37,6 +37,9 @@ void mcpc_defer(int on);
    of those open (mcpc_opened_tools, malloc'd JSON array, NULL: none) go
    to janas_llm_chat_tools_add. mcpc_close_services: a new conversation. */
 unsigned mcpc_opened(void);
+/* The prefix of the tools of the service opened last ("system__"), or NULL:
+   the reply after it is held to them. */
+const char *mcpc_opened_prefix(void);
 char *mcpc_opened_tools(void);
 void mcpc_close_services(void);
 

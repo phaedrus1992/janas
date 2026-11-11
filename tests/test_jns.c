@@ -145,11 +145,21 @@ static void check_accepted(const struct janas_jns *j)
     for (uint32_t l = 0; l < j->h.n_layer; l++)
         for (uint32_t e = 0; e < j->h.n_expert; e++) {
             uint64_t off = janas_jns_expert_offset(j, l, e);
+            if (off == 0 && j->expert_sum[(size_t)l * j->h.n_expert + e] == 0)
+                continue; /* absent (Nemotron-H: fewer experts a layer) */
             CHECK(off >= j->h.experts_offset &&
                       off + j->layers[l].slot_bytes <=
                           j->h.experts_offset + j->h.experts_bytes,
                   "accepted an expert outside the expert region");
         }
+    for (uint64_t t = 0; t < j->h.n_tensor; t++) {
+        const struct janas_jns_tensor *tn = &j->tensors[t];
+        uint64_t n = 1;
+        for (uint32_t d = 0; d < tn->n_dims; d++)
+            n *= tn->dims[d];
+        CHECK(tn->type != 0 || n * 4 == tn->bytes,
+              "accepted a tensor whose shape is not its bytes");
+    }
 }
 
 int main(void)
@@ -212,6 +222,30 @@ int main(void)
     CHECK(janas_jns_parse(base, sizeof(base), file_bytes - 1, &j, err,
                           sizeof(err)) != 0,
           "wrong file size accepted");
+
+    /* a tensor whose shape says more than its bytes: a reader trusting
+       the dims would read past the resident region */
+    {
+        static const uint64_t shapes[][3] = {
+            {1000, 1, 1}, {4, 2, 2}, {0, 1, 2}, {4, 0, 2}, {4, 1u << 31, 2}};
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+            memcpy(img, base, sizeof(img));
+            struct janas_jns_header hh;
+            struct janas_jns_tensor tt;
+            memcpy(&hh, img, sizeof(hh));
+            memcpy(&tt, img + hh.tensor_dir_offset, sizeof(tt));
+            tt.dims[0] = shapes[i][0];
+            tt.dims[1] = shapes[i][1];
+            tt.n_dims = (uint32_t)shapes[i][2];
+            memcpy(img + hh.tensor_dir_offset, &tt, sizeof(tt));
+            seal(img);
+            rc = janas_jns_parse(img, sizeof(img), file_bytes, &j, err,
+                                 sizeof(err));
+            CHECK(rc != 0, "tensor shape %zu accepted against its bytes", i);
+            if (rc == 0)
+                janas_jns_close(&j);
+        }
+    }
 
     int accepted_flips = 0, accepted_fields = 0;
     for (int iter = 0; iter < 20000; iter++) {

@@ -21,7 +21,9 @@
  * message over 1024 tokens and with one under. The disk is a
  * directory of the test's own (XDG_CACHE_HOME), removed at the end.
  *
- * Usage: llm_keep <model.jns> [mtp=<file>] [draft=<file>]
+ * Usage: llm_keep <model.jns> [mtp=<file>] [draft=<file>] [cache=MiB]
+ * cache= sets the expert cache, below what the machine's free memory would
+ * give it, for a machine busy with other work.
  */
 #define _GNU_SOURCE
 #include <ftw.h>
@@ -322,7 +324,7 @@ int main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr, "usage: llm_keep <model.jns> [mtp=<file>] "
-                        "[draft=<file>]\n");
+                        "[draft=<file>] [cache=MiB]\n");
         return 2;
     }
     struct janas_llm_params lp;
@@ -333,6 +335,8 @@ int main(int argc, char **argv)
             lp.mtp_path = argv[i] + 4;
         else if (!strncmp(argv[i], "draft=", 6))
             lp.draft_path = argv[i] + 6;
+        else if (!strncmp(argv[i], "cache=", 6))
+            lp.cache_bytes = strtoull(argv[i] + 6, NULL, 10) << 20;
     }
     janas_llm *llm;
     if (janas_llm_open(argv[1], &lp, &llm) != JANAS_LLM_OK) {

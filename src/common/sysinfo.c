@@ -55,6 +55,8 @@ int janas_cpu_layout(const int *allowed, int n_allowed,
 #include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 /* Reads a CPU list ("0-11,14") from a sysfs file. Returns the count. */
@@ -231,7 +233,9 @@ void janas_cpu_name(char *buf, size_t len)
 
 int janas_on_mains(void)
 {
-    /* every power supply of type Mains; on mains if any is online */
+    /* every power supply of type Mains, and the USB ones (a laptop fed
+       by USB-C may have its Mains offline): on mains if any is online;
+       on battery only if there is a Mains and none is */
     DIR *d = opendir("/sys/class/power_supply");
     if (!d)
         return -1;
@@ -249,16 +253,17 @@ int janas_on_mains(void)
         if (!fgets(type, sizeof(type), f))
             type[0] = 0;
         fclose(f);
-        if (strncmp(type, "Mains", 5) != 0)
+        int mains = strncmp(type, "Mains", 5) == 0;
+        if (!mains && strncmp(type, "USB", 3) != 0)
             continue;
-        found = 1;
+        found |= mains;
         snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online",
                  e->d_name);
         if (read_long(path) > 0)
             online = 1;
     }
     closedir(d);
-    return found ? online : -1;
+    return online ? 1 : found ? 0 : -1;
 }
 
 /* A field of /proc/meminfo, in bytes (0 if missing). */
@@ -286,6 +291,88 @@ uint64_t janas_mem_available(void)
 uint64_t janas_mem_total(void)
 {
     return meminfo("MemTotal");
+}
+
+uint64_t janas_rss_bytes(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    unsigned long long size = 0, resident = 0;
+    int ok = fscanf(f, "%llu %llu", &size, &resident) == 2;
+    fclose(f);
+    long page = sysconf(_SC_PAGESIZE);
+    return ok && page > 0 ? (uint64_t)resident * (uint64_t)page : 0;
+}
+
+size_t janas_l2_bytes(void)
+{
+    for (int i = 0; i < 8; i++) {
+        char path[96], buf[32];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        if (read_long(path) != 2)
+            continue;
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            return 0;
+        char *ok = fgets(buf, sizeof(buf), f);
+        fclose(f);
+        char *end;
+        unsigned long v = ok ? strtoul(buf, &end, 10) : 0;
+        if (!ok || end == buf)
+            return 0;
+        return *end == 'K' ? v << 10 : *end == 'M' ? v << 20 : v;
+    }
+    return 0;
+}
+
+double janas_cpu_seconds(void)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0)
+        return -1;
+    return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec * 1e-6 +
+           (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec * 1e-6;
+}
+
+int janas_cpu_count(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+
+static long long read_ll(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    long long v = -1;
+    if (fscanf(f, "%lld", &v) != 1)
+        v = -1;
+    fclose(f);
+    return v;
+}
+
+double janas_package_joules(void)
+{
+#ifdef __linux__
+    static _Atomic long long wraps, last = -1;
+    long long uj = read_ll("/sys/class/powercap/intel-rapl:0/energy_uj");
+    if (uj < 0)
+        return -1;
+    long long range =
+        read_ll("/sys/class/powercap/intel-rapl:0/max_energy_range_uj");
+    /* the counter starts again from 0 past its range */
+    long long before = atomic_exchange(&last, uj);
+    if (before >= 0 && uj < before && range > 0)
+        atomic_fetch_add(&wraps, 1);
+    return ((double)uj + (double)atomic_load(&wraps) * (double)range) * 1e-6;
+#else
+    return -1;
+#endif
 }
 
 #endif /* !_WIN32 */
