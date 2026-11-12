@@ -14,8 +14,13 @@
  * and 2112) is widened with zeros to the next one - rows of zero bytes in
  * gate and up, a zero tail on each row of down: every weight type reads zero
  * bytes as zero weights, so the products are the same, and the engine's
- * activations, quantized 256 at a time, fit. Gate and up fused in one
- * tensor (ffn_gate_up_exps) are split into the two matrices of the slot.
+ * activations, quantized 256 at a time, fit. Qwen3.8-Flash-Next's experts
+ * (qwen4exp, 640 wide) keep their width: the engine reads rows that end
+ * inside a group of 256 in the types stored in blocks of 32 or 64
+ * (janas_dot_rows_n), the only ones such a down can have, and the zeros
+ * would be a fifth more bytes read at every token. Gate and up fused in
+ * one tensor (ffn_gate_up_exps) are split into the two matrices of the
+ * slot.
  *
  * A resident tensor in MXFP4 (unsloth's Qwen3-Coder-Next files have their
  * shared experts so, issue #18) is written as Q8_0, which holds it exactly:
@@ -25,6 +30,12 @@
  * weights are so below 3.6e-7, is written as zeros (counted). Routed
  * experts in MXFP4 (the MXFP4_MOE files) stay MXFP4, which the engine reads
  * as it is: as Q8_0 they would read twice the bytes at every token.
+ *
+ * Llama's queries and keys (general.architecture "llama") are written in the
+ * row order of the original checkpoint: llama.cpp's converter permutes the
+ * rows of each head, [2][half] to [half][2], for its rotation of adjacent
+ * pairs, and Janas-LLM rotates halves, as Qwen's files have it. The rows are
+ * moved whole, so any type of weight moves exactly.
  *
  * A model split into several GGUF files (name-00001-of-0000N.gguf) is read
  * from all of them: give the first. Data is copied in streaming; the model
@@ -77,6 +88,8 @@ struct tensor {
     /* a resident matrix widened with zeros: its rows, then as written */
     uint64_t rows, rb, new_rows, new_rb, new_dims[2], new_bytes;
     uint32_t new_type; /* MXFP4 is written as Q8_0 */
+    uint32_t unperm;   /* Llama's attn_q, attn_k: their heads, rows to put
+                          back in the checkpoint's order */
 };
 
 /* A matrix of a slot: from which tensor, where in an expert's part of it,
@@ -116,6 +129,35 @@ static uint64_t need_uint(const struct janas_gguf *g, const char *key)
     if (janas_gguf_uint(g, key, &v) != 0)
         die("metadata %s missing, or not a number", key);
     return v;
+}
+
+/* An integer, or the largest of an array of them (nemotron_h_moe's
+   expert_used_count, one a layer); 0 if neither. */
+static uint64_t uint_or_max(const struct janas_gguf *g, const char *key)
+{
+    uint64_t v;
+    if (janas_gguf_uint(g, key, &v) == 0)
+        return v;
+    for (uint64_t i = 0; i < g->n_kv; i++) {
+        const struct janas_gguf_kv *kv = &g->kv[i];
+        if (kv->key.n != strlen(key) || memcmp(kv->key.p, key, kv->key.n) ||
+            kv->type != 9)
+            continue;
+        uint32_t et;
+        uint64_t n, best = 0;
+        memcpy(&et, kv->val, 4);
+        memcpy(&n, kv->val + 4, 8);
+        if (et != 4 && et != 5)
+            return 0;
+        for (uint64_t k = 0; k < n; k++) {
+            uint32_t x;
+            memcpy(&x, kv->val + 12 + 4 * k, 4);
+            if (x > best && !(et == 5 && (int32_t)x < 0))
+                best = x;
+        }
+        return best;
+    }
+    return 0;
 }
 
 /* The tensor of this name in any part; the last part that has it wins, as
@@ -207,6 +249,10 @@ static uint32_t copy_rows(const struct tensor *t, uint64_t src, uint64_t rows,
     if (new_rb == rb) {
         crc = copy(t, src, rows * rb, dst, crc, with_crc);
     } else {
+        /* a row at a time at the least: it must fit the buffers */
+        if (new_rb < rb || new_rb > COPY_CHUNK)
+            die("%s", "a row longer than 16 MiB: not one this converter "
+                      "rewrites");
         uint64_t per = COPY_CHUNK / new_rb ? COPY_CHUNK / new_rb : 1;
         int fd = parts[t->part].fd;
         for (uint64_t r0 = 0; r0 < rows; r0 += per) {
@@ -228,6 +274,30 @@ static uint32_t copy_rows(const struct tensor *t, uint64_t src, uint64_t rows,
     if (with_crc)
         crc = crc_zeros(crc, (new_rows - rows) * new_rb);
     return crc;
+}
+
+/* The rows of t, heads of rows / heads each, from llama.cpp's order - row
+   2 i + j of a head - back to the checkpoint's, row j * half + i. */
+static void copy_unpermuted(const struct tensor *t, uint64_t dst)
+{
+    uint64_t rows = t->t->dims[1], rb = t->t->bytes / rows;
+    uint64_t hd = rows / t->unperm, half = hd / 2;
+    uint8_t *in = malloc(t->t->bytes), *outb = malloc(t->t->bytes);
+    if (!in || !outb)
+        die("%s", "out of memory");
+    if (pread(parts[t->part].fd, in, t->t->bytes,
+              (off_t)(t->base + t->t->offset)) != (ssize_t)t->t->bytes)
+        die("%s", "unexpected end of the GGUF file");
+    for (uint64_t h = 0; h < t->unperm; h++)
+        for (uint64_t j = 0; j < 2; j++)
+            for (uint64_t i = 0; i < half; i++)
+                memcpy(outb + (h * hd + j * half + i) * rb,
+                       in + (h * hd + 2 * i + j) * rb, rb);
+    if (pwrite(out_fd, outb, t->t->bytes, (off_t)dst) != (ssize_t)t->t->bytes)
+        die("write failed: %s", strerror(errno));
+    copied += t->t->bytes;
+    free(in);
+    free(outb);
 }
 
 static size_t tiny_blocks; /* MXFP4 blocks below fp16's scales */
@@ -321,12 +391,54 @@ int main(int argc, char **argv)
         n_expert = 1;
     else {
         snprintf(key, sizeof(key), "%s.expert_used_count", arch);
-        n_used = need_uint(g0, key);
+        n_used = uint_or_max(g0, key);
+        if (n_used == 0)
+            die("metadata %s missing, or not a number", key);
     }
     snprintf(key, sizeof(key), "%s.embedding_length", arch);
     uint64_t d_model = need_uint(g0, key);
-    if (n_layer == 0 || n_layer > 4096 || n_expert == 0 || n_expert > 65536)
+    if (n_layer == 0 || n_layer > JANAS_JNS_MAX_LAYERS || n_expert == 0 ||
+        n_expert > 65536)
         die("%s: layers or experts out of range", src);
+    /* the experts' width as it is (see the top of the file) */
+    int keep_width = strcmp(arch, "qwen4exp") == 0;
+    uint64_t llama_heads = 0, llama_kv = 0;
+    if (strcmp(arch, "llama") == 0) {
+        llama_heads = need_uint(g0, "llama.attention.head_count");
+        llama_kv = need_uint(g0, "llama.attention.head_count_kv");
+    }
+
+    /* nemotron_h_moe: a layer is a Mamba-2 mixer, an attention or a
+       mixture, and only the mixtures have experts - each its own number of
+       them (the router's rows) and no gate (relu^2 on up). Such a layer
+       without experts has an empty slot (no matrices, size 0), a missing
+       gate an empty matrix, and the table is as wide as the layer with the
+       most experts: the others' slots past their own are absent (offset
+       0), never asked for. */
+    int sparse = strcmp(arch, "nemotron_h_moe") == 0;
+    uint64_t *layer_ne = calloc(n_layer, sizeof(*layer_ne));
+    if (!layer_ne)
+        die("%s", "out of memory");
+    if (sparse) {
+        n_expert = 0;
+        for (uint64_t l = 0; l < n_layer; l++) {
+            snprintf(key, sizeof(key), "blk.%llu.ffn_up_exps.weight",
+                     (unsigned long long)l);
+            struct tensor *t = find(key);
+            layer_ne[l] = t && t->t->n_dims > 2 ? t->t->dims[2] : 0;
+            if (layer_ne[l] > n_expert)
+                n_expert = layer_ne[l];
+        }
+        if (n_expert == 0 || n_expert > 65536)
+            die("%s: no layer with experts", src);
+        for (uint64_t l = 0; l < n_layer; l++)
+            if (layer_ne[l] && layer_ne[l] < n_used)
+                die("%s: a layer has fewer experts than are used", src);
+    } else
+        for (uint64_t l = 0; l < n_layer; l++)
+            layer_ne[l] = n_expert;
+    if (n_used > n_expert)
+        die("%s: more experts used than there are", src);
 
     /* expert geometry per layer */
     struct janas_jns_layer_v2 *layers = calloc(n_layer, sizeof(*layers));
@@ -336,6 +448,8 @@ int main(int argc, char **argv)
     static const char *const part_name[3] = {"gate", "up", "down"};
     for (uint64_t l = 0; l < n_layer; l++) {
         uint64_t off = 0;
+        if (layer_ne[l] == 0)
+            continue; /* no experts: an empty slot */
         for (int p = 0; p < 3; p++) {
             snprintf(key, sizeof(key),
                      dense ? "blk.%llu.ffn_%s.weight"
@@ -349,16 +463,18 @@ int main(int argc, char **argv)
                 t = find(key);
                 half = 1;
             }
+            if (!t && sparse && p == 0)
+                continue; /* no gate: an empty matrix */
             if (!t)
                 die("%s missing: only models with routed experts in every "
                     "layer, or dense ones, are supported",
                     key);
             uint64_t ne = t->t->n_dims > 2 ? t->t->dims[2] : 1;
-            if (ne != n_expert || t->t->bytes % n_expert ||
+            if (ne != layer_ne[l] || t->t->bytes % ne ||
                 t->t->dims[0] > UINT32_MAX || t->t->dims[1] > UINT32_MAX ||
                 t->t->dims[3] != 1 || (half && t->t->dims[1] % 2))
                 die("%s: unexpected shape", key);
-            uint64_t per = t->t->bytes / n_expert;
+            uint64_t per = t->t->bytes / ne;
             uint64_t rows = t->t->dims[1] / (half ? 2 : 1);
             uint64_t cols = t->t->dims[0];
             if (per % t->t->dims[1])
@@ -366,10 +482,13 @@ int main(int argc, char **argv)
             uint64_t rb = per / t->t->dims[1];
             /* widened to a multiple of 256: the rows of gate and up, the
                row of down */
-            uint64_t new_rows = p < 2 ? wide(rows) : rows;
-            uint64_t new_cols = p < 2 ? cols : wide(cols);
+            uint64_t new_rows = p < 2 && !keep_width ? wide(rows) : rows;
+            uint64_t new_cols = p < 2 || keep_width ? cols : wide(cols);
             if (new_cols != cols && (rb * new_cols) % cols)
                 die("%s: cannot widen this type", key);
+            if (keep_width &&
+                janas_qtype_row_bytes((int)t->t->type, cols) != rb)
+                die("%s: a row the engine cannot read at this width", key);
             uint64_t new_rb = rb * new_cols / cols;
             off = align_up(off, MATRIX_ALIGN);
             layers[l].m[p] =
@@ -420,6 +539,15 @@ int main(int argc, char **argv)
         t->new_dims[0] = t->t->dims[0];
         t->new_dims[1] = t->t->dims[1];
         t->new_type = t->t->type;
+        if (llama_heads && nl > 14 &&
+            (!strcmp(name + nl - 14, ".attn_q.weight") ||
+             !strcmp(name + nl - 14, ".attn_k.weight"))) {
+            t->unperm =
+                (uint32_t)(name[nl - 8] == 'q' ? llama_heads : llama_kv);
+            if (t->t->n_dims != 2 || t->t->dims[1] % (2 * t->unperm) ||
+                t->t->bytes % t->t->dims[1])
+                die("%s: unexpected shape", name);
+        }
         if (t->t->type == GGUF_MXFP4) {
             if (t->t->bytes % MXFP4_BLOCK || t->t->dims[0] % 32 ||
                 (t->t->n_dims == 2 && (gu || dn) &&
@@ -472,8 +600,10 @@ int main(int argc, char **argv)
         die("%s", "out of memory");
     for (uint64_t l = 0; l < n_layer; l++)
         for (uint64_t e = 0; e < n_expert; e++) {
-            slot_off[l * n_expert + e] = pos;
-            pos += layers[l].slot_bytes;
+            /* an absent slot: offset 0 */
+            slot_off[l * n_expert + e] = e < layer_ne[l] ? pos : 0;
+            if (e < layer_ne[l])
+                pos += layers[l].slot_bytes;
         }
     uint64_t experts_bytes = pos - experts_offset;
     uint64_t file_bytes = pos;
@@ -499,7 +629,9 @@ int main(int argc, char **argv)
 
     for (size_t i = 0; i < n_res; i++) {
         const struct tensor *t = resident[i];
-        if (t->new_type != t->t->type)
+        if (t->unperm)
+            copy_unpermuted(t, t->new_offset);
+        else if (t->new_type != t->t->type)
             copy_mxfp4(t, t->t->offset, t->t->bytes, t->new_offset);
         else if (t->new_bytes != t->t->bytes)
             copy_rows(t, t->t->offset, t->rows, t->rb, t->new_rows, t->new_rb,
@@ -513,8 +645,14 @@ int main(int argc, char **argv)
             uint64_t slot = slot_off[l * n_expert + e];
             uint32_t crc = 0;
             uint64_t end = 0;
+            if (e >= layer_ne[l]) {
+                sums[l * n_expert + e] = 0;
+                continue;
+            }
             for (int p = 0; p < 3; p++) {
                 const struct janas_jns_matrix *m = &layers[l].m[p];
+                if (m->type == 0)
+                    continue;        /* an empty matrix */
                 if (m->offset > end) /* padding inside the slot is zero */
                     crc = crc_zeros(crc, m->offset - end);
                 const struct src_matrix *s = &mats[l][p];
@@ -562,6 +700,14 @@ int main(int argc, char **argv)
         d.offset = resident[i]->new_offset;
         d.bytes = resident[i]->new_bytes;
         memcpy(tbl + (tensor_dir - layer_table) + i * sizeof(d), &d, sizeof(d));
+    }
+    /* copied as it is, and the JNS reader takes no array of arrays */
+    for (uint64_t i = 0; i < g0->n_kv; i++) {
+        uint32_t et;
+        if (g0->kv[i].type == 9 && (memcpy(&et, g0->kv[i].val, 4), et == 9))
+            die("%s: an array of arrays in the metadata, which a JNS file "
+                "cannot hold",
+                src);
     }
     uint8_t *meta = malloc(metadata_bytes);
     if (!meta)
@@ -611,6 +757,7 @@ int main(int argc, char **argv)
     free(resident);
     free(mats);
     free(layers);
+    free(layer_ne);
     free(arch);
     free(tensors);
     for (int i = 0; i < n_parts; i++) {

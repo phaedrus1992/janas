@@ -24,22 +24,46 @@ int janas_https_get(const char *url, const char *const *headers,
                               err_len);
 }
 
+static int get(const char *url, const char *const *headers, size_t n_headers,
+               int timeout_ms, const struct janas_net_policy *policy,
+               struct janas_buf *out, char *err, size_t err_len);
+
 int janas_https_get_ms(const char *url, const char *const *headers,
                        size_t n_headers, int timeout_ms, struct janas_buf *out,
                        char *err, size_t err_len)
 {
-    char where[4096], first[256] = "";
+    return get(url, headers, n_headers, timeout_ms, NULL, out, err, err_len);
+}
+
+int janas_https_get_policy(const char *url,
+                           const struct janas_net_policy *policy,
+                           int timeout_ms, struct janas_buf *out, char *err,
+                           size_t err_len)
+{
+    return get(url, NULL, 0, timeout_ms, policy, out, err, err_len);
+}
+
+static int get(const char *url, const char *const *headers, size_t n_headers,
+               int timeout_ms, const struct janas_net_policy *policy,
+               struct janas_buf *out, char *err, size_t err_len)
+{
+    char where[4096];
     snprintf(where, sizeof where, "%s", url);
     const char *kept[16];
+    struct janas_url first;
     for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
         struct janas_url u;
         if (janas_url_parse(where, &u, err, err_len) != 0)
             return -1;
+        u.policy = policy; /* on every hop: a redirect too is checked */
         if (!hop)
-            snprintf(first, sizeof first, "%s", u.host);
-        /* sent to another host, a redirect loses the credentials (as curl
-           does): a token for one server is not for the next */
-        if (hop && strcasecmp(first, u.host) != 0 && headers) {
+            first = u;
+        /* sent to another origin, a redirect loses the credentials (as curl
+           does): a token for one server is not for the next, nor for the
+           same one in clear */
+        if (hop && headers &&
+            (strcasecmp(first.host, u.host) != 0 || first.tls != u.tls ||
+             strcmp(first.port, u.port) != 0)) {
             size_t k = 0;
             for (size_t i = 0; i < n_headers && k < 16; i++)
                 if (strncasecmp(headers[i], "Authorization:", 14) != 0)

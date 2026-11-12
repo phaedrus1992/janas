@@ -152,6 +152,23 @@ int main(void)
     expect(st, "response", "resp_1", "{\"b\":22}", "items");
     srv_store_free(st);
 
+    /* 6: a document past SRV_STORE_DOC_MAX is refused, put or grown */
+    st = srv_store_new(0);
+    char *big = malloc(SRV_STORE_DOC_MAX + 2);
+    if (st && big) {
+        memset(big, ' ', SRV_STORE_DOC_MAX + 1);
+        big[SRV_STORE_DOC_MAX + 1] = 0;
+        CHECK(srv_store_put(st, "response", "resp_big", 1, big, NULL) == -3,
+              "a document past the limit was kept");
+        CHECK(srv_store_put(st, "response", "resp_s", 1, "{}", NULL) == 0 &&
+                  srv_store_update(st, "response", "resp_s", NULL, big + 2) ==
+                      -3,
+              "a document grew past the limit");
+        expect(st, "response", "resp_s", "{}", NULL);
+    }
+    free(big);
+    srv_store_free(st);
+
     nftw(dir, rm_one, 16, FTW_DEPTH | FTW_PHYS);
     if (!failed)
         printf("test_server_store: ok\n");
