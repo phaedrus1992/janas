@@ -170,7 +170,7 @@ static int call_ok(enum janas_tool_dialect d, const char *body)
     struct janas_toolset *t = tools();
     struct janas_gbuild *b = janas_gbuild_new();
     struct janas_jsg *j = janas_jsg_new(b);
-    uint32_t r = janas_tools_rule(b, j, d, t, -1, 9);
+    uint32_t r = janas_tools_rule(b, j, d, t, -1, NULL, 0, 9);
     struct janas_grammar *g = janas_grammar_make(b);
     struct janas_gmatch *m = g ? janas_gmatch_new(g, r) : NULL;
     int ok = m && janas_gmatch_feed(m, body, strlen(body), -1) == 0 &&
@@ -253,7 +253,7 @@ static void test_mangled(void)
             janas_buf_free(&s);
             struct janas_gbuild *b = janas_gbuild_new();
             struct janas_jsg *j = janas_jsg_new(b);
-            janas_tools_rule(b, j, d, t, -1, 9);
+            janas_tools_rule(b, j, d, t, -1, NULL, 0, 9);
             struct janas_grammar *g = janas_grammar_make(b);
             janas_grammar_free(g);
             janas_jsg_free(j);

@@ -29,9 +29,6 @@
 #undef strcasestr
 #undef memmem
 #undef strndup
-#undef aligned_alloc
-#undef posix_memalign
-#undef free
 #undef getline
 #undef mkdtemp
 #undef open_memstream
@@ -282,61 +279,6 @@ long janas_sysconf(int name)
     }
     errno = EINVAL;
     return -1;
-}
-
-/* the tag before an aligned block: where malloc's block began, and that
-   address mixed with a constant, so that the bytes before an ordinary
-   block (the heap's own header) are not taken for one */
-#define ALIGN_TAG 0x4a414e4153414c47ull
-struct align_tag {
-    void *base;
-    uint64_t check;
-};
-
-void *janas_aligned_alloc(size_t align, size_t size)
-{
-    if (align < sizeof(void *) || (align & (align - 1))) {
-        errno = EINVAL;
-        return NULL;
-    }
-    size_t extra = align + sizeof(struct align_tag);
-    if (size > SIZE_MAX - extra) {
-        errno = ENOMEM;
-        return NULL;
-    }
-    char *base = malloc(size + extra);
-    if (!base)
-        return NULL;
-    uintptr_t a = ((uintptr_t)base + sizeof(struct align_tag) + align - 1) &
-                  ~(uintptr_t)(align - 1);
-    struct align_tag *t = (struct align_tag *)a - 1;
-    t->base = base;
-    t->check = ALIGN_TAG ^ (uint64_t)a;
-    return (void *)a;
-}
-
-int janas_posix_memalign(void **p, size_t align, size_t size)
-{
-    void *a = janas_aligned_alloc(align, size ? size : 1);
-    if (!a)
-        return errno;
-    *p = a;
-    return 0;
-}
-
-void janas_free(void *p)
-{
-    if (!p)
-        return;
-    struct align_tag *t = (struct align_tag *)p - 1;
-    if (((uintptr_t)p & 15) == 0 &&
-        t->check == (ALIGN_TAG ^ (uint64_t)(uintptr_t)p)) {
-        void *base = t->base;
-        t->check = 0;
-        free(base);
-        return;
-    }
-    free(p);
 }
 
 ssize_t janas_getline(char **line, size_t *cap, FILE *f)

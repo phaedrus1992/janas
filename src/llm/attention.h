@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 Maurizio Cammalleri */
 /*
- * attention.h - causal grouped-query attention over an eight-bit KV cache.
+ * attention.h - causal grouped-query attention over an eight-bit KV cache
+ * (spans that attend both ways set call by call).
  *
  * The keys and values of one layer are laid out n_head_kv x n_ctx x
  * head_dim as signed bytes, with one float scale per position and KV head
@@ -84,6 +85,16 @@ void janas_attn_set_ring(struct janas_attn *a, int on);
 /* The positions a ring needs for a window and calls of up to n tokens
    whose keys and values are written before any of them is attended. */
 uint32_t janas_attn_ring_positions(uint32_t window, uint32_t n);
+
+/*
+ * For the next call only: token j sees the positions up to last[j] instead
+ * of up to its own (pos0 + j), last[j] >= pos0 + j and never less than
+ * last[j - 1] - the tokens of a span that attends both ways, a picture's
+ * in Gemma 4 12B and 26B; the keys and values up to the largest must be in
+ * the cache. A window still starts from the token's own position. NULL:
+ * causal, as every call without it.
+ */
+void janas_attn_set_last(struct janas_attn *a, const uint32_t *last);
 
 /* What the scores are actually computed with: FLOAT or INT16. */
 int janas_attn_scores_mode(const struct janas_attn *a);

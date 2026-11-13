@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "janas/llm.h"
+#include "llm/nucleus.h"
 #include "llm/expert_cache.h"
 #include "llm/constrain.h"
 #include "llm/generate.h"
@@ -26,19 +27,47 @@ enum chat_format {
        "model", the reasoning in <|channel>thought\n...<channel|>:
        ChatML's shape, so im_start and im_end hold <|turn> and <turn|> */
     FORMAT_GEMMA,
+    /* Llama 3: <|begin_of_text|> once, then <|start_header_id|>role
+       <|end_header_id|>\n\ntext<|eot_id|>, nothing after: ChatML's shape,
+       im_start and im_end holding <|start_header_id|> and <|eot_id|>, the
+       role closed by hdr_end */
+    FORMAT_LLAMA3,
+};
+
+/* a picture read by the vision encoder (api_image.c): its embeddings and
+   its grid of tokens; and where one is in the prompt being built */
+struct cpic {
+    float *embd;
+    uint32_t nx, ny;
+};
+struct ppic {
+    uint32_t off; /* of its first token in ids */
+    const struct cpic *pic;
 };
 
 struct janas_llm {
     struct janas_llm_model *m;
+    char *path;               /* the model's file */
+    struct janas_vision *vis; /* its vision encoder, opened at the first
+                                 picture (api_image.c) */
     struct janas_tokenizer *tok;
     int format;
     int32_t im_start, im_end;
     const char *asst_role; /* "assistant", or Gemma's "model" */
     int32_t bos;           /* written once at the start, or -1 */
+    int32_t hdr_end;       /* Llama 3's <|end_header_id|>, or -1 */
     int32_t think_on;      /* Gemma's <|think|>: reasoning asked for, or -1 */
     int32_t quote, decl_open, decl_close; /* Gemma's <|"|>, <|tool>, <tool|> */
     int32_t think_open, think_close;      /* reasoning markers, or -1 */
-    int thinker;       /* the template knows enable_thinking */
+    int thinker; /* the template knows enable_thinking */
+    /* the template's words at the top of the system message while the
+       model reasons, at its default effort (Qwen3.8: "Reasoning effort is
+       set to xhigh. ..."); empty where it has none */
+    char think_note[512];
+    /* the template gives every earlier turn of the assistant its reasoning
+       back (Qwen3.8: preserve_thinking unless told otherwise), not only
+       those after the user's last question (Qwen3.5 and 3.6) */
+    int think_kept;
     int empty_thought; /* Gemma 4: an empty channel when not reasoning */
     enum janas_tool_dialect tools; /* how its template writes tool calls */
     int32_t call_open, call_close; /* <tool_call>, </tool_call>, or -1 */
@@ -52,6 +81,12 @@ struct janas_llm {
     struct janas_llm_model *draft; /* the drafting model, or NULL */
     uint32_t n_ctx;
     struct janas_llm_chat *chat;
+    /* Nucleus mode (api_nucleus.c): the gate is open on m, and the model
+       the requests go to */
+    int nuc_on;
+    struct janas_llm *nuc_spec;
+    /* what a monitor reads from another thread (api_stats.c), or NULL */
+    struct janas_api_monitor *mon;
     char desc[1024];
     /* what the description is built from, so that it can be built again:
        whether the GPU is given work is a thing that changes */
@@ -101,8 +136,14 @@ struct janas_llm_chat {
     /* the message being built: ids, and plain text not yet tokenized */
     int32_t *ids;
     size_t n_ids, cap_ids;
+    /* pictures queued for the next user message, and those in ids */
+    struct cpic *pics;
+    size_t n_pics;
+    struct ppic *idpics;
+    size_t n_idpics;
     char *text;
     size_t n_text, cap_text;
+    int text_special; /* the model's special tokens in it are tokens */
     /* counters */
     struct janas_gen_stats st0;
     struct janas_expert_cache_stats cs0;
@@ -148,6 +189,16 @@ struct janas_llm_chat {
     char *rtext;       /* the answer of the reply being read */
     size_t n_rtext, cap_rtext;
 
+    /* Nucleus mode (api_nucleus.c): the conversation last loaded, for the
+       Specialist; the gate's decision waited for at the reply's first
+       token; who answers; the Specialist's chat */
+    int32_t *nuc_roles;
+    char **nuc_texts;
+    size_t n_nuc;
+    int nuc_pending, nuc_route;
+    double nuc_handoff; /* seconds from the send to the Specialist's turn */
+    struct janas_llm_chat *nuc_chat;
+
     /* the conversation of janas_llm_chat_begin and _add, not yet run */
     struct cmsg {
         int32_t role;
@@ -155,6 +206,8 @@ struct janas_llm_chat {
         size_t n;
         struct janas_tool_call *calls; /* name and args owned here */
         size_t n_calls;
+        struct cpic *pics; /* a user message's pictures, owned here */
+        size_t n_pics;
     } *msgs;
     size_t n_msgs, cap_msgs;
 
@@ -165,6 +218,9 @@ struct janas_llm_chat {
     struct janas_toolset *tools, *tools_sys;
     char *tools_json, *more_json;
     int32_t tool_choice, tool_only, parallel;
+    char tool_prefix[128]; /* REQUIRED with a name: the calls' names begin
+                              with it (tool_prefix_n bytes; 0: any) */
+    size_t tool_prefix_n;
     int32_t format;
     struct janas_json_doc *schema;
     struct janas_grammar *g;       /* of the reply being read, with ... */
@@ -214,6 +270,27 @@ struct janas_llm_chat {
                         reply */
     float *top_lp;
     size_t top_cap; /* tokens they have room for */
+    /* the conversation as it was said (api_transcript.c): its messages, the
+       replies with their reasoning and calls; its title (titled: the
+       caller's, not the first question's) and when it began; the folder it
+       is saved to as it goes and its file there (api_chatfile.c); a reply
+       begun and not yet written down; a conversation taken up, to be loaded
+       whole at its next message */
+    struct tmsg {
+        int32_t role;
+        char *text, *reasoning;
+        struct tcall {
+            char *name, *args;
+        } *calls;
+        size_t n_calls;
+        int64_t at; /* seconds since 1970 */
+    } *tr;
+    size_t n_tr, cap_tr;
+    char *tr_title;
+    int tr_titled;
+    int64_t tr_created;
+    char *tr_dir, *tr_path;
+    int tr_reply, tr_pending;
 };
 
 /* The last error, on this thread; returns code. */
@@ -241,9 +318,25 @@ int janas_api_rtext_add(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_add_text(janas_llm_chat *c, const char *s, size_t n);
 int janas_api_flush_text(janas_llm_chat *c);
 int janas_api_add_special(janas_llm_chat *c, int32_t id);
+/* The newline after a turn's end where the format has one. */
+int janas_api_end_turn_nl(janas_llm_chat *c);
+/* api_image.c */
+int janas_api_add_user(janas_llm_chat *c, const char *text, size_t n,
+                       const struct cpic *pics, size_t n_pics);
+uint32_t janas_api_media_first(const janas_llm_chat *c);
+/* The prefill block a model at path needs for its pictures: 0, or (a
+   vision encoder beside it whose pictures attend both ways) their most
+   tokens rounded up to 64 */
+uint32_t janas_api_picture_block(const char *path);
+int janas_api_media_register(janas_llm_chat *c, uint32_t base, uint32_t from);
+void janas_api_pics_free(struct cpic *p, size_t n);
 int janas_api_add_message(janas_llm_chat *c, const char *role, const char *text,
                           size_t n);
 int janas_api_add_system(janas_llm_chat *c, const char *sys, size_t n);
+/* The model's words on reasoning for the system message's top
+   (janas_llm.think_note) when this chat's replies reason, else NULL: where
+   it is not NULL there is a system message whatever the caller says. */
+const char *janas_api_think_note(const janas_llm_chat *c);
 int janas_api_start_reply(janas_llm_chat *c);
 int janas_api_begin_sequence(janas_llm_chat *c);
 int janas_api_note_turn(janas_llm_chat *c, uint32_t at);
@@ -286,6 +379,53 @@ void janas_api_close_call(janas_llm_chat *c, struct janas_buf *text);
 
 /* api_load.c: the messages of janas_llm_chat_add, at the chat's end. */
 void janas_api_msgs_free(janas_llm_chat *c);
+/* janas_llm_chat_run without writing the conversation down */
+int32_t janas_api_run(janas_llm_chat *c);
+
+/* api_transcript.c: the record of the conversation. tr_push appends a
+   message (NULL on memory), tr_call a call to one; tr_system puts the
+   system message first (NULL or empty: none); tr_turn writes down what was
+   sent (a question, or the tools' answers); tr_finish the reply that began,
+   tr_settle the same once it is over; tr_from_msgs makes it the
+   conversation of janas_llm_chat_add; tr_resume loads a conversation taken
+   up with what follows it; tr_clear empties it for a new one (the folder
+   it is saved to stays), tr_free at the chat's end. */
+struct tmsg *janas_api_tr_push(janas_llm_chat *c, int32_t role,
+                               const char *text, size_t n);
+int janas_api_tr_call(struct tmsg *m, const char *name, size_t nn,
+                      const char *args, size_t an);
+int janas_api_tr_system(janas_llm_chat *c, const char *s);
+void janas_api_tr_turn(janas_llm_chat *c, const char *text, size_t n,
+                       int32_t n_res, const char *const *texts,
+                       const int32_t *lens);
+void janas_api_tr_finish(janas_llm_chat *c);
+void janas_api_tr_settle(janas_llm_chat *c);
+void janas_api_tr_from_msgs(janas_llm_chat *c);
+int32_t janas_api_tr_resume(janas_llm_chat *c, const char *text, size_t n,
+                            int32_t n_res, const char *const *texts,
+                            const int32_t *lens);
+void janas_api_tr_clear(janas_llm_chat *c);
+void janas_api_tr_free(janas_llm_chat *c);
+/* the title from the first question, unless the caller gave one */
+void janas_api_tr_autotitle(janas_llm_chat *c);
+/* api_chatfile.c: the conversation written to its file, when it is saved
+   as it goes (nothing otherwise) */
+void janas_api_tr_saved(janas_llm_chat *c);
+/* the record from a file's bytes, s of n (path: its name, whose ending
+   says Markdown): saved_form says it was the saved form; 0, or -1 with
+   nothing read */
+int janas_api_tr_read(janas_llm_chat *c, const char *s, size_t n,
+                      const char *path, int *saved_form);
+/* Nucleus mode (api_nucleus.c) */
+int janas_api_nuc_keep(janas_llm_chat *c);
+void janas_api_nuc_forget(janas_llm_chat *c);
+void janas_api_nuc_free(janas_llm_chat *c);
+/* api_stats.c: the reply's counters copied for a monitor, at every step;
+   the monitor's state freed with the model */
+void janas_api_monitor_note(janas_llm_chat *c);
+void janas_api_monitor_free(janas_llm *llm);
+void janas_api_nuc_arm(janas_llm_chat *c);
+const char *janas_api_nuc_decide(janas_llm_chat *c);
 
 /* api_keep.c: before a conversation (c->ids) is loaded over the current
    one, puts in its place the kept one that shares most of it, keeping the
