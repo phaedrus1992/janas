@@ -31,4 +31,11 @@ long janas_tls_read(struct janas_tls *t, void *p, size_t n);
 long janas_tls_write(struct janas_tls *t, const void *p, size_t n);
 void janas_tls_close(struct janas_tls *t);
 
+/* The one lock every use of Mbed TLS in the process takes (it has no
+   threading of its own): janas-server's TLS takes it too. janas_tls_crypto
+   starts the crypto library once, under it: 0, or -1. */
+void janas_tls_lock(void);
+void janas_tls_unlock(void);
+int janas_tls_crypto(void);
+
 #endif

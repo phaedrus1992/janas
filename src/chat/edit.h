@@ -14,10 +14,12 @@
 #define JANAS_CHAT_EDIT_H
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "scroll.h"
@@ -65,9 +67,18 @@ static void hist_save(const struct janas_hist *h)
 {
     if (!h->path[0])
         return;
-    FILE *f = fopen(h->path, "w");
-    if (!f)
+    /* the owner's alone: what was typed to the model */
+    int fd = open(h->path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
         return;
+#ifndef _WIN32
+    fchmod(fd, 0600); /* a file an older version made 0644 */
+#endif
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
     for (int i = 0; i < h->n; i++)
         fprintf(f, "%s\n", h->line[i]);
     fclose(f);
