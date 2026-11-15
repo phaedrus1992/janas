@@ -32,7 +32,9 @@ int janas_gguf_type(uint32_t type, uint64_t *blck, uint64_t *size)
         {6, 32, 22},    {7, 32, 24},    {8, 32, 34},    {10, 256, 84},
         {11, 256, 110}, {12, 256, 144}, {13, 256, 176}, {14, 256, 210},
         {15, 256, 292}, {20, 32, 18},   {21, 256, 110}, {23, 256, 136},
-        {30, 1, 2},     {39, 32, 17},
+        {30, 1, 2},     {39, 32, 17},   {40, 64, 36},   {42, 64, 18},
+        {18, 256, 98},  {16, 256, 66},  {17, 256, 74},  {22, 256, 82},
+        {29, 256, 56},  {19, 256, 50},
     };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
         if (t[i].type == type) {
@@ -194,6 +196,10 @@ int janas_gguf_parse(uint8_t *head, size_t n, uint64_t file_bytes,
                 goto bad;
         for (uint32_t d = t->n_dims; d < 4; d++)
             t->dims[d] = 1;
+        for (uint32_t d = 0; d < 4; d++)
+            if (t->dims[d] == 0) /* readers divide by them */
+                return fail(g, -1, err, err_len,
+                            "a tensor with an empty dimension");
         if (u32(&c, &t->type) || u64(&c, &t->offset))
             goto bad;
         uint64_t blck, size, count = 1, bytes;

@@ -21,6 +21,7 @@
 struct entry {
     char *kind, *id, *json, *aux;
     int64_t created;
+    size_t size;  /* of json and aux */
     uint64_t seq; /* the order it was made in, across restarts */
     struct entry *prev, *next;
 };
@@ -31,10 +32,17 @@ struct srv_store {
     size_t cap;
     struct srv_disk *disk; /* or NULL: memory only */
     uint64_t seq;
-    int warned; /* a write failed, and it was said */
+    size_t bytes; /* of every document's texts */
+    int warned;   /* a write failed, and it was said */
 };
 
 static void trim(struct srv_store *st, const char *kind);
+static void trim_bytes(struct srv_store *st, const struct entry *keep);
+
+static size_t doc_size(const char *json, const char *aux)
+{
+    return (json ? strlen(json) : 0) + (aux ? strlen(aux) : 0);
+}
 
 static char *str_dup(const char *s)
 {
@@ -89,8 +97,21 @@ static void entry_free(struct entry *e)
     free(e);
 }
 
+static void link_entry(struct srv_store *st, struct entry *e)
+{
+    e->prev = st->tail;
+    e->next = NULL;
+    if (st->tail)
+        st->tail->next = e;
+    else
+        st->head = e;
+    st->tail = e;
+    st->bytes += e->size;
+}
+
 static void unlink_entry(struct srv_store *st, struct entry *e)
 {
+    st->bytes -= e->size;
     if (e->prev)
         e->prev->next = e->next;
     else
@@ -147,6 +168,7 @@ static int take(void *arg, const char *kind, const char *id, uint64_t seq,
     }
     e->json = json;
     e->aux = aux;
+    e->size = doc_size(json, aux);
     e->seq = seq;
     e->created = created;
     l->e[l->n++] = e;
@@ -180,12 +202,7 @@ struct srv_store *srv_store_open(size_t cap, const char *dir, char *err,
         qsort(l.e, l.n, sizeof(*l.e), by_seq);
     for (size_t i = 0; i < l.n; i++) {
         struct entry *e = l.e[i];
-        e->prev = st->tail;
-        if (st->tail)
-            st->tail->next = e;
-        else
-            st->head = e;
-        st->tail = e;
+        link_entry(st, e);
         if (e->seq > st->seq)
             st->seq = e->seq;
     }
@@ -205,6 +222,7 @@ struct srv_store *srv_store_open(size_t cap, const char *dir, char *err,
         trim(st, kinds[k]);
         free(kinds[k]);
     }
+    trim_bytes(st, NULL);
     if (skipped)
         fprintf(stderr,
                 "janas-server: %d unreadable files in %s left as they are\n",
@@ -243,6 +261,20 @@ static void trim(struct srv_store *st, const char *kind)
     }
 }
 
+/* Past SRV_STORE_MAX bytes, the oldest go but keep. Under st->mu. */
+static void trim_bytes(struct srv_store *st, const struct entry *keep)
+{
+    for (struct entry *x = st->head; x && st->bytes > SRV_STORE_MAX;) {
+        struct entry *nx = x->next;
+        if (x != keep) {
+            unlink_entry(st, x);
+            unsave(st, x);
+            entry_free(x);
+        }
+        x = nx;
+    }
+}
+
 static struct entry *find(struct srv_store *st, const char *kind,
                           const char *id)
 {
@@ -255,6 +287,8 @@ static struct entry *find(struct srv_store *st, const char *kind,
 int srv_store_put(struct srv_store *st, const char *kind, const char *id,
                   int64_t created, const char *json, const char *aux)
 {
+    if (doc_size(json, aux) > SRV_STORE_DOC_MAX)
+        return -3;
     struct entry *e = calloc(1, sizeof(*e));
     if (!e)
         return -1;
@@ -263,6 +297,7 @@ int srv_store_put(struct srv_store *st, const char *kind, const char *id,
     e->json = str_dup(json);
     e->aux = str_dup(aux);
     e->created = created;
+    e->size = doc_size(json, aux);
     if (!e->kind || !e->id || !e->json || (aux && !e->aux)) {
         entry_free(e);
         return -1;
@@ -274,14 +309,10 @@ int srv_store_put(struct srv_store *st, const char *kind, const char *id,
         entry_free(old);
     }
     e->seq = ++st->seq;
-    e->prev = st->tail;
-    if (st->tail)
-        st->tail->next = e;
-    else
-        st->head = e;
-    st->tail = e;
+    link_entry(st, e);
     save(st, e);
     trim(st, kind);
+    trim_bytes(st, e);
     pthread_mutex_unlock(&st->mu);
     return 0;
 }
@@ -315,6 +346,7 @@ int srv_store_update(struct srv_store *st, const char *kind, const char *id,
                      const char *json, const char *aux)
 {
     char *j = str_dup(json), *a = str_dup(aux);
+    int rc = -1;
     if ((json && !j) || (aux && !a)) {
         free(j);
         free(a);
@@ -322,7 +354,10 @@ int srv_store_update(struct srv_store *st, const char *kind, const char *id,
     }
     pthread_mutex_lock(&st->mu);
     struct entry *e = find(st, kind, id);
-    if (e) {
+    if (e && doc_size(j ? j : e->json, a ? a : e->aux) > SRV_STORE_DOC_MAX)
+        rc = -3;
+    else if (e) {
+        st->bytes -= e->size;
         if (j) {
             free(e->json);
             e->json = j;
@@ -333,12 +368,16 @@ int srv_store_update(struct srv_store *st, const char *kind, const char *id,
             e->aux = a;
             a = NULL;
         }
+        e->size = doc_size(e->json, e->aux);
+        st->bytes += e->size;
         save(st, e);
+        trim_bytes(st, e);
+        rc = 0;
     }
     pthread_mutex_unlock(&st->mu);
     free(j);
     free(a);
-    return e ? 0 : -1;
+    return rc;
 }
 
 int srv_store_del(struct srv_store *st, const char *kind, const char *id)

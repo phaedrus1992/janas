@@ -149,6 +149,21 @@ static int from_gguf(const struct janas_model_entry *m, const char *dir,
         snprintf(xout, sizeof(xout), "%s/%s", dir, m->extra_out);
         if (exists(xout) && get_same(xout, m->extra_sha) == 1) {
             printf("%s: already here, fingerprint checked\n", xout);
+        } else if (m->extra == JANAS_EXTRA_BLOCK) {
+            char src[4096];
+            printf("== its MTP block, from %s (hf2jns_mtp)\n",
+                   m->extra_repo ? m->extra_repo : m->repo);
+            if (get_fetch(m->extra_repo ? m->extra_repo : m->repo, m->extra_src,
+                          dir, m->extra_src_sha, 0) != 0)
+                return 1;
+            get_local(src, sizeof(src), dir, m->extra_src);
+            char *argv[] = {"hf2jns_mtp", out, src, xout, NULL};
+            fflush(stdout);
+            if (get_run("hf2jns_mtp", argv) != 0 ||
+                check(xout, m->extra_sha, "hf2jns_mtp") != 0)
+                return 1;
+            if (!keep)
+                remove(src);
         } else if (m->extra == JANAS_EXTRA_GGUF) {
             char src[4096];
             printf("== its assistant\n");

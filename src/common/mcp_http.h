@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "common/mcp_policy.h"
 #include "common/mcp_tls.h"
 #include "llm/json.h"
 
@@ -24,6 +25,8 @@ struct janas_url {
     char port[8];
     char path[4096]; /* with the query, "/" at least (a signed CDN
                         address runs past a thousand) */
+    /* where a connection may go (mcp_policy.h); NULL, as parsed: anywhere */
+    const struct janas_net_policy *policy;
 };
 
 /* 0, or -1 with the reason in err. Only http:// and https://. */

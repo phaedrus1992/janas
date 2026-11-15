@@ -80,12 +80,21 @@ static int type_geometry(uint32_t type, uint64_t *blck, uint64_t *size)
         {13, 256, 176}, /* Q5_K */
         {14, 256, 210}, /* Q6_K */
         {214, 256, 82}, /* Q6_K_P, the base plane and the scales */
+        {215, 256, 82}, /* Q6_K_PN, the same by neuron */
         {15, 256, 292}, /* Q8_K */
         {20, 32, 18},   /* IQ4_NL */
         {21, 256, 110}, /* IQ3_S */
         {23, 256, 136}, /* IQ4_XS */
         {30, 1, 2},     /* BF16 */
         {39, 32, 17},   /* MXFP4 */
+        {40, 64, 36},   /* NVFP4 */
+        {42, 64, 18},   /* Q2_0 */
+        {18, 256, 98},  /* IQ3_XXS */
+        {16, 256, 66},  /* IQ2_XXS */
+        {17, 256, 74},  /* IQ2_XS */
+        {22, 256, 82},  /* IQ2_S */
+        {29, 256, 56},  /* IQ1_M */
+        {19, 256, 50},  /* IQ1_S */
     };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
         if (t[i].type == type) {
@@ -347,6 +356,33 @@ int janas_jns_meta_ints(const struct janas_jns *j, const char *key,
     return 0;
 }
 
+int janas_jns_meta_uint_at(const struct janas_jns *j, const char *key,
+                           uint64_t i, uint64_t *out, uint64_t *count)
+{
+    uint32_t t, et;
+    uint64_t p, n;
+    if (!find_key(j, key, &t, &p) || t != GG_ARRAY)
+        return -1;
+    memcpy(&et, j->metadata + p, 4);
+    memcpy(&n, j->metadata + p + 4, 8);
+    uint64_t sz = et == GG_U8 || et == GG_I8     ? 1
+                  : et == GG_U16 || et == GG_I16 ? 2
+                  : et == GG_U32 || et == GG_I32 ? 4
+                  : et == GG_U64 || et == GG_I64 ? 8
+                                                 : 0;
+    if (!sz || i >= n)
+        return -1;
+    const uint8_t *e = j->metadata + p + 12 + i * sz; /* validated at open */
+    uint64_t v = 0;
+    memcpy(&v, e, sz); /* little-endian, as the file */
+    if ((et == GG_I8 || et == GG_I16 || et == GG_I32) && (e[sz - 1] & 0x80))
+        v |= ~0ull << (8 * sz); /* sign-extended */
+    *out = v;
+    if (count)
+        *count = n;
+    return 0;
+}
+
 int janas_jns_meta_bytes(const struct janas_jns *j, const char *key,
                          uint64_t *count, const uint8_t **data)
 {
@@ -408,9 +444,14 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
         h->header_checksum)
         return fail(err, err_len, "header checksum mismatch");
 
-    if (h->n_layer < 1 || h->n_layer > JANAS_JNS_MAX_LAYERS ||
-        h->n_expert < 1 || h->n_expert > JANAS_JNS_MAX_EXPERTS ||
-        h->n_expert_used < 1 || h->n_expert_used > h->n_expert ||
+    /* no layers and no experts: a file of resident tensors only (the
+       vision encoder of tools/hf2jns_vision.c) */
+    int resident_only =
+        h->n_layer == 0 && h->n_expert == 0 && h->n_expert_used == 0;
+    if ((!resident_only &&
+         (h->n_layer < 1 || h->n_layer > JANAS_JNS_MAX_LAYERS ||
+          h->n_expert < 1 || h->n_expert > JANAS_JNS_MAX_EXPERTS ||
+          h->n_expert_used < 1 || h->n_expert_used > h->n_expert)) ||
         h->n_tensor > JANAS_JNS_MAX_TENSORS)
         return fail(err, err_len, "model dimensions out of range");
 
@@ -459,9 +500,10 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
         h->experts_offset < h->resident_offset + h->resident_bytes)
         return fail(err, err_len, "data regions out of place");
 
-    out->layers = malloc(array_bytes(h->n_layer, sizeof(*out->layers)));
-    out->expert_offset = malloc(slot_len);
-    out->expert_sum = malloc(slot_len);
+    uint64_t lb = array_bytes(h->n_layer, sizeof(*out->layers));
+    out->layers = malloc(lb ? lb : 1);
+    out->expert_offset = malloc(slot_len ? slot_len : 1);
+    out->expert_sum = malloc(slot_len ? slot_len : 1);
     out->tensors = malloc(dir_len ? dir_len : 1);
     out->metadata = malloc(h->metadata_bytes);
     if (!out->layers || !out->expert_offset || !out->expert_sum ||
@@ -506,17 +548,39 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
     uint64_t experts_end = h->experts_offset + h->experts_bytes;
     for (uint32_t l = 0; l < h->n_layer; l++) {
         const struct janas_jns_layer *ly = &out->layers[l];
-        if (ly->slot_bytes == 0 || ly->slot_bytes % JANAS_JNS_ALIGN) {
+        /* a layer without experts (nemotron_h_moe's Mamba-2 and attention
+           layers): an empty slot, no matrices, every expert absent */
+        if (ly->slot_bytes == 0) {
+            static const struct janas_jns_layer none;
+            int empty = memcmp(ly, &none, sizeof(none)) == 0;
+            for (uint32_t e = 0; empty && e < h->n_expert; e++)
+                empty = out->expert_offset[(size_t)l * h->n_expert + e] == 0 &&
+                        out->expert_sum[(size_t)l * h->n_expert + e] == 0;
+            if (!empty) {
+                janas_jns_close(out);
+                return fail(err, err_len, "layer %u: bad empty slot", l);
+            }
+            continue;
+        }
+        if (ly->slot_bytes % JANAS_JNS_ALIGN) {
             janas_jns_close(out);
             return fail(err, err_len, "layer %u: bad slot size", l);
         }
         for (int m = 0; m < 3; m++) {
             const struct janas_jns_matrix *mx = &ly->m[m];
             uint64_t blck, size, row_bytes, total;
+            static const struct janas_jns_matrix no_matrix;
+            /* no gate (nemotron_h_moe's experts: relu^2 on up alone) */
+            if (m == JANAS_JNS_GATE && memcmp(mx, &no_matrix, sizeof(*mx)) == 0)
+                continue;
             if (!type_geometry(mx->type, &blck, &size) || mx->rows == 0 ||
                 mx->cols == 0 || mx->cols % blck ||
                 __builtin_mul_overflow(mx->cols / blck, size, &row_bytes) ||
                 __builtin_mul_overflow(row_bytes, mx->rows, &total) ||
+                /* by neuron: a float per output channel first */
+                __builtin_add_overflow(
+                    total, mx->type == 215 ? (uint64_t)mx->cols * 4 : 0,
+                    &total) ||
                 total != mx->bytes || mx->offset % 256 ||
                 !inside(mx->offset, mx->bytes, 0, ly->slot_bytes)) {
                 janas_jns_close(out);
@@ -551,7 +615,8 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
             }
             uint64_t total;
             /* a bare plane: 64 bytes per 256 weights, no scales */
-            if (ly->m[JANAS_JNS_DOWN].type != 214 ||
+            if ((ly->m[JANAS_JNS_DOWN].type != 214 &&
+                 ly->m[JANAS_JNS_DOWN].type != 215) ||
                 px->type != ly->m[JANAS_JNS_DOWN].type ||
                 px->rows != ly->m[JANAS_JNS_DOWN].rows ||
                 px->cols != ly->m[JANAS_JNS_DOWN].cols || px->cols % 256 ||
@@ -565,7 +630,13 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
             }
         }
         for (uint32_t e = 0; e < h->n_expert; e++) {
-            uint64_t off = out->expert_offset[(size_t)l * h->n_expert + e];
+            size_t at = (size_t)l * h->n_expert + e;
+            uint64_t off = out->expert_offset[at];
+            /* absent: past the layer's own experts, a tail of them, each
+               with a zero checksum (gguf2jns) */
+            if (off == 0 && out->expert_sum[at] == 0 &&
+                (e + 1 == h->n_expert || out->expert_offset[at + 1] == 0))
+                continue;
             if (off % JANAS_JNS_ALIGN ||
                 !inside(off, ly->slot_bytes, h->experts_offset, experts_end)) {
                 janas_jns_close(out);
@@ -576,9 +647,17 @@ int janas_jns_parse(const uint8_t *image, size_t bytes, uint64_t file_bytes,
     }
     for (uint64_t t = 0; t < h->n_tensor; t++) {
         const struct janas_jns_tensor *tn = &out->tensors[t];
-        uint64_t blck, size;
-        if (memchr(tn->name, 0, sizeof(tn->name)) == NULL || tn->n_dims < 1 ||
-            tn->n_dims > 4 || !type_geometry(tn->type, &blck, &size) ||
+        uint64_t blck, size, rows = 1, want = 0;
+        int dims_ok = tn->n_dims >= 1 && tn->n_dims <= 4;
+        /* the bytes are what the shape says: the readers trust the dims */
+        for (uint32_t d = 1; dims_ok && d < tn->n_dims; d++)
+            dims_ok = tn->dims[d] > 0 &&
+                      !__builtin_mul_overflow(rows, tn->dims[d], &rows);
+        if (memchr(tn->name, 0, sizeof(tn->name)) == NULL || !dims_ok ||
+            !type_geometry(tn->type, &blck, &size) || tn->dims[0] == 0 ||
+            tn->dims[0] % blck ||
+            __builtin_mul_overflow(tn->dims[0] / blck, size, &want) ||
+            __builtin_mul_overflow(want, rows, &want) || want != tn->bytes ||
             !inside(tn->offset, tn->bytes, h->resident_offset,
                     h->resident_offset + h->resident_bytes)) {
             janas_jns_close(out);

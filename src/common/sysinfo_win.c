@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <cpuid.h>
 #include <powrprof.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,10 +81,17 @@ static int cores_of(struct core *out, int max)
     return n;
 }
 
+/* The thread's CPUs before Janas first pinned it, while it stays pinned
+   (sysinfo.c says why) */
+static _Thread_local GROUP_AFFINITY before_pin;
+static _Thread_local int pinned, known;
+
 int janas_os_allowed_cpus(int *out, int max)
 {
     GROUP_AFFINITY ga;
-    if (!GetThreadGroupAffinity(GetCurrentThread(), &ga))
+    if (pinned)
+        ga = before_pin;
+    else if (!GetThreadGroupAffinity(GetCurrentThread(), &ga))
         return -1;
     int n = 0;
     for (int b = 0; b < 64 && n < max; b++)
@@ -223,14 +231,18 @@ int janas_cpus_save(unsigned char save[JANAS_CPU_SAVE_BYTES])
 
 void janas_cpus_restore(const unsigned char save[JANAS_CPU_SAVE_BYTES])
 {
-    SetThreadGroupAffinity(GetCurrentThread(), (const GROUP_AFFINITY *)save,
-                           NULL);
+    const GROUP_AFFINITY *ga = (const GROUP_AFFINITY *)save;
+    SetThreadGroupAffinity(GetCurrentThread(), ga, NULL);
+    if (known)
+        pinned = ga->Mask != before_pin.Mask || ga->Group != before_pin.Group;
 }
 
 int janas_pin_current_thread(int cpu)
 {
     if (cpu < 0)
         return -1;
+    if (!pinned && GetThreadGroupAffinity(GetCurrentThread(), &before_pin))
+        pinned = known = 1;
     GROUP_AFFINITY ga = {.Mask = (KAFFINITY)1 << (cpu % 64),
                          .Group = (WORD)(cpu / 64)};
     return SetThreadGroupAffinity(GetCurrentThread(), &ga, NULL) ? 0 : -1;
@@ -289,6 +301,50 @@ uint64_t janas_mem_total(void)
 {
     MEMORYSTATUSEX m = {.dwLength = sizeof m};
     return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;
+}
+
+uint64_t janas_rss_bytes(void)
+{
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)
+               ? pmc.WorkingSetSize
+               : 0;
+}
+
+size_t janas_l2_bytes(void)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD len = sizeof(info);
+    if (!GetLogicalProcessorInformation(info, &len))
+        return 0;
+    for (DWORD i = 0; i < len / sizeof(info[0]); i++)
+        if (info[i].Relationship == RelationCache && info[i].Cache.Level == 2)
+            return info[i].Cache.Size;
+    return 0;
+}
+
+double janas_cpu_seconds(void)
+{
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+        return -1;
+    ULARGE_INTEGER kk = {.LowPart = k.dwLowDateTime,
+                         .HighPart = k.dwHighDateTime};
+    ULARGE_INTEGER uu = {.LowPart = u.dwLowDateTime,
+                         .HighPart = u.dwHighDateTime};
+    return (double)(kk.QuadPart + uu.QuadPart) * 1e-7; /* 100 ns units */
+}
+
+int janas_cpu_count(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors ? (int)si.dwNumberOfProcessors : 1;
+}
+
+double janas_package_joules(void)
+{
+    return -1; /* not readable without a driver */
 }
 
 #endif /* _WIN32 */
