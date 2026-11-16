@@ -3,7 +3,10 @@
 #version 450
 // The fast prompt for weights left as they are, f32 (KIND 0) or bf16 (1):
 // the per-layer branches of Gemma 4's E2B and E4B (gpu.c
-// janas_gpu_dense_mm). Tiles of 64 rows by 64 vectors, 16 columns staged
+// janas_gpu_dense_mm); or Q8_0 (2: blocks of 32, an fp16 scale and 32
+// int8, rows of cols / 32 blocks), on float vectors as the CPU's
+// janas_q8w_dot takes them (Qwen3.8-Flash-Next's mixes rewritten by
+// JANAS_HC_MIX=q8, gpu_token_hc.c). Tiles of 64 rows by 64 vectors, 16 columns staged
 // per barrier, each invocation 4 rows by 4 vectors. y[v * ys + r] = scale x
 // the dot product of row r with vector v (vectors cols floats apart). NOT
 // bit for bit with the CPU: summed in another order.
@@ -33,6 +36,16 @@ float wt(uint r, uint k)
     uint i = r * p.cols + k;
     if (KIND == 0u)
         return F1(p.w).v[i];
+    if (KIND == 2u) {
+        /* the block's first byte: its scale, then its quants */
+        uint b = (r * (p.cols / 32u) + k / 32u) * 34u;
+        U1 W = U1(p.w);
+        uint dw = W.v[b >> 2];
+        float d = unpackHalf2x16((b & 2u) != 0u ? dw >> 16 : dw & 0xffffu).x;
+        uint qb = b + 2u + k % 32u;
+        int q = bitfieldExtract(int(W.v[qb >> 2]), int(8u * (qb & 3u)), 8);
+        return d * float(q);
+    }
     uint u = U1(p.w).v[i >> 1];
     return uintBitsToFloat((i & 1u) != 0u ? u & 0xffff0000u : u << 16);
 }

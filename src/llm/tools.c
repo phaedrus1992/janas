@@ -654,14 +654,33 @@ void janas_tools_system(struct janas_buf *out, enum janas_tool_dialect d,
 
 static uint32_t g_value_rule(struct janas_gbuild *b, int32_t quote);
 
+/* Whether function i is one a call may name: `only`, or with a prefix those
+   whose names begin with it, or all where none does. */
+static int callable(const struct janas_toolset *t, uint32_t i, int only,
+                    const char *prefix, size_t prefix_n)
+{
+    if (only >= 0)
+        return (uint32_t)only == i;
+    if (!prefix_n)
+        return 1;
+    int any = 0;
+    for (uint32_t k = 0; k < t->n && !any; k++) {
+        const struct janas_json *nm = janas_json_get(t->fn[k], "name");
+        any = nm->n >= prefix_n && memcmp(nm->s, prefix, prefix_n) == 0;
+    }
+    const struct janas_json *nm = janas_json_get(t->fn[i], "name");
+    return !any || (nm->n >= prefix_n && memcmp(nm->s, prefix, prefix_n) == 0);
+}
+
 /* The rule of a Gemma call: call:name{members} then the closing token. */
 uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
                                 const struct janas_toolset *t, int only,
+                                const char *prefix, size_t prefix_n,
                                 int32_t close, int32_t quote)
 {
     uint32_t fns = janas_gb_rule(b);
     for (uint32_t i = 0; i < t->n; i++) {
-        if (only >= 0 && (uint32_t)only != i)
+        if (!callable(t, i, only, prefix, prefix_n))
             continue;
         const struct janas_json *nm = janas_json_get(t->fn[i], "name");
         janas_gb_lit(b, janas_gb_alt(b, fns), nm->s, nm->n);
@@ -1102,12 +1121,12 @@ static uint32_t g_value_rule(struct janas_gbuild *b, int32_t quote)
 uint32_t janas_tools_rule(struct janas_gbuild *b, struct janas_jsg *j,
                           enum janas_tool_dialect d,
                           const struct janas_toolset *t, int only,
-                          int32_t close)
+                          const char *prefix, size_t prefix_n, int32_t close)
 {
     uint32_t ws = janas_jsg_ws(j);
     uint32_t fns = janas_gb_rule(b); /* one alternative per function */
     for (uint32_t i = 0; i < t->n; i++) {
-        if (only >= 0 && (uint32_t)only != i)
+        if (!callable(t, i, only, prefix, prefix_n))
             continue;
         const struct janas_json *nm = janas_json_get(t->fn[i], "name");
         uint32_t a = janas_gb_alt(b, fns);
