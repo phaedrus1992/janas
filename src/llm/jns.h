@@ -30,8 +30,11 @@
  * JANAS_JNS_ALIGN: reading only the first level_bytes[0] of the slot gives
  * two bits per weight of the down matrix, level_bytes[1] four, the whole slot
  * the six of Q6_K, bit for bit. A machine short of memory reads the prefix it
- * can afford, out of the same file. Version 2 files are read as if their
- * three levels were all the whole slot.
+ * can afford, out of the same file. The down matrix by neuron
+ * (JANAS_Q6_K_PN, tools/jns_neurons.c), its rows the neurons, keeps the same
+ * three planes and levels, a float per output channel before its base
+ * plane (counted in its bytes). Version 2 files are read as if their three
+ * levels were all the whole slot.
  *
  * Sizes are stored, never derived from products of fields read from the
  * file; the reader checks every offset and length against the file size with
@@ -178,6 +181,11 @@ int janas_jns_meta_ints(const struct janas_jns *j, const char *key,
 /* An array of bytes: bool, u8 or i8 (sliding_window_pattern). */
 int janas_jns_meta_bytes(const struct janas_jns *j, const char *key,
                          uint64_t *count, const uint8_t **data);
+/* Element i of an array of integers of any of GGUF's widths, as a u64 (a
+   signed one cast), and the array's length: 0, or -1 if the key is no such
+   array or i is past its end (qwen4exp's n-gram hashes, 64 bits). */
+int janas_jns_meta_uint_at(const struct janas_jns *j, const char *key,
+                           uint64_t i, uint64_t *out, uint64_t *count);
 
 /* The tensor of the resident region with this name, or NULL. */
 const struct janas_jns_tensor *janas_jns_tensor(const struct janas_jns *j,
