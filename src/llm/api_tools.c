@@ -141,8 +141,16 @@ int32_t janas_llm_chat_tool_choice(janas_llm_chat *c, int32_t choice,
             return janas_api_fail(JANAS_LLM_EINVAL, "no tool is called '%.*s'",
                                   (int)janas_api_text_len(name, len), name);
     }
+    size_t pn = 0;
+    if (choice == JANAS_LLM_TOOLS_REQUIRED && name) {
+        pn = janas_api_text_len(name, len);
+        if (pn >= sizeof c->tool_prefix)
+            return janas_api_fail(JANAS_LLM_EINVAL, "too long a name");
+        memcpy(c->tool_prefix, name, pn);
+    }
     c->tool_choice = choice;
     c->tool_only = only;
+    c->tool_prefix_n = pn;
     c->parallel = parallel != 0;
     return JANAS_LLM_OK;
 }
@@ -190,6 +198,32 @@ int32_t janas_llm_chat_logit_bias(janas_llm_chat *c, int32_t n,
     return JANAS_LLM_OK;
 }
 
+int32_t janas_llm_chat_vocab(janas_llm_chat *c, int32_t n, const int32_t *ids)
+{
+    if (!c || n < 0 || (n > 0 && !ids))
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid argument");
+    const janas_llm *llm = c->llm;
+    if (n == 0) {
+        janas_llm_model_set_vocab(llm->m, NULL, 0);
+        return JANAS_LLM_OK;
+    }
+    /* the format's ends of a reply too, or none could end */
+    int32_t *all = malloc(((size_t)n + JANAS_GEN_MAX_STOP) * sizeof(int32_t));
+    if (!all)
+        return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
+    memcpy(all, ids, (size_t)n * sizeof(int32_t));
+    for (int i = 0; i < llm->n_stop; i++)
+        all[n + i] = llm->stop[i];
+    int rc =
+        janas_llm_model_set_vocab(llm->m, all, (uint32_t)(n + llm->n_stop));
+    free(all);
+    if (rc != 0)
+        return janas_api_fail(JANAS_LLM_EMODEL,
+                              "this model's output head cannot be restricted "
+                              "(its weights in bit planes), or out of memory");
+    return JANAS_LLM_OK;
+}
+
 /* ---- what holds a reply ---- */
 
 /*
@@ -228,6 +262,8 @@ static uint32_t calls_rule(struct janas_gbuild *b, const janas_llm *llm,
 
 void janas_api_reply_clear(janas_llm_chat *c)
 {
+    c->nuc_route = JANAS_LLM_ROUTE_SELF; /* Nucleus mode (api_nucleus.c) */
+    c->nuc_pending = 0;
     if (c->s)
         janas_llm_session_filter(c->s, NULL);
     janas_constraint_free(c->cons);
@@ -266,9 +302,11 @@ int janas_api_reply_setup(janas_llm_chat *c)
     int only = choice == JANAS_LLM_TOOLS_FUNCTION ? c->tool_only : -1;
     if (tools && choice != JANAS_LLM_TOOLS_NONE)
         call = llm->tools == JANAS_TOOLS_GEMMA
-                   ? janas_tools_rule_gemma(b, c->tools, only, llm->call_close,
+                   ? janas_tools_rule_gemma(b, c->tools, only, c->tool_prefix,
+                                            c->tool_prefix_n, llm->call_close,
                                             llm->quote)
                    : janas_tools_rule(b, j, llm->tools, c->tools, only,
+                                      c->tool_prefix, c->tool_prefix_n,
                                       llm->call_close);
     if (must) {
         answer = calls_rule(b, llm, call, c->parallel);
@@ -375,6 +413,8 @@ void janas_api_close_call(janas_llm_chat *c, struct janas_buf *text)
 
 int32_t janas_llm_chat_calls(const janas_llm_chat *c)
 {
+    if (c && c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat)
+        c = c->nuc_chat; /* Nucleus mode: the Specialist's reply */
     return c ? (int32_t)c->n_calls : 0;
 }
 
@@ -382,6 +422,8 @@ int32_t janas_llm_chat_call(const janas_llm_chat *c, int32_t i, char *name,
                             int32_t name_cap, int32_t *name_len, char *args,
                             int32_t args_cap, int32_t *args_len)
 {
+    if (c && c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat)
+        c = c->nuc_chat; /* Nucleus mode: the Specialist's reply */
     if (!c || i < 0 || (size_t)i >= c->n_calls)
         return janas_api_fail(JANAS_LLM_EINVAL, "no such call");
     const struct rcall *r = &c->calls[i];
@@ -444,6 +486,8 @@ int janas_api_record(janas_llm_chat *c, int32_t t, int32_t part,
 
 int32_t janas_llm_chat_tokens(const janas_llm_chat *c)
 {
+    if (c && c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat)
+        c = c->nuc_chat; /* Nucleus mode: the Specialist's reply */
     return c ? (int32_t)c->n_toks : 0;
 }
 
@@ -451,6 +495,8 @@ int32_t janas_llm_chat_token(const janas_llm_chat *c, int32_t i, int32_t *id,
                              int32_t *part, float *logprob, char *buf,
                              int32_t cap, int32_t *len)
 {
+    if (c && c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat)
+        c = c->nuc_chat; /* Nucleus mode: the Specialist's reply */
     if (!c || i < 0 || (size_t)i >= c->n_toks)
         return janas_api_fail(JANAS_LLM_EINVAL, "no such token");
     const struct rtok *r = &c->toks[i];
@@ -469,6 +515,8 @@ int32_t janas_llm_chat_token_top(const janas_llm_chat *c, int32_t i,
                                  int32_t max, int32_t *ids, float *logprobs,
                                  int32_t *n)
 {
+    if (c && c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat)
+        c = c->nuc_chat; /* Nucleus mode: the Specialist's reply */
     if (!c || i < 0 || (size_t)i >= c->n_toks || max < 0 || !n)
         return janas_api_fail(JANAS_LLM_EINVAL, "no such token");
     const struct rtok *r = &c->toks[i];

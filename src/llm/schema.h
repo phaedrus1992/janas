@@ -6,11 +6,14 @@
  * What a schema says is enforced where a grammar can say it: types, the
  * properties of an object (in the order the schema lists them, the required
  * ones always there, no others), array items and small bounds on their
- * count, string lengths up to 64, enum and const, anyOf and oneOf, $ref to
- * the same document (recursion included), nullable. What it cannot say
- * (pattern, format, minimum and maximum, allOf of more than one schema) is
- * left out: the value is still valid JSON of the right type, and
- * janas_jsg_relaxed counts the keywords so treated.
+ * count, string lengths up to 4096, enum and const, anyOf and oneOf, $ref
+ * to the same document (recursion included), nullable; minimum, maximum,
+ * their exclusive forms and multipleOf (up to 50) on integers, the bounds
+ * on numbers (schema_num.c); the formats date, time, date-time, uuid,
+ * email and ipv4 (schema_re.c). What it cannot say (pattern, other
+ * formats, allOf of more than one schema) is left out: the value is still
+ * valid JSON of the right type, and janas_jsg_relaxed counts the keywords
+ * so treated.
  */
 #ifndef JANAS_LLM_SCHEMA_H
 #define JANAS_LLM_SCHEMA_H

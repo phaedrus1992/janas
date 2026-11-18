@@ -311,6 +311,194 @@ static void test_schemas(void)
            (const char *const[]){"1", "{}", NULL});
 }
 
+/* Every integer in [-1200, 1200] against a schema of bounds and a multiple:
+   accepted exactly when it fits (want: the check). */
+static void ints_against(const char *name, const char *schema,
+                         int (*want)(long))
+{
+    struct gram x;
+    if (make_schema(&x, schema) != 0) {
+        CHECK(0, "%s: grammar not made", name);
+        gram_free(&x);
+        return;
+    }
+    int bad = 0;
+    for (long v = -1200; v <= 1200 && bad < 5; v++) {
+        char t[32];
+        snprintf(t, sizeof(t), "%ld", v);
+        int got = matches(&x, t, 1);
+        if (got != want(v)) {
+            CHECK(0, "%s: %ld %s", name, v, got ? "accepted" : "refused");
+            bad++;
+        }
+    }
+    CHECK(matches(&x, "1.5", 1) == 0 && matches(&x, "1e2", 1) == 0 &&
+              matches(&x, "007", 1) == 0 && matches(&x, "-0", 1) == 0,
+          "%s: not an integer accepted", name);
+    gram_free(&x);
+}
+
+static int w_range(long v)
+{
+    return v >= -5 && v <= 300;
+}
+static int w_mult(long v)
+{
+    return v >= 0 && v < 1000 && v % 7 == 0;
+}
+static int w_neg(long v)
+{
+    return v > -1000 && v < -10 && v % 25 == 0;
+}
+static int w_lo(long v)
+{
+    return v >= 17;
+}
+static int w_mult12(long v)
+{
+    return v % 12 == 0;
+}
+
+/* Numbers: whatever the grammar takes is inside the bounds, and the
+   integers and simple fractions well inside them are taken. */
+static void reals_against(const char *name, const char *schema, double lo,
+                          int lox, double hi, int hix)
+{
+    struct gram x;
+    if (make_schema(&x, schema) != 0) {
+        CHECK(0, "%s: grammar not made", name);
+        gram_free(&x);
+        return;
+    }
+    int bad = 0;
+    for (int k = -4000; k <= 4000 && bad < 5; k++) {
+        double v = k / 100.0;
+        char t[32];
+        snprintf(t, sizeof(t), "%.2f", v);
+        if (v == 0 && t[0] == '-')
+            continue;
+        int in = (lox ? v > lo : v >= lo) && (hix ? v < hi : v <= hi);
+        int got = matches(&x, t, 1);
+        if (got && !in) {
+            CHECK(0, "%s: %s accepted, outside", name, t);
+            bad++;
+        }
+        /* well inside: at least one unit from each bound */
+        if (!got && v >= lo + 1 && v <= hi - 1) {
+            CHECK(0, "%s: %s refused, inside", name, t);
+            bad++;
+        }
+    }
+    gram_free(&x);
+}
+
+static void test_bounds_and_formats(void)
+{
+    ints_against("int range",
+                 "{\"type\":\"integer\",\"minimum\":-5,\"maximum\":300}",
+                 w_range);
+    ints_against("int multiple",
+                 "{\"type\":\"integer\",\"minimum\":0,"
+                 "\"exclusiveMaximum\":1000,\"multipleOf\":7}",
+                 w_mult);
+    ints_against("int negative",
+                 "{\"type\":\"integer\",\"exclusiveMinimum\":-1000,"
+                 "\"exclusiveMaximum\":-10,\"multipleOf\":25}",
+                 w_neg);
+    ints_against("int lower only", "{\"type\":\"integer\",\"minimum\":16.5}",
+                 w_lo);
+    ints_against("int multiple only",
+                 "{\"type\":\"integer\",\"multipleOf\":12}", w_mult12);
+    reals_against("real range",
+                  "{\"type\":\"number\",\"minimum\":-2.5,\"maximum\":10}", -2.5,
+                  0, 10, 0);
+    reals_against("real exclusive",
+                  "{\"type\":\"number\",\"exclusiveMinimum\":0,"
+                  "\"exclusiveMaximum\":1}",
+                  0, 1, 1, 1);
+    reals_against("real negative",
+                  "{\"type\":\"number\",\"minimum\":-30,"
+                  "\"exclusiveMaximum\":-3.25}",
+                  -30, 0, -3.25, 1);
+    reals_against("real lower", "{\"type\":\"number\",\"exclusiveMinimum\":-7}",
+                  -7, 1, 1e9, 0);
+    expect(
+        "real fractions",
+        "{\"type\":\"number\",\"exclusiveMinimum\":0,\"maximum\":1}",
+        (const char *const[]){"0.5", "0.001", "1", "0.999999", NULL},
+        (const char *const[]){"0", "0.0", "1.0001", "1.5", "-0.5", "2", NULL});
+    expect("date", "{\"type\":\"string\",\"format\":\"date\"}",
+           (const char *const[]){"\"2026-10-28\"", "\"1999-02-31\"", NULL},
+           (const char *const[]){"\"2026-13-01\"", "\"2026-1-01\"",
+                                 "\"28/10/2026\"", "\"2026-10-32\"", NULL});
+    expect("date-time", "{\"type\":\"string\",\"format\":\"date-time\"}",
+           (const char *const[]){"\"2026-10-28T21:05:00Z\"",
+                                 "\"2026-10-28T21:05:00.123+01:00\"", NULL},
+           (const char *const[]){"\"2026-10-28 21:05:00Z\"",
+                                 "\"2026-10-28T24:00:00Z\"",
+                                 "\"2026-10-28T21:05:00\"", NULL});
+    expect("time", "{\"type\":\"string\",\"format\":\"time\"}",
+           (const char *const[]){"\"23:59:60-05:30\"", NULL},
+           (const char *const[]){"\"23:60:00Z\"", NULL});
+    expect(
+        "uuid", "{\"type\":\"string\",\"format\":\"uuid\"}",
+        (const char *const[]){"\"123e4567-e89b-12d3-a456-426614174000\"", NULL},
+        (const char *const[]){"\"123e4567e89b12d3a456426614174000\"",
+                              "\"123e4567-e89b-12d3-a456-42661417400g\"",
+                              NULL});
+    expect("email", "{\"type\":\"string\",\"format\":\"email\"}",
+           (const char *const[]){"\"ann.lee+x@mail.example.org\"", "\"a@b.it\"",
+                                 NULL},
+           (const char *const[]){"\"ann@localhost\"", "\"@b.it\"",
+                                 "\"a b@c.it\"", "\"a..b@c.it\"", "\"a@-b.it\"",
+                                 NULL});
+    expect("ipv4", "{\"type\":\"string\",\"format\":\"ipv4\"}",
+           (const char *const[]){"\"192.168.0.1\"", "\"255.255.255.255\"",
+                                 "\"0.0.0.0\"", NULL},
+           (const char *const[]){"\"256.1.1.1\"", "\"01.2.3.4\"", "\"1.2.3\"",
+                                 NULL});
+    /* patterns: anchored, or not and written from the start all the same */
+    expect("pattern anchored",
+           "{\"type\":\"string\",\"pattern\":\"^[A-Z]{2}-\\\\d{3,4}$\"}",
+           (const char *const[]){"\"AB-123\"", "\"ZZ-0000\"", NULL},
+           (const char *const[]){"\"ab-123\"", "\"AB-12\"", "\"AB-12345\"",
+                                 "\"xAB-123\"", "\"AB-123x\"", NULL});
+    expect("pattern anywhere", "{\"type\":\"string\",\"pattern\":\"o+k\"}",
+           (const char *const[]){"\"ok\"", "\"oook!\"", "\"ok then\"", NULL},
+           (const char *const[]){"\"k\"", "\"o k\"", "\"\"", "\"it is ok\"",
+                                 NULL});
+    expect("pattern start only",
+           "{\"type\":\"string\",\"pattern\":\"^(cat|dog)s?\"}",
+           (const char *const[]){"\"cats and\"", "\"dog\"", NULL},
+           (const char *const[]){"\"a cat\"", "\"cow\"", NULL});
+    /* a quote and a backslash in the expression: written escaped */
+    expect("pattern escapes",
+           "{\"type\":\"string\",\"pattern\":\"^say \\\"[a-z]+\\\"\\\\\\\\$\"}",
+           (const char *const[]){"\"say \\\"hi\\\"\\\\\"", NULL},
+           (const char *const[]){"\"say \"hi\"\\\\\"", "\"say \\\"hi\\\"\"",
+                                 NULL});
+    expect("pattern control", "{\"type\":\"string\",\"pattern\":\"^a\\\\nb$\"}",
+           (const char *const[]){"\"a\\nb\"", NULL},
+           (const char *const[]){"\"anb\"", "\"a\\\\nb\"", NULL});
+    /* not read: anchors inside, back references; the string unbounded */
+    expect("pattern unread", "{\"type\":\"string\",\"pattern\":\"a|^b\"}",
+           (const char *const[]){"\"zzz\"", NULL}, (const char *const[]){NULL});
+    /* a length past the old limit of 64 */
+    {
+        char good[402], bad[403];
+        good[0] = bad[0] = '"';
+        memset(good + 1, 'a', 399);
+        memset(bad + 1, 'a', 400);
+        good[400] = '"';
+        good[401] = 0;
+        bad[401] = '"';
+        bad[402] = 0;
+        expect("long string", "{\"type\":\"string\",\"maxLength\":399}",
+               (const char *const[]){good, "\"\"", NULL},
+               (const char *const[]){bad, NULL});
+    }
+}
+
 /* Text up to a closing tag, and special tokens as symbols. */
 static void test_until_and_tokens(void)
 {
@@ -375,6 +563,7 @@ int main(void)
     test_json();
     test_json_mangled();
     test_schemas();
+    test_bounds_and_formats();
     test_until_and_tokens();
     test_long();
     if (failures) {

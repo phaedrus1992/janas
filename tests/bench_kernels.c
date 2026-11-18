@@ -14,7 +14,10 @@
  * (the memory a GPU sharing the host's reads fastest), BENCH_MEM=huge2m in
  * ordinary memory aligned to 2 MB and collapsed into huge pages: the CPU's
  * speed on each, against malloc's (13 Oct 2026).
- * Defaults: 256 MiB of weights per type, 12 threads on CPUs 0-11; the
+ * BENCH_TYPES=Q4_K,Q2_0 measures the types named alone; BENCH_NV=8,16,64
+ * the vectors a product takes (1,2,4,8 by default, 512 at most: a prompt's
+ * block): where the prompt's tiles (JANAS_CPU_TILES) pay against the rows'
+ * products. Defaults: 256 MiB of weights per type, 12 threads on CPUs 0-11; the
  * single core is first_cpu (default 2).
  * The weights are random bytes below 0x7c, so that every fp16 scale is a
  * finite number; the speed of a kernel does not depend on the values.
@@ -28,6 +31,7 @@
 #endif
 #include <time.h>
 
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "llm/matvec.h"
 #include "llm/gpu.h"
@@ -54,7 +58,7 @@ static unsigned char *weights(size_t bytes)
         return janas_gpu_alloc(gpu, bytes);
     if (mem_kind == 2) {
         size_t al = (size_t)2 << 20;
-        return aligned_alloc(al, (bytes + al - 1) / al * al);
+        return janas_aligned_alloc(al, (bytes + al - 1) / al * al);
     }
     return malloc(bytes);
 }
@@ -62,11 +66,34 @@ static unsigned char *weights(size_t bytes)
 static const struct {
     const char *name;
     int type;
-} TYPES[] = {
-    {"Q4_K", JANAS_Q4_K},     {"Q5_K", JANAS_Q5_K},   {"Q6_K", JANAS_Q6_K},
-    {"Q3_K", JANAS_Q3_K},     {"Q8_0", JANAS_Q8_0},   {"Q4_0", JANAS_Q4_0},
-    {"Q4_1", JANAS_Q4_1},     {"Q5_1", JANAS_Q5_1},   {"IQ4_NL", JANAS_IQ4_NL},
-    {"IQ4_XS", JANAS_IQ4_XS}, {"IQ3_S", JANAS_IQ3_S}, {"MXFP4", JANAS_MXFP4}};
+} TYPES[] = {{"Q4_K", JANAS_Q4_K},       {"Q5_K", JANAS_Q5_K},
+             {"Q6_K", JANAS_Q6_K},       {"Q3_K", JANAS_Q3_K},
+             {"Q8_0", JANAS_Q8_0},       {"Q4_0", JANAS_Q4_0},
+             {"Q4_1", JANAS_Q4_1},       {"Q5_1", JANAS_Q5_1},
+             {"IQ4_NL", JANAS_IQ4_NL},   {"IQ4_XS", JANAS_IQ4_XS},
+             {"IQ3_S", JANAS_IQ3_S},     {"MXFP4", JANAS_MXFP4},
+             {"Q5_0", JANAS_Q5_0},       {"Q2_0", JANAS_Q2_0},
+             {"Q2_K", JANAS_Q2_K},       {"IQ3_XXS", JANAS_IQ3_XXS},
+             {"IQ2_XXS", JANAS_IQ2_XXS}, {"IQ2_XS", JANAS_IQ2_XS},
+             {"IQ2_S", JANAS_IQ2_S},     {"IQ1_S", JANAS_IQ1_S},
+             {"IQ1_M", JANAS_IQ1_M}};
+
+/* BENCH_TYPES=Q4_K,Q2_0 measures those types alone (all when unset). */
+static int wanted(const char *name)
+{
+    const char *list = getenv("BENCH_TYPES");
+    if (!list || !*list)
+        return 1;
+    size_t n = strlen(name);
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n))
+            return 1;
+        p += len + (e != NULL);
+    }
+    return 0;
+}
 
 /* Seconds per product, the best of passes run for at least 0.3 s. */
 static double timed(struct janas_pool *pool, struct janas_matvec_task *t)
@@ -115,13 +142,32 @@ int main(int argc, char **argv)
         fprintf(stderr, "bench_kernels: no thread pool\n");
         return 1;
     }
-    const size_t cols = 2048, nb = cols / JANAS_QK, nvs[] = {1, 2, 4, 8};
-    struct janas_block_q8k *x = calloc(8 * nb, sizeof(*x));
-    float *v = malloc(8 * cols * sizeof(float));
+    enum { MAX_NV = 512 };
+    size_t nvs[8] = {1, 2, 4, 8}, n_nv = 4;
+    const char *ev = getenv("BENCH_NV");
+    if (ev) {
+        n_nv = 0;
+        for (const char *c = ev; *c && n_nv < 8;) {
+            long n = strtol(c, (char **)&c, 10);
+            if (n >= 1 && n <= MAX_NV)
+                nvs[n_nv++] = (size_t)n;
+            while (*c == ',' || *c == ' ')
+                c++;
+            if (*c && (*c < '0' || *c > '9'))
+                break;
+        }
+        if (!n_nv) {
+            fprintf(stderr, "bench_kernels: BENCH_NV lists 1 to 512\n");
+            return 1;
+        }
+    }
+    const size_t cols = 2048, nb = cols / JANAS_QK;
+    struct janas_block_q8k *x = calloc(MAX_NV * nb, sizeof(*x));
+    float *v = malloc(MAX_NV * cols * sizeof(float));
     srand(1);
-    for (size_t i = 0; i < 8 * cols; i++)
+    for (size_t i = 0; i < MAX_NV * cols; i++)
         v[i] = (float)rand() / RAND_MAX - 0.5f;
-    for (int k = 0; k < 8; k++)
+    for (int k = 0; k < MAX_NV; k++)
         janas_q8k_quantize(v + k * cols, x + k * nb, cols);
     printf("GB/s of weights, %zu MiB a type, 2048 columns; 1 core (CPU %d) "
            "and %d threads; weights in %s\n",
@@ -129,13 +175,22 @@ int main(int argc, char **argv)
            mem_kind == 1   ? "the GPU driver's memory"
            : mem_kind == 2 ? "2 MB pages"
                            : "malloc's memory");
-    printf("%-7s %8s %8s %8s %8s | %8s %8s %8s %8s\n", "type", "1x1", "1x2",
-           "1x4", "1x8", "Nx1", "Nx2", "Nx4", "Nx8");
+    printf("%-7s", "type");
+    for (int p = 0; p < 2; p++) {
+        for (size_t i = 0; i < n_nv; i++) {
+            char h[16];
+            snprintf(h, sizeof(h), "%sx%zu", p ? "N" : "1", nvs[i]);
+            printf(" %8s", h);
+        }
+        printf(p ? "\n" : " |");
+    }
     for (size_t k = 0; k < sizeof TYPES / sizeof *TYPES; k++) {
+        if (!wanted(TYPES[k].name))
+            continue;
         size_t bs = janas_qtype_block_size(TYPES[k].type);
         size_t rows = (mib << 20) / (nb * bs), bytes = rows * nb * bs;
         unsigned char *w = weights(bytes);
-        float *y = malloc(8 * rows * sizeof(float));
+        float *y = malloc(MAX_NV * rows * sizeof(float));
         if (!w || !y) {
             fprintf(stderr, "bench_kernels: out of memory\n");
             return 1;
@@ -147,13 +202,27 @@ int main(int argc, char **argv)
         if (TYPES[k].type == JANAS_MXFP4)
             for (size_t i = 0; i < bytes; i += sizeof(struct janas_block_mxfp4))
                 w[i] = (unsigned char)(118 + rand() % 12);
+        /* the IQ types' scale of a block, at its start (IQ1_M: the top
+           nibbles of its four scale words), a normal fp16 as in real
+           weights: a subnormal one sends every float product of the block
+           down the slow path (IQ1_M read 0.3 GB/s on random bytes) */
+        int t = TYPES[k].type;
+        if (t == JANAS_IQ2_XXS || t == JANAS_IQ2_XS || t == JANAS_IQ2_S ||
+            t == JANAS_IQ3_XXS || t == JANAS_IQ1_S)
+            for (size_t i = 0; i < bytes; i += bs) {
+                uint16_t d = (uint16_t)(0x2000 + rand() % 0x1000);
+                memcpy(w + i, &d, 2);
+            }
+        if (t == JANAS_IQ1_M)
+            for (size_t i = 0; i < bytes; i += bs)
+                w[i + bs - 1] = (unsigned char)(0x20 | (w[i + bs - 1] & 0x0f));
 #if defined(__linux__)
         if (mem_kind == 2)
             madvise(w, bytes, MADV_COLLAPSE);
 #endif
         printf("%-7s", TYPES[k].name);
         for (int p = 0; p < 2; p++) {
-            for (size_t i = 0; i < 4; i++) {
+            for (size_t i = 0; i < n_nv; i++) {
                 struct janas_matvec_task t = {.type = TYPES[k].type,
                                               .w = w,
                                               .x = x,
@@ -169,8 +238,10 @@ int main(int argc, char **argv)
             printf(p ? "\n" : " |");
         }
         fflush(stdout);
-        if (mem_kind != 1)
-            free(w); /* the driver's goes with the GPU */
+        if (mem_kind == 2) /* the driver's goes with the GPU */
+            janas_aligned_free(w);
+        else if (mem_kind == 0)
+            free(w);
         free(y);
     }
     free(x);
