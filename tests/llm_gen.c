@@ -12,6 +12,7 @@
  * With mtp= the drafts come from the model's MTP block instead of lookup.
  * With cpus=<list> (e.g. 0-11 or 18,19) the compute threads run on those
  * CPUs, one each (to run it beside another process on other cores).
+ * LLM_GEN_DUMP=<path> writes the first run's tokens there (int32).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +240,16 @@ int main(int argc, char **argv)
     if (na < 0 || nb < 0) {
         fprintf(stderr, "generation failed\n");
         return 1;
+    }
+    /* LLM_GEN_DUMP=<path>: the first run's tokens there (int32), to read
+       or compare against another run's */
+    const char *dump = getenv("LLM_GEN_DUMP");
+    if (dump) {
+        FILE *f = fopen(dump, "wb");
+        if (!f || fwrite(a, sizeof(int32_t), (size_t)na, f) != (size_t)na)
+            fprintf(stderr, "%s: not written\n", dump);
+        if (f)
+            fclose(f);
     }
     printf("first tokens:");
     for (int i = 0; i < 12 && i < na; i++)

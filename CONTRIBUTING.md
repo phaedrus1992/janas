@@ -1,10 +1,10 @@
 # Contributing to Janas
 
-Janas is an experiment in early development: formats, interfaces and the command line change without notice. Before writing code, it is worth asking in an issue whether the thing you have in mind is already being changed underneath.
+Janas is young: the C API and the command line still change, now mostly by additions (the models' `.jns` format does not). Before writing code, it is worth asking in an issue whether the thing you have in mind is already being changed underneath.
 
 ## What helps most
 
-**A measurement from a machine nobody here owns.** Everything in the engine is decided from what it measures, and it has only ever measured one machine (a Core Ultra 9 185H with 32 GB of RAM and an NVMe disk, on Debian 13). Run:
+**A measurement from a machine nobody here owns.** Everything in the engine is decided from what it measures, and it has been measured here on one machine (a Core Ultra 9 185H with 32 GB of RAM and an NVMe disk, on Debian 13), by testers on 19 others ([docs/reports.md](docs/reports.md)). Run:
 
 ```sh
 bin/x86_64-linux/janas-bench <model.jns>
@@ -32,19 +32,11 @@ Then open a [hardware report](https://github.com/prabanta-dev/janas/issues/new?t
 - A change that touches arithmetic must keep the results it promises: kernels agree bit for bit with the scalar reference, and a pass over a block of tokens agrees bit for bit with the same tokens one at a time. The tests check this; keep them passing.
 - Numbers in a commit message are welcome, and should say on what they were measured.
 
-## Copyright and sign-off
+## Copyright
 
-Janas is licensed under the **GNU General Public License, version 3 or later** (see [LICENSE](LICENSE)). Contributions are taken under the same licence.
+Janas is licensed under the **GNU General Public License, version 3 or later** (see [LICENSE](LICENSE)).
 
-Every commit must carry a sign-off line:
-
-```
-Signed-off-by: Your Name <your@email>
-```
-
-which `git commit -s` adds for you. It means what the [Developer Certificate of Origin](https://developercertificate.org/) says: that you wrote the change, or have the right to submit it under this licence.
-
-Please keep contributions to code you own. Code copied from elsewhere, however small, has to be declared in the pull request, with where it came from and under what licence.
+**Code from contributors cannot be accepted yet.** Janas's copyright is going to be held by a non-profit foundation, which does not exist yet; once it does, contributors will assign their rights in what they contribute to it, and their authorship will be recognised. A single holder is what keeps the code free for everyone to use, in the spirit of free and open source software, and lets the project defend its licence as a whole. Until the foundation is set up, pull requests with code stay open but are not merged; reports, measurements and ideas in the issues are as welcome as ever.
 
 ## Models
 

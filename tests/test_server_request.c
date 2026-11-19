@@ -14,6 +14,20 @@
 
 #include "server/engine.c"
 #include "server/fim.c"
+#include "server/images.c"
+
+/* images.c reads files from the store: none here */
+int srv_files_get(struct srv_files *f, const char *id, struct srv_file *out)
+{
+    (void)f, (void)id, (void)out;
+    return -1;
+}
+
+int srv_files_open_content(struct srv_files *f, const char *id)
+{
+    (void)f, (void)id;
+    return -1;
+}
 #include "server/request.c"
 #include "server/request_opts.c"
 
@@ -62,7 +76,8 @@ static void valid(void)
         "{\"role\":\"assistant\",\"content\":null},"
         "{\"role\":\"developer\",\"content\":\"Italian.\"},"
         "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Ci\"},"
-        "{\"type\":\"text\",\"text\":\"ao\"}]}],"
+        "{\"type\":\"refusal\",\"refusal\":\"a\"},"
+        "{\"type\":\"text\",\"text\":\"o\"}]}],"
         "\"temperature\":0.2,\"top_p\":0.9,\"max_tokens\":50,"
         "\"stop\":[\"END\",\"\"],\"seed\":7,\"stream\":true,"
         "\"stream_options\":{\"include_usage\":true},"
@@ -176,9 +191,27 @@ static void invalid(void)
         {"{\"messages\":[{\"role\":\"user\",\"content\":\"a\"},"
          "{\"role\":\"assistant\",\"content\":\"b\"}]}",
          1, "invalid_value"},
+        /* a picture part without its picture */
         {"{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
          "\"image_url\"}]}]}",
+         1, "invalid_value"},
+        /* a picture in the assistant's message */
+        {"{\"messages\":[{\"role\":\"user\",\"content\":\"a\"},"
+         "{\"role\":\"assistant\",\"content\":[{\"type\":\"image_url\","
+         "\"image_url\":{\"url\":\"data:image/png;base64,AA\"}}]},"
+         "{\"role\":\"user\",\"content\":\"b\"}]}",
+         1, "invalid_value"},
+        /* sound: not read */
+        {"{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+         "\"input_audio\"}]}]}",
          1, "unsupported_content"},
+        /* a part's text not a string: its length is not the bytes */
+        {"{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+         "\"text\",\"text\":[1,2,3,4,5,6,7,8]}]}]}",
+         1, "invalid_value"},
+        {"{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+         "\"text\",\"text\":{\"a\":1}}]}]}",
+         1, "invalid_value"},
         {"{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],"
          "\"temperature\":3}",
          1, "invalid_value"},

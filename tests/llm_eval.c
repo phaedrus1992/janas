@@ -6,14 +6,15 @@
  *
  * Usage: llm_eval <model.jns> <tokens.int32> [reference.logits]
  *                 [cache_MiB] [compute_cpus] [io_cpus] [block=B] [reject=R]
- *                 [dump=F]
+ *                 [dump=F] [bdump=F]
  * With block=B the tokens are also run in blocks of B (the prefill path) and
  * the logits compared with the token-by-token ones: they must be identical.
  * With reject=R (R < B) each block but the last keeps only its first B - R
  * tokens and the next starts after them, as when the last R tokens of a
  * chain of drafts are rejected: a recurrent model then replays the kept
  * tokens of its log on the state before the block.
- * With dump=F the logits are written to F in the reference format.
+ * With dump=F the logits are written to F in the reference format; with
+ * bdump=F (and block=B) those of the blocks.
  * Reports, per position, whether the most likely token agrees, the largest and
  * mean absolute logit difference, and the time per token.
  */
@@ -46,7 +47,7 @@ static void print_phases(const char *what, const double *a, const double *b,
                          size_t n)
 {
     static const char *names[JANAS_PH_COUNT] = {
-        "qkv", "attention", "wo", "router", "experts", "output", "ssm"};
+        "qkv", "attention", "wo", "router", "experts", "output", "ssm", "mix"};
     double sum = 0;
     printf("%s, ms/token:", what);
     for (int i = 0; i < JANAS_PH_COUNT; i++) {
@@ -149,9 +150,15 @@ int main(int argc, char **argv)
            n, dt, dt / n * 1e3, t2 / (n - n / 2) * 1e3, (n - n / 2) / t2,
            100.0 * st.hits / (st.requests ? st.requests : 1));
     int block = 0, reject = 0;
+    FILE *bdump = NULL;
     for (int i = 7; i < argc; i++) {
         if (strncmp(argv[i], "block=", 6) == 0)
             block = atoi(argv[i] + 6);
+        if (strncmp(argv[i], "bdump=", 6) == 0 &&
+            !(bdump = fopen(argv[i] + 6, "wb"))) {
+            perror(argv[i] + 6);
+            return 2;
+        }
         if (strncmp(argv[i], "reject=", 7) == 0)
             reject = atoi(argv[i] + 7);
     }
@@ -184,6 +191,10 @@ int main(int argc, char **argv)
             kept = p0 + b >= nn ? b : b - (uint32_t)reject;
             for (uint32_t j = 0; j < kept; j++) {
                 const float *a = seq + (p0 + j) * nv, *c = blk + (size_t)j * nv;
+                if (bdump && fwrite(c, sizeof(float), nv, bdump) != nv) {
+                    fprintf(stderr, "cannot write the blocks' logits\n");
+                    return 1;
+                }
                 int eq = 1;
                 for (uint32_t i = 0; i < nv; i++) {
                     double d = fabs((double)a[i] - c[i]);
@@ -225,6 +236,10 @@ int main(int argc, char **argv)
                    block, rtop, nn, rsum / ((double)nn * nv));
         free(seq);
         free(blk);
+    }
+    if (bdump && fclose(bdump) != 0) {
+        fprintf(stderr, "cannot write the blocks' logits\n");
+        return 1;
     }
     print_phases("second half", ph0, ph_end, n - n / 2);
     if (compared)

@@ -22,9 +22,12 @@
 #include "llm/chat.h"
 #include "jns.h"
 
-/* no MTP block or assistant is near this size; the models beside one are
-   larger, and their headers are not worth reading */
-#define MTP_MAX_BYTES ((uint64_t)2 << 30)
+/* An MTP block or an assistant is a small part of its model - Qwen3.5-2B's
+   45 MB beside 1.3 GB, Qwen3.8-Flash-Next's 1.9 GB beside 66 GB - so a file
+   larger than a quarter of the model, and than 2 GiB, is another model,
+   whose header is not worth reading. The 2 GiB alone left out the block
+   unsloth recommends for Qwen3.8-Flash-Next, its Q8_0, 2.6 GB. */
+#define MTP_MIN_CAP ((uint64_t)2 << 30)
 
 struct model_shape {
     char arch[32];
@@ -74,6 +77,11 @@ int32_t janas_llm_find_mtp(const char *model_path, char *out, int32_t cap)
                             .n_vocab = vocab_of(&j)};
     snprintf(m.arch, sizeof(m.arch), "%.31s", j.h.arch);
     janas_jns_close(&j);
+    /* the largest file worth a look */
+    struct stat ms;
+    uint64_t most = MTP_MIN_CAP;
+    if (stat(model_path, &ms) == 0 && (uint64_t)ms.st_size / 4 > most)
+        most = (uint64_t)ms.st_size / 4;
 
     /* the model's directory and its own name */
     char dir[4096];
@@ -99,7 +107,7 @@ int32_t janas_llm_find_mtp(const char *model_path, char *out, int32_t cap)
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
-            (uint64_t)st.st_size > MTP_MAX_BYTES)
+            (uint64_t)st.st_size > most)
             continue;
         if (janas_jns_open(path, &j, err, sizeof(err)) != 0)
             continue;

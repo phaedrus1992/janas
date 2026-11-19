@@ -147,6 +147,32 @@ const struct janas_model_entry janas_catalog[] = {
      .flat_sha =
          "138d1db3af7e48d3bd36a428f7a81dfd8813434521aced84459c546e4830ab5b",
      .ram_gb = 32},
+    /* Qwen Community License 1.0 (MODELS.md): converted files may be
+       published with its notice, which the repository carries */
+    {.name = "qwen3.8-flash-next",
+     .what = "Qwen3.8-Flash-Next, 512 experts, ISTA's 2-bit GSQ, with its MTP "
+             "block",
+     .repo = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+     .parts = {"Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+               "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"},
+     .part_sha =
+         {"69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720",
+          "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"},
+     .gguf_gb = 66.4,
+     .out = "qwen3.8-flash-next-gsq-q20.jns",
+     .jns_repo = "prabanta-dev/Qwen3.8-Flash-Next-JNS",
+     .jns_gb = 68.38,
+     .flat_sha =
+         "b5b4dbe4e3ae01bffc41acefa0d1e62afdfe4b5b9bc24c2a3fab591a41f9087f",
+     .extra = JANAS_EXTRA_BLOCK,
+     .extra_repo = "unsloth/Qwen3.8-Flash-Next-GGUF",
+     .extra_src = "MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+     .extra_src_sha =
+         "8087dbb39fc73f79ac069b1debe4069a44b73ada900c8bd761569d43a5a90231",
+     .extra_out = "qwen3.8-flash-next-mtp-q4km.jns",
+     .extra_sha =
+         "d9c9dd94ef2e52391613db98c2e34c574341c48ab8752454696534d0f69a29ca",
+     .ram_gb = 32},
     {.name = "qwen3-30b-a3b",
      .what = "Qwen3-30B-A3B, mixture of experts",
      .repo = "Qwen/Qwen3-30B-A3B-GGUF",
@@ -242,6 +268,24 @@ const struct janas_model_entry janas_catalog[] = {
          "5c9bc4cb6f739193fac5e4daa30c922f73255acf41443ecfc0123ef084584559",
      .ram_gb = 32,
      .fast = "--head 4 --bits 4"},
+    /* the model tried in the editor (docs/editor.md, code-completion.md):
+       it fills in the middle and has no recurrent layers, so it completes
+       at the cursor as well as writing code; held whole in memory for
+       that */
+    {.name = "qwen3-coder-30b-a3b",
+     .what = "Qwen3-Coder-30B-A3B-Instruct, mixture of experts, for code "
+             "and completion in the editor",
+     .repo = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+     .parts = {"Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"},
+     .part_sha =
+         {"fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad"},
+     .gguf_gb = 18.6,
+     .out = "qwen3-coder-30b-a3b-q4km.jns",
+     .jns_repo = "prabanta-dev/Qwen3-Coder-30B-A3B-Instruct-JNS",
+     .jns_gb = 18.56,
+     .flat_sha =
+         "bee7d25509e911a195cbf05a157e69bb05a62d2241cca2c4fdcfef269dcb2bdd",
+     .ram_gb = 32},
     {.name = "qwen3-coder-next",
      .what = "Qwen3-Coder-Next, mixture of experts, for code",
      .repo = "Qwen/Qwen3-Coder-Next-GGUF",
@@ -265,6 +309,23 @@ const struct janas_model_entry janas_catalog[] = {
          "0276b0697a05075fec8ab076a757205537804ff41dd7e9dadace7c6993763563",
      .ram_gb = 32,
      .fast = "--head 4 --bits 4"},
+    /* NVIDIA's own 24GB GGUF, in one step (no planes: its experts are
+       IQ2_XXS); under NVIDIA's OpenMDW-1.1, which lets it be passed on
+       with the licence and NVIDIA's notices (MODELS.md) */
+    {.name = "nemotron-3.5-bolt-74b",
+     .what = "NVIDIA Nemotron-3.5-Bolt-74B-A9B, mixture of experts with "
+             "Mamba-2 layers, its experts at two bits",
+     .repo = "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+     .parts = {"NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf"},
+     .part_sha =
+         {"91d63363e782c8a3d5f4be42816eba8e0d42dd2530bd07a7d0d2dc440599af75"},
+     .gguf_gb = 22.0,
+     .out = "nemotron-3.5-bolt-74b-24gb.jns",
+     .jns_repo = "prabanta-dev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-JNS",
+     .jns_gb = 22.02,
+     .flat_sha =
+         "5c67c321b7e4dd2397d990bb12cd4ae5cd08db2edd75dbbc71b7aeea139b54c1",
+     .ram_gb = 32},
     {.name = "qwen3-embedding-0.6b",
      .what = "Qwen3-Embedding-0.6B, for janas-server --embedding-model",
      .repo = "Qwen/Qwen3-Embedding-0.6B-GGUF",
@@ -279,6 +340,32 @@ const struct janas_model_entry janas_catalog[] = {
          "1e8eb8cbeba7a1a657354d259c5730bb79f6087160a9ca8da901bd08bdbe943f",
      .ram_gb = 2,
      .not_chat = 1},
+    /* speech to text: OpenAI's checkpoints converted by hf2jns_whisper
+       (half precision as released), so their JNS alone is downloaded */
+    {.name = "whisper-small",
+     .what = "Whisper small, speech to text (dictation), for janas-server "
+             "--speech-model",
+     .repo = "openai/whisper-small",
+     .out = "whisper-small.jns",
+     .jns_repo = "prabanta-dev/whisper-small-JNS",
+     .jns_gb = 0.49,
+     .flat_sha =
+         "78401176c4abda8124188d429ac777ed79bd7e63b262d4f1f0075066b42b316a",
+     .ram_gb = 4,
+     .not_chat = 1,
+     .speech = 1},
+    {.name = "whisper-large-v3-turbo",
+     .what = "Whisper large-v3-turbo, speech to text, more accurate, for "
+             "janas-server --speech-model",
+     .repo = "openai/whisper-large-v3-turbo",
+     .out = "whisper-large-v3-turbo.jns",
+     .jns_repo = "prabanta-dev/whisper-large-v3-turbo-JNS",
+     .jns_gb = 1.63,
+     .flat_sha =
+         "b2396b2c413af93a471b3f14ff6f0076630cc27f2e8a181cc982ac0d23d91b34",
+     .ram_gb = 8,
+     .not_chat = 1,
+     .speech = 1},
     {.name = "gemma-4-e2b",
      .what = "Gemma-4-E2B-it, with its assistant",
      .repo = "unsloth/gemma-4-E2B-it-GGUF",
@@ -388,18 +475,41 @@ int janas_models_dir(char *buf, size_t len)
     return n > 0 && (size_t)n < len ? 0 : -1;
 }
 
+/* a separator of a path: on Windows the backslash too, which its own
+   paths use (C:\Users\...\janas); only the slash was taken, and a
+   folder whose parent was missing could not be made there */
+static int is_sep(char c)
+{
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
 int janas_mkdirs(const char *dir)
 {
     char p[4096];
     int n = snprintf(p, sizeof(p), "%s", dir);
     if (n <= 0 || (size_t)n >= sizeof(p))
         return -1;
-    for (char *c = p + 1; *c; c++)
-        if (*c == '/') {
+    /* without the separators it ends with ("dir/", a zip's folder): Windows's
+       stat() finds no "C:/x/" even when C:/x is there */
+    while (n > 1 && is_sep(p[n - 1]) && !(n == 3 && p[1] == ':'))
+        p[--n] = 0;
+    char *c = p + 1;
+#ifdef _WIN32
+    if (p[0] && p[1] == ':') /* a drive's root is there already */
+        c = p + 2;
+#endif
+    for (; *c; c++)
+        if (is_sep(*c) && !is_sep(c[-1])) {
+            char sep = *c;
             *c = 0;
-            if (mkdir(p, 0755) != 0 && errno != EEXIST)
-                return -1;
-            *c = '/';
+            /* a part that cannot be made may be one that is there and
+               cannot be made again (a share's root): the end decides */
+            mkdir(p, 0755);
+            *c = sep;
         }
     if (mkdir(p, 0755) != 0 && errno != EEXIST)
         return -1;
