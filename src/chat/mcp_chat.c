@@ -6,15 +6,21 @@
  */
 #include "mcp_chat.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "layout.h"
 #include "llm/json.h"
+#include "common/mcp_config.h"
+#include "common/mcp_services.h"
+#include "common/mcp_tls.h"
+#include "janas/llm.h"
 #include "common/sysinfo.h"
 
 /* An answer longer than this is cut: the context is the model's memory of
@@ -27,6 +33,23 @@ struct server {
     janas_mcp *m;
     int own;    /* a service of Janas's own, found beside janas-chat */
     int opened; /* its tools given to the model (mcpc_call of OPEN_TOOL) */
+    /* what it is - its command line or address - and the version it says
+       it is: an approval holds for that server alone; autoApprove, the
+       tools mcp.json allows for good (their names on the server) */
+    char *ident, *version;
+    char **auto_ok;
+};
+
+/*
+ * The tools allowed with "a": the conversation's alone (forgotten when it
+ * changes), each with the server it was given to and the time it was last
+ * used, kept beside the conversation's file so that taking it up again
+ * finds them - unless they are older than the user allows, or the server
+ * is no longer the same.
+ */
+struct approval {
+    char *tool, *ident, *version;
+    int64_t used;
 };
 
 /* The services of Janas that janas-chat starts by itself when they are
@@ -34,33 +57,6 @@ struct server {
    those that change something (readOnlyHint false: janas-git's commit,
    push...) are asked for every time (mcpc_writes). What they say of their
    tools goes to the model. */
-static const struct {
-    const char *name, *about; /* for the catalog */
-} SERVICES[] = {
-    {"flights", "flights and aircraft: where a flight is and what it is "
-                "doing, today's flights of a route, what flies over a sea "
-                "or near a place"},
-    {"git", "the git repositories of this computer: what has changed, "
-            "the commits, the branches, a diff; a commit, pull, push or "
-            "switch of branch, each confirmed by the user"},
-    {"github", "GitHub: a project's issues and pull requests (the new "
-               "ones), its latest release, its recent commits, what it is"},
-    {"maps", "roads and places: a route by car, bike or on foot, public "
-             "transport between places, what is near (fuel, a pharmacy...), "
-             "where an address is"},
-    {"prices", "prices and finance, for information: currencies, "
-               "crypto-assets, shares, inflation, central banks' rates, "
-               "electricity, the cheapest fuel near a place"},
-    {"quakes", "earthquakes: the latest near a place or where the user is, "
-               "the strongest in the world, one in detail"},
-    {"system", "this computer: how it is (memory, processor, disks, "
-               "battery, temperatures), what fills a folder, the programs "
-               "running, the errors, the updates, the network"},
-    {"weather", "the weather now and the forecast, the sea and its waves, "
-                "weather warnings"},
-    {"wiki", "Wikipedia, when the user asks for it: a page shown to the "
-             "user; what there is to see around a place"},
-};
 
 /*
  * The tools of Janas's services are not written into the system message:
@@ -72,15 +68,16 @@ static const struct {
  * that call's answer, and its tools are added to those the model may call
  * (janas_llm_chat_tools_add). --all-tools writes them all as before.
  */
-#define OPEN_TOOL "janas__open_service"
+#define OPEN_TOOL JANAS_OPEN_SERVICE
 static int deferred = 1;
 static unsigned opened_gen; /* changes when a service is opened or all closed */
+static const char *opened_prefix; /* of the service opened last */
 
 static struct server *servers;
 static size_t n_servers;
 static char *tools_json;
-static char **always;
-static size_t n_always;
+static struct approval *appr;
+static size_t n_appr;
 static janas_mcp *volatile running; /* the call in progress, for Ctrl-C */
 
 size_t mcpc_count(void)
@@ -165,20 +162,13 @@ static void join_tools(void)
     }
     if (own) { /* the one that opens them */
         struct janas_buf o = {0};
-        janas_buf_puts(&o, "{\"type\": \"function\", \"function\": {\"name\": "
-                           "\"" OPEN_TOOL "\", \"description\": \"Gives you "
-                           "the instructions and the tools of one of "
-                           "Janas's services, listed in the system message. "
-                           "Once a service is open, call its tools.\", "
-                           "\"parameters\": {\"type\": \"object\", "
-                           "\"properties\": {\"service\": {\"type\": "
-                           "\"string\", \"enum\": [");
-        int k = 0;
-        for (size_t i = 0; i < n_servers; i++)
+        const char **names = calloc(n_servers + 1, sizeof *names);
+        size_t k = 0;
+        for (size_t i = 0; names && i < n_servers; i++)
             if (servers[i].own)
-                janas_buf_printf(&o, "%s\"%s\"", k++ ? ", " : "",
-                                 servers[i].name);
-        janas_buf_puts(&o, "]}}, \"required\": [\"service\"]}}}");
+                names[k++] = servers[i].name;
+        janas_services_open_tool(&o, names, k);
+        free(names);
         char *g = o.oom ? NULL : realloc(all, used + o.n + 4);
         if (g) {
             all = g;
@@ -206,22 +196,17 @@ void mcpc_defer(int on)
 /* The catalog of the services, for the system message. */
 static void catalog(FILE *f)
 {
-    fputs("Janas's services bring data of the world. Their tools are not "
-          "listed here: to use a service, call " OPEN_TOOL " with its name, "
-          "by yourself whenever a question is on its subject (the user need "
-          "not name it), then call the tools it gives you; an open service "
-          "stays open for the conversation. Never name the services or the "
-          "tools in your reply. The services:\n",
-          f);
-    for (size_t i = 0; i < n_servers; i++) {
-        if (!servers[i].own)
-            continue;
-        const char *about = "";
-        for (size_t k = 0; k < sizeof SERVICES / sizeof *SERVICES; k++)
-            if (strcmp(SERVICES[k].name, servers[i].name) == 0)
-                about = SERVICES[k].about;
-        fprintf(f, "- %s: %s\n", servers[i].name, about);
-    }
+    const char **names = calloc(n_servers + 1, sizeof *names);
+    size_t n = 0;
+    for (size_t i = 0; names && i < n_servers; i++)
+        if (servers[i].own)
+            names[n++] = servers[i].name;
+    struct janas_buf o = {0};
+    janas_services_catalog(&o, names, NULL, n);
+    if (!o.oom && o.n)
+        fwrite(o.p, 1, o.n, f);
+    janas_buf_free(&o);
+    free(names);
 }
 
 /* The call of OPEN_TOOL: the service's instructions and tools. */
@@ -256,27 +241,10 @@ static int open_service(const char *args, char **text)
         *text = o.oom ? NULL : o.p;
         return 0;
     }
-    int32_t len = 0;
-    janas_mcp_instructions(s->m, NULL, 0, &len);
-    char *ins = len > 0 ? malloc((size_t)len + 1) : NULL;
-    if (ins && janas_mcp_instructions(s->m, ins, len + 1, &len) == JANAS_MCP_OK)
-        janas_buf_printf(&o, "%s\n\n", ins);
-    free(ins);
-    len = 0;
-    janas_mcp_tools(s->m, s->prefix, -1, NULL, 0, &len);
-    char *t = malloc((size_t)len + 1);
-    if (t &&
-        janas_mcp_tools(s->m, s->prefix, -1, t, len + 1, &len) == JANAS_MCP_OK)
-        janas_buf_printf(&o,
-                         "The service %s is open. Its tools, to call as "
-                         "any other:\n%s\n\nNow call the one that "
-                         "answers the user's question: do not answer "
-                         "before it has, and never make up what it "
-                         "would say.",
-                         s->name, t);
-    free(t);
+    janas_service_opened(&o, s->m, s->name, s->prefix);
     s->opened = 1;
     opened_gen++;
+    opened_prefix = s->prefix;
     *text = o.oom ? NULL : o.p;
     if (o.oom)
         janas_buf_free(&o);
@@ -286,6 +254,11 @@ static int open_service(const char *args, char **text)
 unsigned mcpc_opened(void)
 {
     return opened_gen;
+}
+
+const char *mcpc_opened_prefix(void)
+{
+    return opened_prefix;
 }
 
 char *mcpc_opened_tools(void)
@@ -322,24 +295,115 @@ void mcpc_close_services(void)
     for (size_t i = 0; i < n_servers; i++)
         servers[i].opened = 0;
     opened_gen++;
+    opened_prefix = NULL;
 }
 
-static int add_server(const char *line, janas_mcp *m, int own)
+/* Does p clash with a server's prefix: the same, or one the start of the
+   other ("a__" and "a__b__"), so that a tool name would go to the wrong
+   server? */
+static int prefix_clash(const char *p)
 {
+    for (size_t i = 0; i < n_servers; i++) {
+        size_t a = strlen(p), b = strlen(servers[i].prefix);
+        if (strncmp(p, servers[i].prefix, a < b ? a : b) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The name's prefix, made unique among the servers': a.b and a_b both
+   come out a_b__, the second a_b_2__ */
+static char *unique_prefix(const char *name)
+{
+    char *base = prefix_of(name);
+    if (!base || !prefix_clash(base))
+        return base;
+    size_t n = strlen(base) - 2; /* without its "__" */
+    char *p = malloc(n + 16);
+    for (int k = 2; p && k < 100000; k++) {
+        snprintf(p, n + 16, "%.*s_%d__", (int)n, base, k);
+        if (!prefix_clash(p))
+            break;
+    }
+    free(base);
+    return p;
+}
+
+/* The version the server says it is ("version: ..." of its info). */
+static char *server_version(janas_mcp *m)
+{
+    char info[4096] = "";
+    int32_t len = 0;
+    janas_mcp_info(m, info, sizeof info, &len);
+    for (char *l = info; l && *l;) {
+        char *e = strchr(l, '\n');
+        if (e)
+            *e = 0;
+        if (strncmp(l, "version: ", 9) == 0)
+            return strdup(l + 9);
+        l = e ? e + 1 : NULL;
+    }
+    return strdup("");
+}
+
+static char **dup_list(char *const *a)
+{
+    size_t n = 0;
+    while (a && a[n])
+        n++;
+    char **d = calloc(n + 1, sizeof(*d));
+    for (size_t i = 0; d && i < n; i++)
+        if (!(d[i] = strdup(a[i])))
+            return d; /* what was copied */
+    return d;
+}
+
+static int add_server(const char *line, janas_mcp *m, int own,
+                      const char *ident, char *const *auto_ok)
+{
+    /* the prefix against the servers as they are, before the table moves */
+    char *name = strdup(line), *prefix = unique_prefix(line);
+    char *id = strdup(ident ? ident : line), *ver = server_version(m);
+    char **ok = dup_list(auto_ok);
     struct server *g = realloc(servers, (n_servers + 1) * sizeof(*g));
-    char *name = strdup(line), *prefix = prefix_of(line);
-    if (!g || !name || !prefix) {
+    if (!g || !name || !prefix || !id || !ver || !ok) {
         if (g)
             servers = g;
         free(name);
         free(prefix);
+        free(id);
+        free(ver);
+        for (char **a = ok; a && *a; a++)
+            free(*a);
+        free(ok);
         janas_mcp_close(m);
         return -1;
     }
     servers = g;
-    servers[n_servers++] =
-        (struct server){.name = name, .prefix = prefix, .m = m, .own = own};
+    servers[n_servers++] = (struct server){.name = name,
+                                           .prefix = prefix,
+                                           .m = m,
+                                           .own = own,
+                                           .ident = id,
+                                           .version = ver,
+                                           .auto_ok = ok};
     return 0;
+}
+
+/* What a configured server is, as a line: its address, or its command and
+   arguments. */
+static char *conf_ident(const struct janas_mcp_conf *c)
+{
+    struct janas_buf b = {0};
+    if (c->url)
+        janas_buf_puts(&b, c->url);
+    for (char **a = c->argv; a && *a; a++) {
+        if (a != c->argv)
+            janas_buf_puts(&b, " ");
+        janas_buf_puts(&b, *a);
+    }
+    janas_buf_put(&b, "", 0);
+    return b.oom ? NULL : b.p;
 }
 
 int mcpc_start(const char *path)
@@ -360,6 +424,18 @@ int mcpc_start(const char *path)
         fprintf(stderr, "mcp: %s\n", janas_mcp_last_error());
         return 0;
     }
+    /* the servers as configured: what each is, and its autoApprove */
+    struct janas_mcp_conf *conf = NULL;
+    size_t n_conf = 0;
+    char cerr[256], cpath[4096];
+    const char *cfg = path;
+    if (!cfg && janas_mcp_conf_path(cpath, sizeof cpath) == 0)
+        cfg = cpath;
+    if (!cfg ||
+        janas_mcp_config_read(cfg, &conf, &n_conf, cerr, sizeof cerr) != 0) {
+        conf = NULL;
+        n_conf = 0;
+    }
     for (char *line = strtok(list, "\n"); line; line = strtok(NULL, "\n")) {
         if (strstr(line, " (disabled)"))
             continue;
@@ -371,11 +447,19 @@ int mcpc_start(const char *path)
             fprintf(stderr, "mcp: %s\n", janas_mcp_last_error());
             continue;
         }
-        if (add_server(line, m, 0) != 0)
+        const struct janas_mcp_conf *cf = NULL;
+        for (size_t k = 0; k < n_conf; k++)
+            if (strcmp(conf[k].name, line) == 0)
+                cf = &conf[k];
+        char *id = cf ? conf_ident(cf) : NULL;
+        int rc = add_server(line, m, 0, id, cf ? cf->auto_approve : NULL);
+        free(id);
+        if (rc != 0)
             break;
         fprintf(stderr, "mcp: %s: %d tools\n", line, janas_mcp_tool_count(m));
     }
     free(list);
+    janas_mcp_config_free(conf, n_conf);
     join_tools();
     return (int)n_servers;
 }
@@ -393,28 +477,28 @@ int mcpc_start_services(void)
     *base++ = 0;
     const char *suffix = strncmp(base, "janas-chat", 10) == 0 ? base + 10 : "";
     int started = 0;
-    for (size_t i = 0; i < sizeof SERVICES / sizeof *SERVICES; i++) {
+    for (size_t i = 0; i < JANAS_N_SERVICES; i++) {
         int taken = 0; /* a server of that name configured by the user */
         for (size_t k = 0; k < n_servers; k++)
-            taken |= strcmp(servers[k].name, SERVICES[i].name) == 0;
+            taken |= strcmp(servers[k].name, JANAS_SERVICES[i].name) == 0;
         char path[4200];
         struct stat st;
         snprintf(path, sizeof path, "%s/services/janas-%s%s", self,
-                 SERVICES[i].name, suffix);
+                 JANAS_SERVICES[i].name, suffix);
         if (stat(path, &st) != 0 || !(st.st_mode & S_IXUSR))
-            snprintf(path, sizeof path, "%s/janas-%s%s", self, SERVICES[i].name,
-                     suffix);
+            snprintf(path, sizeof path, "%s/janas-%s%s", self,
+                     JANAS_SERVICES[i].name, suffix);
         if (taken || stat(path, &st) != 0 || !(st.st_mode & S_IXUSR))
             continue;
         const char *argv[] = {path};
         janas_mcp *m = NULL;
-        if (janas_mcp_open_command(SERVICES[i].name, 1, argv, 0, NULL, 20,
+        if (janas_mcp_open_command(JANAS_SERVICES[i].name, 1, argv, 0, NULL, 20,
                                    &m) != JANAS_MCP_OK) {
-            fprintf(stderr, "janas-%s: %s\n", SERVICES[i].name,
+            fprintf(stderr, "janas-%s: %s\n", JANAS_SERVICES[i].name,
                     janas_mcp_last_error());
             continue;
         }
-        if (add_server(SERVICES[i].name, m, 1) != 0)
+        if (add_server(JANAS_SERVICES[i].name, m, 1, path, NULL) != 0)
             break;
         started++;
     }
@@ -453,17 +537,18 @@ void mcpc_stop(void)
         janas_mcp_close(servers[i].m);
         free(servers[i].name);
         free(servers[i].prefix);
+        free(servers[i].ident);
+        free(servers[i].version);
+        for (char **a = servers[i].auto_ok; a && *a; a++)
+            free(*a);
+        free(servers[i].auto_ok);
     }
     free(servers);
     servers = NULL;
     n_servers = 0;
     free(tools_json);
     tools_json = NULL;
-    for (size_t i = 0; i < n_always; i++)
-        free(always[i]);
-    free(always);
-    always = NULL;
-    n_always = 0;
+    mcpc_forget_always();
 }
 
 char *mcpc_instructions(int others)
@@ -529,28 +614,227 @@ char *mcpc_instructions(int others)
     return b.p;
 }
 
+/* The server a tool (server__tool) belongs to, or NULL. */
+static const struct server *server_of(const char *tool)
+{
+    for (size_t i = 0; i < n_servers; i++)
+        if (strncmp(tool, servers[i].prefix, strlen(servers[i].prefix)) == 0)
+            return &servers[i];
+    return NULL;
+}
+
+static struct approval *find_appr(const char *name)
+{
+    const struct server *s = server_of(name);
+    for (size_t i = 0; s && i < n_appr; i++)
+        if (strcmp(appr[i].tool, name) == 0 &&
+            strcmp(appr[i].ident, s->ident) == 0 &&
+            strcmp(appr[i].version, s->version) == 0)
+            return &appr[i];
+    return NULL;
+}
+
+int mcpc_auto_approved(const char *name)
+{
+    const struct server *s = server_of(name);
+    if (!s)
+        return 0;
+    const char *t = name + strlen(s->prefix);
+    for (char **a = s->auto_ok; a && *a; a++)
+        if (strcmp(*a, t) == 0)
+            return 1;
+    return 0;
+}
+
 int mcpc_always(const char *name)
 {
-    for (size_t i = 0; i < n_always; i++)
-        if (strcmp(always[i], name) == 0)
-            return 1;
+    return mcpc_auto_approved(name) || find_appr(name) != NULL;
+}
+
+void mcpc_forget_always(void)
+{
+    for (size_t i = 0; i < n_appr; i++) {
+        free(appr[i].tool);
+        free(appr[i].ident);
+        free(appr[i].version);
+    }
+    free(appr);
+    appr = NULL;
+    n_appr = 0;
+}
+
+static int add_appr(const char *tool, const char *ident, const char *version,
+                    int64_t used)
+{
+    struct approval *g = realloc(appr, (n_appr + 1) * sizeof(*g));
+    char *t = strdup(tool), *i = strdup(ident), *v = strdup(version);
+    if (!g || !t || !i || !v) {
+        if (g)
+            appr = g;
+        free(t);
+        free(i);
+        free(v);
+        return -1;
+    }
+    appr = g;
+    appr[n_appr++] =
+        (struct approval){.tool = t, .ident = i, .version = v, .used = used};
     return 0;
 }
 
 void mcpc_set_always(const char *name)
 {
-    if (mcpc_always(name))
-        return;
-    char **g = realloc(always, (n_always + 1) * sizeof(*g));
-    char *s = strdup(name);
-    if (!g || !s) {
-        if (g)
-            always = g;
-        free(s);
-        return;
+    const struct server *s = server_of(name);
+    struct approval *a = find_appr(name);
+    if (a)
+        a->used = (int64_t)time(NULL);
+    else if (s)
+        add_appr(name, s->ident, s->version, (int64_t)time(NULL));
+}
+
+void mcpc_touch(const char *name)
+{
+    struct approval *a = find_appr(name);
+    if (a)
+        a->used = (int64_t)time(NULL);
+}
+
+int mcpc_revoke(const char *name)
+{
+    int n = 0;
+    for (size_t i = 0; i < n_appr;) {
+        if (!strcmp(name, "all") || !strcmp(appr[i].tool, name)) {
+            free(appr[i].tool);
+            free(appr[i].ident);
+            free(appr[i].version);
+            appr[i] = appr[--n_appr];
+            n++;
+        } else {
+            i++;
+        }
     }
-    always = g;
-    always[n_always++] = s;
+    return n;
+}
+
+size_t mcpc_approved(size_t i, const char **tool, int64_t *used)
+{
+    if (i < n_appr) {
+        *tool = appr[i].tool;
+        *used = appr[i].used;
+    }
+    return n_appr;
+}
+
+/* The approvals' file beside a conversation's: <file>.approvals. */
+static void appr_path(const char *chat, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s.approvals", chat);
+}
+
+/* A field without the tabs and line breaks that separate them. */
+static void put_field(FILE *f, const char *s)
+{
+    for (; *s; s++)
+        fputc(*s == '\t' || *s == '\n' || *s == '\r' ? ' ' : *s, f);
+}
+
+int mcpc_approvals_save(const char *chat)
+{
+    if (!chat || !*chat)
+        return -1;
+    char path[4200], tmp[4300];
+    appr_path(chat, path, sizeof path);
+    if (n_appr == 0) {
+        remove(path);
+        return 0;
+    }
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+#ifdef _WIN32
+    FILE *f = fopen(tmp, "wb");
+#else
+    int fd =
+        open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (fd >= 0 && !f)
+        close(fd);
+#endif
+    if (!f)
+        return -1;
+    fputs("janas-approvals 1\n", f);
+    for (size_t i = 0; i < n_appr; i++) {
+        put_field(f, appr[i].tool);
+        fputc('\t', f);
+        put_field(f, appr[i].ident);
+        fputc('\t', f);
+        put_field(f, appr[i].version);
+        fprintf(f, "\t%lld\n", (long long)appr[i].used);
+    }
+    if (fclose(f) != 0) {
+        remove(tmp);
+        return -1;
+    }
+#ifdef _WIN32
+    janas_tls_private(tmp); /* the user's alone */
+    remove(path);
+#endif
+    return rename(tmp, path) == 0 ? 0 : -1;
+}
+
+int mcpc_approvals_load(const char *chat, int64_t max_age, int *dropped)
+{
+    *dropped = 0;
+    if (!chat || !*chat || max_age == 0)
+        return 0;
+    /* only beside a conversation of the user's own folder, from a file
+       Janas wrote for this user alone: a conversation copied in from
+       elsewhere comes without approvals */
+    char dir[4096], path[4200];
+    int32_t dl = 0;
+    if (janas_llm_chats_dir(dir, sizeof dir, &dl) != JANAS_LLM_OK || dl <= 0 ||
+        strncmp(chat, dir, (size_t)dl) != 0 ||
+        (chat[dl] != '/' && chat[dl] != '\\'))
+        return 0;
+    appr_path(chat, path, sizeof path);
+#ifndef _WIN32
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 077))
+        return 0;
+#endif
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    char line[8192];
+    int got = 0;
+    int64_t now = (int64_t)time(NULL);
+    if (!fgets(line, sizeof line, f) ||
+        strncmp(line, "janas-approvals 1", 17) != 0) {
+        fclose(f);
+        return 0;
+    }
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *t = line, *id = strchr(t, '\t');
+        char *v = id ? strchr(id + 1, '\t') : NULL;
+        char *u = v ? strchr(v + 1, '\t') : NULL;
+        if (!u)
+            continue;
+        *id++ = 0;
+        *v++ = 0;
+        *u++ = 0;
+        int64_t used = strtoll(u, NULL, 10);
+        const struct server *s = server_of(t);
+        /* too old, or the server is not the one it was given to */
+        if ((max_age > 0 && now - used > max_age) || !s ||
+            strcmp(s->ident, id) || strcmp(s->version, v)) {
+            (*dropped)++;
+            continue;
+        }
+        if (add_appr(t, id, v, used) == 0)
+            got++;
+    }
+    fclose(f);
+    return got;
 }
 
 void mcpc_cancel(void)

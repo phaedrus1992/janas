@@ -67,6 +67,15 @@ static int create(struct srv_req *r, int chat)
         srv_job_release(j);
         return ret;
     }
+    char ierr[300];
+    if (srv_images_fetch(r->srv, j, ierr, sizeof ierr) != 0) {
+        ret = srv_reply_error(r, 400, "invalid_request_error", "invalid_image",
+                              "%s", ierr);
+        srv_parsed_free(&pr);
+        free(o);
+        srv_job_release(j);
+        return ret;
+    }
     o->j = j;
     o->srv = r->srv;
     o->chat = chat;

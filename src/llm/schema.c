@@ -8,9 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "schema_impl.h"
+
 #define WS_MAX 20     /* white space bytes in a row */
 #define DIGITS_MAX 20 /* digits of a number's parts */
-#define LEN_MAX 64    /* string lengths enforced up to this */
+#define LEN_MAX 4096  /* string lengths enforced up to this */
 #define ITEMS_MAX 32  /* array bounds enforced up to this */
 #define DEPTH_MAX 64  /* schemas inside schemas */
 #define NONE UINT32_MAX
@@ -511,14 +513,117 @@ static uint32_t object_rule(struct janas_jsg *j, const struct janas_json *s,
     return r;
 }
 
+/* The formats a grammar says, as expressions over the string's inside */
+static const struct {
+    const char *name, *re;
+} FORMATS[] = {
+#define DATE "[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+#define TIME                                                                   \
+    "([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\\.[0-9]{1,9})?"            \
+    "(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])"
+#define OCTET "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+#define LABEL "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+#define ATOM "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+    {"date", DATE},
+    {"time", TIME},
+    {"date-time", DATE "T" TIME},
+    {"uuid", "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+             "[0-9a-fA-F]{12}"},
+    {"email", ATOM "(\\." ATOM ")*@" LABEL "(\\." LABEL ")+"},
+    {"ipv4", OCTET "(\\." OCTET "){3}"},
+#undef DATE
+#undef TIME
+#undef OCTET
+#undef LABEL
+#undef ATOM
+};
+
+/* A string of format f, quotes included; NONE when it is not one of them. */
+static uint32_t format_rule(struct janas_jsg *j, const char *f)
+{
+    for (size_t i = 0; i < sizeof(FORMATS) / sizeof(FORMATS[0]); i++)
+        if (strcmp(f, FORMATS[i].name) == 0) {
+            uint32_t close = lit_rule(j, "\"", 1);
+            uint32_t in = janas_jsg_regex(j->b, FORMATS[i].re,
+                                          strlen(FORMATS[i].re), close);
+            if (in == NONE)
+                return NONE;
+            uint32_t r = janas_gb_rule(j->b);
+            uint32_t a = janas_gb_alt(j->b, r);
+            janas_gb_byte(j->b, a, '"');
+            janas_gb_ref(j->b, a, in);
+            return r;
+        }
+    return NONE;
+}
+
+/* The bounds of a number, NULL-free; 1 when there are any. */
+static int number_bounds(const struct janas_json *s,
+                         struct janas_jsg_bounds *bd)
+{
+    memset(bd, 0, sizeof(*bd));
+    const struct janas_json *v;
+    if ((v = janas_json_get(s, "minimum")) && v->type == JANAS_JSON_NUMBER)
+        bd->has_lo = 1, bd->lo = janas_json_num(v, 0);
+    if ((v = janas_json_get(s, "maximum")) && v->type == JANAS_JSON_NUMBER)
+        bd->has_hi = 1, bd->hi = janas_json_num(v, 0);
+    /* exclusive ones as numbers (draft 6 on); the stricter bound wins */
+    if ((v = janas_json_get(s, "exclusiveMinimum")) &&
+        v->type == JANAS_JSON_NUMBER) {
+        double x = janas_json_num(v, 0);
+        if (!bd->has_lo || x >= bd->lo)
+            bd->has_lo = 1, bd->lo = x, bd->lo_x = 1;
+    } else if (v && v->type == JANAS_JSON_TRUE && bd->has_lo) {
+        bd->lo_x = 1; /* draft 4: a flag on minimum */
+    }
+    if ((v = janas_json_get(s, "exclusiveMaximum")) &&
+        v->type == JANAS_JSON_NUMBER) {
+        double x = janas_json_num(v, 0);
+        if (!bd->has_hi || x <= bd->hi)
+            bd->has_hi = 1, bd->hi = x, bd->hi_x = 1;
+    } else if (v && v->type == JANAS_JSON_TRUE && bd->has_hi) {
+        bd->hi_x = 1;
+    }
+    if ((v = janas_json_get(s, "multipleOf")) && v->type == JANAS_JSON_NUMBER &&
+        janas_json_num(v, 0) > 0)
+        bd->has_mult = 1, bd->mult = janas_json_num(v, 0);
+    return bd->has_lo || bd->has_hi || bd->has_mult;
+}
+
 /* The schema with one type, t, of those it lists. */
 static uint32_t typed(struct janas_jsg *j, const struct janas_json *s,
                       const struct janas_json *root, const char *t)
 {
     if (strcmp(t, "string") == 0) {
+        const struct janas_json *f = janas_json_get(s, "format");
+        if (f && f->type == JANAS_JSON_STRING) {
+            uint32_t fr = format_rule(j, f->s);
+            if (fr != NONE) { /* its own length: the bounds not added */
+                if (janas_json_get(s, "minLength") ||
+                    janas_json_get(s, "maxLength") ||
+                    janas_json_get(s, "pattern"))
+                    j->relaxed++;
+                return fr;
+            }
+        }
+        const struct janas_json *pat = janas_json_get(s, "pattern");
+        if (pat && pat->type == JANAS_JSON_STRING) {
+            uint32_t close = lit_rule(j, "\"", 1);
+            uint32_t in = janas_jsg_pattern(j->b, pat->s, pat->n, close);
+            if (in != NONE) { /* the lengths not added to it */
+                if (f || janas_json_get(s, "minLength") ||
+                    janas_json_get(s, "maxLength"))
+                    j->relaxed++;
+                uint32_t r = janas_gb_rule(j->b);
+                uint32_t a = janas_gb_alt(j->b, r);
+                janas_gb_byte(j->b, a, '"');
+                janas_gb_ref(j->b, a, in);
+                return r;
+            }
+        }
         int lo = bound(s, "minLength", LEN_MAX, 0);
         int hi = bound(s, "maxLength", LEN_MAX, -1);
-        if (janas_json_get(s, "pattern") || janas_json_get(s, "format"))
+        if (pat || f)
             j->relaxed++;
         if (lo == -2 || hi == -2) {
             j->relaxed++;
@@ -533,12 +638,15 @@ static uint32_t typed(struct janas_jsg *j, const struct janas_json *s,
         return string_rule(j, lo, hi < 0 ? -1 : hi < lo ? lo : hi);
     }
     if (strcmp(t, "integer") == 0 || strcmp(t, "number") == 0) {
-        static const char *const lim[] = {"minimum", "maximum",
-                                          "exclusiveMinimum",
-                                          "exclusiveMaximum", "multipleOf"};
-        for (int i = 0; i < 5; i++)
-            if (janas_json_get(s, lim[i]))
-                j->relaxed++;
+        struct janas_jsg_bounds bd;
+        if (number_bounds(s, &bd)) {
+            uint32_t r = t[1] == 'n'
+                             ? janas_jsg_int_bounded(j->b, &bd, &j->relaxed)
+                             : janas_jsg_real_bounded(j->b, &bd, &j->relaxed);
+            if (r != NONE)
+                return r;
+            j->relaxed++; /* memory: the number unbounded */
+        }
         if (t[1] == 'n') {
             if (j->integer == NONE)
                 j->integer = number_rule(j, 0);

@@ -10,6 +10,7 @@
 #define JANAS_CHAT_MCP_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "janas/mcp.h"
 
@@ -37,6 +38,9 @@ void mcpc_defer(int on);
    of those open (mcpc_opened_tools, malloc'd JSON array, NULL: none) go
    to janas_llm_chat_tools_add. mcpc_close_services: a new conversation. */
 unsigned mcpc_opened(void);
+/* The prefix of the tools of the service opened last ("system__"), or NULL:
+   the reply after it is held to them. */
+const char *mcpc_opened_prefix(void);
 char *mcpc_opened_tools(void);
 void mcpc_close_services(void);
 
@@ -54,9 +58,36 @@ size_t mcpc_count(void);
 const char *mcpc_name(size_t i);
 janas_mcp *mcpc_server(size_t i);
 
-/* "Always" for a tool, given by the user for this session. */
+/*
+ * "Always" for a tool: given by the user with "a" in this conversation, for
+ * the server it was given to (its command or address, and the version it
+ * says it is), or in mcp.json's autoApprove for that server
+ * (mcpc_auto_approved). mcpc_set_always gives it (or marks it used, as
+ * mcpc_touch does when it runs). mcpc_forget_always forgets them all: an
+ * approval is the conversation's it was given in, never carried into
+ * another one. mcpc_revoke forgets one ("all": every one), returning how
+ * many; mcpc_approved gives approval i (its tool, when last used) and how
+ * many there are.
+ */
 int mcpc_always(const char *name);
+int mcpc_auto_approved(const char *name);
 void mcpc_set_always(const char *name);
+void mcpc_touch(const char *name);
+void mcpc_forget_always(void);
+int mcpc_revoke(const char *name);
+size_t mcpc_approved(size_t i, const char **tool, int64_t *used);
+
+/*
+ * The approvals kept beside a conversation's file (<file>.approvals, the
+ * user's alone): written as they change (0, or -1), and read when the
+ * conversation is taken up - only for a conversation of the user's own
+ * folder, from a file that is the user's alone, each approval used within
+ * max_age seconds (-1: any time; 0: none read) and given to the server
+ * still running under that name. How many were read; *dropped how many
+ * were not.
+ */
+int mcpc_approvals_save(const char *chat);
+int mcpc_approvals_load(const char *chat, int64_t max_age, int *dropped);
 
 /*
  * Runs the call name (server__tool) with args, into *text (malloc'd), the

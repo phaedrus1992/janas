@@ -6,9 +6,12 @@
  * decoding), and how often it guesses the text.
  *
  * Usage: mtp_eval <model.jns> <mtp.jns> <tokens.int32> [pos=h|pos=t]
+ *                 [cache=MiB]
  * pos=h (default): the row pairing token t_{i+1} with hidden state h_i runs
  * at position i; pos=t: at position i + 1 (row 0 then pairs t_0 with a zero
- * state).
+ * state). cache: the expert cache (20480 MiB by default). A row of hidden
+ * state is janas_llm_model_hidden_width wide: qwen4exp's is its residual's
+ * streams.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,19 +32,28 @@ int main(int argc, char **argv)
 {
     if (argc < 4) {
         fprintf(stderr, "usage: mtp_eval <model.jns> <mtp.jns> <tokens> "
-                        "[pos=h|pos=t]\n");
+                        "[pos=h|pos=t] [cache=MiB]\n");
         return 2;
     }
-    int pos_t = argc > 4 && strcmp(argv[4], "pos=t") == 0;
+    int pos_t = 0;
+    uint64_t cache_mib = 20480;
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "pos=t") == 0)
+            pos_t = 1;
+        else if (strncmp(argv[i], "cache=", 6) == 0)
+            cache_mib = strtoull(argv[i] + 6, NULL, 10);
+    }
     FILE *f = fopen(argv[3], "rb");
-    if (!f)
+    if (!f) {
+        fprintf(stderr, "cannot open %s\n", argv[3]);
         return 1;
+    }
     int32_t tok[4096];
     uint32_t n = (uint32_t)fread(tok, sizeof(int32_t), 4096, f);
     fclose(f);
     int ccpus[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     int icpus[8] = {12, 13, 14, 15, 16, 17, 18, 19};
-    struct janas_llm_options o = {.cache_bytes = 20480ull << 20,
+    struct janas_llm_options o = {.cache_bytes = cache_mib << 20,
                                   .n_ctx = n + 64,
                                   .compute_cpus = ccpus,
                                   .n_compute = 12,
@@ -54,15 +66,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s\n", err);
         return 1;
     }
-    uint32_t nv = janas_llm_model_n_vocab(m), dm = 2048, B = 64;
+    uint32_t nv = janas_llm_model_n_vocab(m),
+             dm = janas_llm_model_hidden_width(m), B = 64;
     float *logits = malloc((size_t)B * nv * sizeof(float));
     float *hid = calloc((size_t)(n + 1) * dm, sizeof(float));
     uint32_t *main_next = malloc(n * sizeof(uint32_t));
     /* main model: its choice after every position, and its hidden states */
     for (uint32_t p = 0; p < n; p += B) {
         uint32_t b = n - p < B ? n - p : B;
-        if (janas_llm_model_forward(m, tok + p, b, p, logits, 1) != 0)
+        if (janas_llm_model_forward(m, tok + p, b, p, logits, 1) != 0) {
+            fprintf(stderr, "the main model failed at position %u\n", p);
             return 1;
+        }
         for (uint32_t j = 0; j < b; j++)
             main_next[p + j] = argmax(logits + (size_t)j * nv, nv);
         memcpy(hid + (size_t)(p + 1) * dm, janas_llm_model_hidden(m),
@@ -78,8 +93,10 @@ int main(int argc, char **argv)
         uint32_t pos0 = pos_t ? r : r - 1;
         /* row k: hidden hid[r + k] = h_{r+k-1}, token t_{r+k} */
         if (janas_llm_mtp_forward(m, tok + r, hid + (size_t)r * dm, b, pos0,
-                                  logits, 1) != 0)
+                                  logits, 1) != 0) {
+            fprintf(stderr, "the MTP block failed at row %u\n", r);
             return 1;
+        }
         for (uint32_t k = 0; k < b; k++) {
             uint32_t i = r + k; /* guesses t_{i+1} */
             if (i < 1 || i + 1 >= n)

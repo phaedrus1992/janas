@@ -7,6 +7,9 @@
 // (key head g), v and the head's beta and decay -
 //   x = M[r] decay, sk = x . k, d = (v[r] - sk) beta, y = x + d k,
 //   out[r] = (y . q) scale, M[r] = y at sixteen bits.
+// The same operations, not the same bits: the dot products are summed in
+// another order (clusters of eight lanes) and packHalf2x16 rounds the state
+// as the GPU does, so the results agree with the CPU's to rounding.
 // The row stays in registers for the whole block: eight threads a row,
 // sixteen numbers each (their q and k read four at a time), sixteen rows a
 // workgroup. The state is read from the half the position buffer's word 1

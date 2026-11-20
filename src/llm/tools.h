@@ -36,6 +36,12 @@ enum janas_tool_dialect {
        tokens, answers <|tool_response>response:f{value:...}<tool_response|>
        inside the model's own turn */
     JANAS_TOOLS_GEMMA,
+    /* DeepSeek-V4's DSML: the tools as JSON lines under "## Tools" in the
+       system message, calls in a <｜DSML｜tool_calls> block of
+       <｜DSML｜invoke name="f"> with <｜DSML｜parameter name="k"
+       string="true|false"> each, answers <tool_result>...</tool_result> in
+       a user turn. ｜DSML｜ is a token of its own, the rest text */
+    JANAS_TOOLS_DSML,
 };
 
 /* The dialect of a chat template (NONE when it has no tools). */
@@ -88,6 +94,7 @@ int janas_tools_parse(enum janas_tool_dialect d, const struct janas_toolset *t,
 /* Gemma 4's call rule: the quote token <|"|> too. */
 uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
                                 const struct janas_toolset *t, int only,
+                                const char *prefix, size_t prefix_n,
                                 int32_t close, int32_t quote);
 
 /* Gemma 4: a tool's answer as its template writes it, without the opening
@@ -98,9 +105,11 @@ uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
 void janas_tools_gemma_response(struct janas_buf *out, const char *name,
                                 size_t name_n, const char *text, size_t n);
 
+/* With prefix (prefix_n bytes, 0: none), only the functions whose names
+   begin with it - all of them where none does. */
 uint32_t janas_tools_rule(struct janas_gbuild *b, struct janas_jsg *j,
                           enum janas_tool_dialect d,
                           const struct janas_toolset *t, int only,
-                          int32_t close);
+                          const char *prefix, size_t prefix_n, int32_t close);
 
 #endif

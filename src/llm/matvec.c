@@ -4,6 +4,7 @@
  * matvec.c - quantized matrix-vector product on a thread pool (see matvec.h).
  */
 #include "matvec.h"
+#include "common/sysinfo.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -44,6 +45,37 @@ static inline size_t claim(atomic_size_t *next, size_t total, size_t div,
         return total;
     *end = g0 + c < total ? g0 + c : total;
     return g0;
+}
+
+/*
+ * A chunk's rows on many vectors are taken in pieces whose weights stay in
+ * the level-2 cache while every group of eight vectors goes over them: the
+ * kernels run the groups outside and the rows inside, so a chunk larger
+ * than the cache was read from memory again for each group of eight - the
+ * whole matrix once every eight tokens of a prompt. A piece is a quarter of
+ * the cache (the rest for the vectors), a cache of 256 KB where the
+ * machine does not say. Not by default: on the laptop's Core Ultra (2 MB of
+ * L2) a chunk already fits and pieces of 128 KB cost 6% of a prompt (Qwen3-
+ * 4B, 52.9 against 56.1 tokens/s, AVX2), and on a Ryzen 5 5500 (512 KB, a
+ * prompt 2.2 times slower than llama.cpp's, issue #45) it is not measured
+ * yet. JANAS_ROW_PIECE_KB=<n> takes pieces of n KB, -1 a quarter of the
+ * L2, 0 or unset the chunk whole.
+ */
+static size_t row_piece_bytes(void)
+{
+    static _Atomic size_t bytes; /* 0: not yet known */
+    size_t b = atomic_load_explicit(&bytes, memory_order_relaxed);
+    if (b)
+        return b;
+    const char *e = getenv("JANAS_ROW_PIECE_KB");
+    if (e && atoi(e) < 0) {
+        size_t l2 = janas_l2_bytes();
+        b = (l2 ? l2 : (size_t)256 << 10) / 4;
+    } else {
+        b = e && atoi(e) > 0 ? (size_t)atoi(e) << 10 : SIZE_MAX;
+    }
+    atomic_store_explicit(&bytes, b, memory_order_relaxed);
+    return b;
 }
 
 struct matvec_job {
@@ -114,15 +146,22 @@ static void group_worker(void *arg, int tid, int n_threads)
             size_t end =
                 job->first_row[t + 1] < g1 ? job->first_row[t + 1] : g1;
             size_t nr = end - g0;
-            size_t nb = k->cols / JANAS_QK;
-            size_t row_bytes = nb * janas_qtype_block_size(k->type);
+            /* a row may end inside a group of 256 (janas_dot_rows_n) */
+            size_t nb = k->cols / JANAS_QK, tail = k->cols % JANAS_QK;
+            size_t row_bytes = janas_qtype_row_bytes(k->type, k->cols);
             const char *w0 = (const char *)k->w + r0 * row_bytes;
             size_t nv = k->n_vec ? k->n_vec : 1;
-            size_t xs = k->x_stride ? k->x_stride : nb;
+            size_t xs = k->x_stride ? k->x_stride : nb + (tail != 0);
             size_t ys = k->y_stride ? k->y_stride : k->rows;
             if (k->type == JANAS_Q6_K_P) {
                 size_t pb = nb * JANAS_Q6KP_PLANE;
-                for (size_t r = r0; r < r0 + nr; r++) {
+                /* eight rows at a time as tiles, where they serve */
+                const uint8_t *pl1 = k->plane[0], *pl0 = k->plane[1];
+                size_t r8 = janas_q6k_tile_rows(
+                    k->type, w0, row_bytes, pl1 ? pl1 + r0 * pb : NULL,
+                    pl0 ? pl0 + r0 * pb : NULL, pb, k->x, xs, nv, nb, nr,
+                    k->y + r0, ys);
+                for (size_t r = r0 + r8; r < r0 + nr; r++) {
                     const void *row = (const char *)k->w + r * row_bytes;
                     const uint8_t *p1 =
                         k->plane[0] ? (const uint8_t *)k->plane[0] + r * pb
@@ -133,12 +172,22 @@ static void group_worker(void *arg, int tid, int n_threads)
                     janas_q6kp_dot_multi(row, p1, p0, k->x, xs, nv, nb,
                                          k->y + r, ys);
                 }
+            } else if (tail && nv == 1) {
+                janas_dot_rows_n(k->type, w0, row_bytes, k->x, k->cols, nr,
+                                 k->y + r0);
+            } else if (tail) {
+                janas_dot_multi_rows_n(k->type, w0, row_bytes, k->x, xs, nv,
+                                       k->cols, nr, k->y + r0, ys);
             } else if (nv == 1) {
                 janas_dot_rows(k->type, w0, row_bytes, k->x, nb, nr, k->y + r0);
             } else {
-                for (size_t i = 0; i < nr; i++)
-                    janas_dot_multi(k->type, w0 + i * row_bytes, k->x, xs, nv,
-                                    nb, k->y + r0 + i, ys);
+                size_t piece = row_piece_bytes() / row_bytes;
+                if (nv <= 8 || piece < 1)
+                    piece = nv <= 8 ? nr : 1;
+                for (size_t i = 0; i < nr; i += piece)
+                    janas_dot_multi_rows(
+                        k->type, w0 + i * row_bytes, row_bytes, k->x, xs, nv,
+                        nb, nr - i < piece ? nr - i : piece, k->y + r0 + i, ys);
             }
             g0 = end;
         }
