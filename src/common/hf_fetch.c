@@ -79,8 +79,16 @@ static int get_url(const char *url, const int64_t *from, const int64_t *to,
                     return -1;
                 }
                 snprintf(u.path, sizeof(u.path), "%s", loc);
-            } else if (janas_url_parse(loc, &u, err, err_len) != 0) {
-                return -1;
+            } else {
+                int was_tls = u.tls;
+                if (janas_url_parse(loc, &u, err, err_len) != 0)
+                    return -1;
+                if (was_tls && !u.tls) { /* never down to clear text */
+                    snprintf(err, err_len,
+                             "%s: a redirect from HTTPS to HTTP refused",
+                             u.host);
+                    return -1;
+                }
             }
             continue;
         }

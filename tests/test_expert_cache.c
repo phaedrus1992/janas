@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "llm/expert_cache.h"
 #include "llm/jns.h"
@@ -35,6 +36,9 @@ static int failures;
     } while (0)
 
 enum { N_LAYER = 3, N_EXPERT = 8, K = 3, SLOT = 8192, SLOTS = 5 };
+/* the last layer's experts in the second file: an MTP block's, larger than
+   the model's (issue #34), whose slots apart are two of the model's */
+enum { WIDE = 12288, WIDE_SLOT = 2 * SLOT };
 
 /* Metadata region: {"test.block_count": u32 N_LAYER, "test.eps": f32 1e-6}. */
 static size_t build_metadata(uint8_t *m)
@@ -65,13 +69,24 @@ static uint32_t rnd(void)
     return (uint32_t)(rng >> 32);
 }
 
-static void fill_slot(uint8_t *p, uint32_t l, uint32_t e)
+static void fill_n(uint8_t *p, uint32_t l, uint32_t e, int n)
 {
-    for (int i = 0; i < SLOT; i++)
+    for (int i = 0; i < n; i++)
         p[i] = (uint8_t)(l * 31 + e * 7 + i);
 }
 
-static int write_file(const char *path)
+static void fill_slot(uint8_t *p, uint32_t l, uint32_t e)
+{
+    fill_n(p, l, e, SLOT);
+}
+
+/* The bytes of an expert of layer l: WIDE for the last with wide set. */
+static int expert_len(int l, int wide)
+{
+    return wide && l == N_LAYER - 1 ? WIDE : SLOT;
+}
+
+static int write_file(const char *path, int wide)
 {
     static uint8_t img[12288];
     memset(img, 0, sizeof(img));
@@ -97,30 +112,33 @@ static int write_file(const char *path)
     h.resident_offset = 8192;
     h.resident_bytes = 4096;
     h.experts_offset = 12288;
-    h.experts_bytes = (uint64_t)N_LAYER * N_EXPERT * SLOT;
+    h.experts_bytes = 0;
+    for (int l = 0; l < N_LAYER; l++)
+        h.experts_bytes += (uint64_t)N_EXPERT * expert_len(l, wide);
     h.file_bytes = h.experts_offset + h.experts_bytes;
 
-    struct janas_jns_layer ly = {.slot_bytes = SLOT,
-                                 .level_bytes = {SLOT, SLOT, SLOT}};
-    for (int m = 0; m < 3; m++)
-        ly.m[m] = (struct janas_jns_matrix){.type = 12,
-                                            .rows = 16,
-                                            .cols = 256,
-                                            .offset = (uint64_t)m * 2304,
-                                            .bytes = 2304};
-    static uint8_t slot[SLOT];
+    static uint8_t slot[WIDE];
+    /* reversed order on disk: the offset table must be honoured */
+    uint64_t off = h.experts_offset;
+    for (int i = N_LAYER * N_EXPERT - 1; i >= 0; i--) {
+        int l = i / N_EXPERT, len = expert_len(l, wide);
+        memcpy(img + h.expert_table_offset + 8 * i, &off, 8);
+        fill_n(slot, (uint32_t)l, (uint32_t)(i % N_EXPERT), len);
+        uint64_t crc = janas_crc32(0, slot, (size_t)len);
+        memcpy(img + h.expert_sums_offset + 8 * i, &crc, 8);
+        off += (uint64_t)len;
+    }
     for (int l = 0; l < N_LAYER; l++) {
+        uint64_t len = (uint64_t)expert_len(l, wide);
+        struct janas_jns_layer ly = {.slot_bytes = len,
+                                     .level_bytes = {len, len, len}};
+        for (int m = 0; m < 3; m++)
+            ly.m[m] = (struct janas_jns_matrix){.type = 12,
+                                                .rows = 16,
+                                                .cols = 256,
+                                                .offset = (uint64_t)m * 2304,
+                                                .bytes = 2304};
         memcpy(img + h.layer_table_offset + l * sizeof(ly), &ly, sizeof(ly));
-        for (int e = 0; e < N_EXPERT; e++) {
-            /* reversed order on disk: the offset table must be honoured */
-            int i = l * N_EXPERT + e;
-            uint64_t off = h.experts_offset +
-                           (uint64_t)(N_LAYER * N_EXPERT - 1 - i) * SLOT;
-            memcpy(img + h.expert_table_offset + 8 * i, &off, 8);
-            fill_slot(slot, (uint32_t)l, (uint32_t)e);
-            uint64_t crc = janas_crc32(0, slot, SLOT);
-            memcpy(img + h.expert_sums_offset + 8 * i, &crc, 8);
-        }
     }
     uint64_t s = JANAS_FNV_INIT;
     s = janas_fnv1a(img + h.layer_table_offset, layer_len, s);
@@ -135,8 +153,9 @@ static int write_file(const char *path)
         return -1;
     fwrite(img, 1, sizeof(img), f);
     for (int i = N_LAYER * N_EXPERT - 1; i >= 0; i--) {
-        fill_slot(slot, (uint32_t)(i / N_EXPERT), (uint32_t)(i % N_EXPERT));
-        fwrite(slot, 1, SLOT, f);
+        int len = expert_len(i / N_EXPERT, wide);
+        fill_n(slot, (uint32_t)(i / N_EXPERT), (uint32_t)(i % N_EXPERT), len);
+        fwrite(slot, 1, (size_t)len, f);
     }
     return fclose(f);
 }
@@ -281,7 +300,7 @@ static void check_resident(struct janas_jns *j, struct janas_pool *io)
               (unsigned long long)janas_expert_cache_loads(c));
         /* moved to memory of another's (as a GPU driver's): every expert
            where fetch says, with its bytes, in the new arena */
-        uint8_t *moved = aligned_alloc(4096, (size_t)ALL * SLOT);
+        uint8_t *moved = janas_aligned_alloc(4096, (size_t)ALL * SLOT);
         CHECK(moved && janas_expert_cache_rebase(c, moved) == 0,
               "rebase failed");
         for (uint32_t k = 0; moved && k < ALL; k++) {
@@ -296,7 +315,7 @@ static void check_resident(struct janas_jns *j, struct janas_pool *io)
         CHECK(janas_expert_cache_resident(c, &bytes, &loads) == moved,
               "resident is not the new arena");
         janas_expert_cache_destroy(c); /* not the arena: it is ours */
-        free(moved);
+        janas_aligned_free(moved);
     }
 
     /* filled in the background: never while it runs, then resident */
@@ -447,7 +466,153 @@ static void check_prefetch(struct janas_jns *j, struct janas_pool *io)
     janas_expert_cache_destroy(c);
 }
 
-static void run(const char *path, const char *how)
+/* A request on the file with the wide last layer, checked: every slot holds
+   its expert, the block's in its own slots past the model's. */
+static void ask_split(struct janas_expert_cache *c, uint32_t layer,
+                      const uint32_t *ids, int n, size_t main_slots)
+{
+    static uint8_t expect[WIDE];
+    const uint8_t *slots[K];
+    uint64_t bytes;
+    const uint8_t *a = janas_expert_cache_arena(c, &bytes);
+    int len = expert_len((int)layer, 1);
+    CHECK(janas_expert_cache_fetch(c, layer, ids, (size_t)n, slots) == 0,
+          "split: fetch of layer %u failed", layer);
+    for (int i = 0; i < n; i++) {
+        size_t at = (size_t)(slots[i] - a);
+        fill_n(expect, layer, ids[i], len);
+        CHECK(memcmp(slots[i], expect, (size_t)len) == 0,
+              "split: layer %u expert %u has the wrong bytes", layer, ids[i]);
+        /* the model's slots first, the block's after them, each starting
+           where one of the model's would (a GPU cuts the arena so) */
+        CHECK(at % SLOT == 0 && at + (size_t)len <= bytes, "split: slot at %zu",
+              at);
+        CHECK((layer == N_LAYER - 1) == (at >= main_slots * SLOT),
+              "split: layer %u in the other part's slots (%zu)", layer, at);
+    }
+}
+
+/*
+ * The last layer as an MTP block whose experts are larger than the
+ * model's: slots apart, out of the same budget, only where that holds more
+ * experts; every byte where fetch says, the counts of both together, the
+ * arena whole for a GPU.
+ */
+static void check_split(const char *path, struct janas_pool *io)
+{
+    enum { MAIN = (N_LAYER - 1) * N_EXPERT, ALL = N_LAYER * N_EXPERT };
+    const uint64_t room =
+        (uint64_t)MAIN * SLOT + (uint64_t)N_EXPERT * WIDE_SLOT;
+    struct janas_jns j;
+    char err[256];
+    CHECK(janas_jns_open(path, &j, err, sizeof(err)) == 0, "open: %s", err);
+    CHECK(janas_expert_cache_room(&j, 0, N_LAYER - 1, 3) == room,
+          "room %llu, expected %llu",
+          (unsigned long long)janas_expert_cache_room(&j, 0, N_LAYER - 1, 3),
+          (unsigned long long)room);
+    CHECK(janas_expert_cache_room(&j, 0, 0, 3) == (uint64_t)ALL * WIDE,
+          "room of one size for all");
+    CHECK(janas_expert_cache_room(&j, N_LAYER - 1, N_LAYER - 1, 3) ==
+              (uint64_t)MAIN * SLOT,
+          "room of the model's layers alone");
+
+    /* a budget where slots apart do not pay (13 experts against 14): one
+       size for all, as janas_expert_cache_create makes it */
+    uint64_t small = 5 * SLOT + (uint64_t)N_EXPERT * WIDE_SLOT;
+    struct janas_expert_cache *c = janas_expert_cache_create_split(
+        &j, 0, N_LAYER - 1, small, 3, io, err, sizeof(err));
+    CHECK(c != NULL, "create_split (small): %s", err);
+    if (c) {
+        CHECK(janas_expert_cache_slots(c) == small / WIDE &&
+                  janas_expert_cache_slot_bytes(c) == WIDE,
+              "small budget: %zu slots of %llu", janas_expert_cache_slots(c),
+              (unsigned long long)janas_expert_cache_slot_bytes(c));
+        janas_expert_cache_destroy(c);
+    }
+
+    /* ten of the model's slots and the block's apart: 18 experts, not 17 */
+    size_t ms = 10;
+    uint64_t budget = ms * SLOT + (uint64_t)N_EXPERT * WIDE_SLOT;
+    c = janas_expert_cache_create_split(&j, 0, N_LAYER - 1, budget, 3, io, err,
+                                        sizeof(err));
+    CHECK(c != NULL, "create_split: %s", err);
+    if (!c) {
+        janas_jns_close(&j);
+        return;
+    }
+    uint64_t bytes = 0, loads = 0;
+    janas_expert_cache_arena(c, &bytes);
+    CHECK(janas_expert_cache_slots(c) == ms &&
+              janas_expert_cache_slot_bytes(c) == SLOT,
+          "split: %zu slots of %llu", janas_expert_cache_slots(c),
+          (unsigned long long)janas_expert_cache_slot_bytes(c));
+    CHECK(bytes == budget + JANAS_ARENA_GUARD, "split: arena of %llu bytes",
+          (unsigned long long)bytes);
+    uint64_t asked = 0;
+    for (int iter = 0; iter < 600; iter++) {
+        uint32_t layer = rnd() % N_LAYER, ids[K];
+        for (int i = 0; i < K; i++)
+            ids[i] = (rnd() % (N_EXPERT / K)) * K + (uint32_t)i; /* distinct */
+        ask_split(c, layer, ids, K, ms);
+        asked += K;
+    }
+    struct janas_expert_cache_stats st;
+    janas_expert_cache_stats(c, &st);
+    CHECK(st.requests == asked && st.hits + st.misses == asked,
+          "split stats: %llu requests (%llu asked), %llu hits, %llu misses",
+          (unsigned long long)st.requests, (unsigned long long)asked,
+          (unsigned long long)st.hits, (unsigned long long)st.misses);
+    /* one request at a time, whichever part it is for */
+    uint32_t e0 = 0;
+    const uint8_t *slot;
+    uint8_t ready, in[2];
+    CHECK(janas_expert_cache_begin(c, N_LAYER - 1, &e0, 1, &slot, &ready) >= 0,
+          "split: begin on the block");
+    CHECK(janas_expert_cache_begin(c, 0, &e0, 1, &slot, &ready) < 0,
+          "split: a second request while the block's is out");
+    CHECK(janas_expert_cache_finish(c) == 0, "split: finish");
+    uint32_t q[2] = {0, 1};
+    janas_expert_cache_present(c, N_LAYER - 1, q, 2, in);
+    CHECK(in[0] == 1, "split: the block's expert 0 not present");
+    CHECK(janas_expert_cache_resident(c, &bytes, &loads) == NULL,
+          "split: resident without room for every expert");
+    janas_expert_cache_reset_stats(c);
+    janas_expert_cache_stats(c, &st);
+    CHECK(st.requests == 0, "split: stats not reset");
+    janas_expert_cache_destroy(c);
+
+    /* room for every expert: resident once all are in, then moved whole */
+    c = janas_expert_cache_create_split(&j, 0, N_LAYER - 1, room, 3, io, err,
+                                        sizeof(err));
+    CHECK(c != NULL, "create_split (all): %s", err);
+    if (c) {
+        CHECK(janas_expert_cache_slots(c) == MAIN, "all: %zu slots",
+              janas_expert_cache_slots(c));
+        for (uint32_t k = 0; k < ALL; k++) {
+            uint32_t e = k % N_EXPERT;
+            ask_split(c, k / N_EXPERT, &e, 1, MAIN);
+        }
+        const uint8_t *a = janas_expert_cache_resident(c, &bytes, &loads);
+        CHECK(a != NULL && bytes == room + JANAS_ARENA_GUARD && loads == ALL,
+              "all: resident %p, %llu bytes, %llu loads", (const void *)a,
+              (unsigned long long)bytes, (unsigned long long)loads);
+        uint8_t *moved = janas_aligned_alloc(4096, room + JANAS_ARENA_GUARD);
+        CHECK(moved && janas_expert_cache_rebase(c, moved) == 0,
+              "all: rebase failed");
+        for (uint32_t k = 0; moved && k < ALL; k++) {
+            uint32_t e = k % N_EXPERT;
+            ask_split(c, k / N_EXPERT, &e, 1, MAIN);
+        }
+        CHECK(janas_expert_cache_resident(c, &bytes, &loads) == moved &&
+                  janas_expert_cache_loads(c) == ALL,
+              "all: not resident in the new arena");
+        janas_expert_cache_destroy(c);
+        janas_aligned_free(moved);
+    }
+    janas_jns_close(&j);
+}
+
+static void run(const char *path, const char *split_path, const char *how)
 {
     rng = 0x9E3779B97F4A7C15ull;
     struct janas_jns j;
@@ -464,6 +629,19 @@ static void run(const char *path, const char *how)
     }
     CHECK(janas_expert_cache_slots(c) == SLOTS, "slots %zu",
           janas_expert_cache_slots(c));
+    /* experts all of one size: create_split is create */
+    {
+        struct janas_expert_cache *u = janas_expert_cache_create_split(
+            &j, 0, N_LAYER - 1, (uint64_t)SLOTS * SLOT, 3, io, err,
+            sizeof(err));
+        CHECK(u && janas_expert_cache_slots(u) == SLOTS &&
+                  janas_expert_cache_slot_bytes(u) == SLOT,
+              "create_split on one size: %s", u ? "other slots" : err);
+        janas_expert_cache_destroy(u);
+        CHECK(janas_expert_cache_room(&j, 0, N_LAYER - 1, 3) ==
+                  (uint64_t)N_LAYER * N_EXPERT * SLOT,
+              "room on one size");
+    }
 
     struct model m = {.cur_layer = 0};
     for (int s = 0; s < SLOTS; s++)
@@ -576,6 +754,7 @@ static void run(const char *path, const char *how)
     janas_expert_cache_destroy(c);
     check_prefetch(&j, io);
     check_resident(&j, io);
+    check_split(split_path, io);
     janas_pool_destroy(io);
     janas_jns_close(&j);
     printf("test_expert_cache (%s): %llu requests, %llu hits (model %llu)\n",
@@ -587,11 +766,13 @@ int main(void)
 {
     /* a test that deadlocks must fail, not hold the suite for ever */
     alarm(600);
-    char path[512];
+    char path[512], split[512];
     const char *dir = getenv("TMPDIR");
     snprintf(path, sizeof(path), "%s/janas_test_cache_%d.jns",
              dir && *dir ? dir : "/var/tmp", (int)getpid());
-    if (write_file(path) != 0) {
+    snprintf(split, sizeof(split), "%s/janas_test_cache_%d_mtp.jns",
+             dir && *dir ? dir : "/var/tmp", (int)getpid());
+    if (write_file(path, 0) != 0 || write_file(split, 1) != 0) {
         fprintf(stderr,
                 "cannot write %s: set TMPDIR to a writable directory on a "
                 "disk (O_DIRECT does not work on tmpfs)\n",
@@ -602,13 +783,14 @@ int main(void)
        and the pool of threads, which is what runs where it has not */
     unsetenv("JANAS_URING");
     unsetenv("JANAS_URING_BATCH");
-    run(path, "io_uring if available");
+    run(path, split, "io_uring if available");
     setenv("JANAS_URING_BATCH", "1", 1); /* some batches each way */
-    run(path, "both ways");
+    run(path, split, "both ways");
     unsetenv("JANAS_URING_BATCH");
     setenv("JANAS_URING", "0", 1);
-    run(path, "thread pool");
+    run(path, split, "thread pool");
     unlink(path);
+    unlink(split);
     printf("test_expert_cache: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

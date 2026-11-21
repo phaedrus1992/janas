@@ -1,0 +1,77 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// dense_mm.comp's products (weights left as they are, f32 (KIND 0), bf16
+// (1) or Q8_0 (2), on float vectors) for a few vectors: a workgroup a row
+// and VW vectors (the second dimension), its 64 invocations each a stride
+// of the columns, the sums added up in shared memory. dense_mm's tiles of
+// 64 rows by 64 vectors left a router's 129 rows on one token 3
+// workgroups, its 2048 columns 128 steps of a barrier each (1.1 ms a
+// layer on the laptop's Arc, 24 Oct 2026). y[v * ys + r] = scale x the dot
+// product of row r with vector v (vectors cols floats apart). NOT bit for
+// bit with the CPU: summed in another order.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 8; // unused
+layout(constant_id = 1) const uint SG = 8; // unused
+layout(constant_id = 2) const uint KIND = 0;
+
+const uint VW = 4u;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F1 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FO { float v[]; };
+
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, cols, nv, ys; float scale; } p;
+
+shared float red[64 * VW];
+
+// weight k of row r
+float wt(uint r, uint k)
+{
+    uint i = r * p.cols + k;
+    if (KIND == 0u)
+        return F1(p.w).v[i];
+    if (KIND == 2u) {
+        /* the block's first byte: its scale, then its quants */
+        uint b = (r * (p.cols / 32u) + k / 32u) * 34u;
+        U1 W = U1(p.w);
+        uint dw = W.v[b >> 2];
+        float d = unpackHalf2x16((b & 2u) != 0u ? dw >> 16 : dw & 0xffffu).x;
+        uint qb = b + 2u + k % 32u;
+        int q = bitfieldExtract(int(W.v[qb >> 2]), int(8u * (qb & 3u)), 8);
+        return d * float(q);
+    }
+    uint u = U1(p.w).v[i >> 1];
+    return uintBitsToFloat((i & 1u) != 0u ? u & 0xffff0000u : u << 16);
+}
+
+void main()
+{
+    F1 X = F1(p.x);
+    FO Y = FO(p.y);
+    uint id = gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.x, v0 = gl_WorkGroupID.y * VW;
+    uint nv = min(p.nv - v0, VW);
+    float acc[VW];
+    [[unroll]] for (uint j = 0; j < VW; j++) acc[j] = 0.0;
+    for (uint k = id; k < p.cols; k += 64u) {
+        float w = wt(r, k);
+        [[unroll]] for (uint j = 0; j < VW; j++)
+            if (j < nv)
+                acc[j] += w * X.v[(v0 + j) * p.cols + k];
+    }
+    [[unroll]] for (uint j = 0; j < VW; j++) red[j * 64u + id] = acc[j];
+    barrier();
+    [[unroll]] for (uint s = 32u; s > 0u; s >>= 1) {
+        if (id < s)
+            [[unroll]] for (uint j = 0; j < VW; j++)
+                red[j * 64u + id] += red[j * 64u + id + s];
+        barrier();
+    }
+    if (id < nv)
+        Y.v[(v0 + id) * p.ys + r] = red[id * 64u] * p.scale;
+}
