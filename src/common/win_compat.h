@@ -97,6 +97,15 @@ int janas_remove(const char *path);
    and "C:/Users" too */
 int janas_mkdir(const char *path);
 #define mkdir(path, mode) janas_mkdir(path)
+/* no symbolic links to follow: lstat is stat, and nothing is one */
+#define lstat stat
+#ifndef S_ISLNK
+#define S_ISLNK(m) 0
+#endif
+/* a file's data written out (msvcrt's _commit); modes are POSIX's only */
+int janas_fsync(int fd);
+#define fsync janas_fsync
+#define fchmod(fd, mode) ((void)(fd), (void)(mode), 0)
 
 /* advisory locks on a whole file */
 #define LOCK_SH 1
@@ -114,17 +123,9 @@ int janas_flock(int fd, int op);
 long janas_sysconf(int name);
 #define sysconf janas_sysconf
 
-/* Aligned memory that free() takes back, as POSIX's: MinGW's own
-   (_aligned_malloc) wants _aligned_free, and code that frees aligned and
-   ordinary blocks alike would have to know which is which. A block is
-   malloc's, with a tag before the address returned that says where it
-   began; free() looks for the tag (win_compat.c). */
-void *janas_aligned_alloc(size_t align, size_t size);
-int janas_posix_memalign(void **p, size_t align, size_t size);
-void janas_free(void *p);
-#define aligned_alloc janas_aligned_alloc
-#define posix_memalign janas_posix_memalign
-#define free janas_free
+/* No aligned_alloc nor posix_memalign: janas_aligned_alloc and
+   janas_aligned_free (common/aligned.h), so that free() never has to tell
+   an aligned block from an ordinary one. */
 
 /* a line of any length, as POSIX's getline */
 ssize_t janas_getline(char **line, size_t *cap, FILE *f);

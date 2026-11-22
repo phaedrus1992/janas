@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     Copyright (C) 2026 Maurizio Cammalleri -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Janas-LLM in Node.js</title>
+<link rel="stylesheet" href="/style.css">
+<script type="module" src="/app/web/app.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">J</span>
+    <div>
+      <div id="model-name" class="name">…</div>
+      <div id="model-desc" class="desc">the model is opening</div>
+    </div>
+  </div>
+  <button id="new" type="button" class="ghost">New chat</button>
+</header>
+
+<main id="log" aria-live="polite"></main>
+
+<footer>
+  <details id="settings">
+    <summary>Settings</summary>
+    <label for="system">System message</label>
+    <textarea id="system" rows="3"></textarea>
+    <div class="row">
+      <label id="thinking-row" hidden><input id="thinking" type="checkbox"> reasoning before the answer</label>
+      <label>temperature
+        <input id="temperature" type="range" min="0" max="1.5" step="0.1" value="0.7">
+        <output id="temperature-value"></output>
+      </label>
+    </div>
+  </details>
+  <div class="composer">
+    <textarea id="input" rows="2" placeholder="Write a message (Enter sends, Shift+Enter a new line)"></textarea>
+    <button id="send" type="button">Send</button>
+    <button id="stop" type="button" class="ghost" hidden>Stop</button>
+  </div>
+  <div id="versions" class="versions"></div>
+</footer>
+</body>
+</html>

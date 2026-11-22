@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/aligned.h"
 #include "llm/gpu.h"
 #include "llm/quant.h"
 #include "llm/vmath.h"
@@ -67,7 +68,7 @@ int main(void)
                dq6 = d * ff / JANAS_QK * 210 + 4;
         size_t per = gub * 2 + (dq4 > dq6 ? dq4 : dq6);
         size_t bytes = (n * ((per + 255) / 256 * 256) + 4095) / 4096 * 4096;
-        uint8_t *w = aligned_alloc(4096, bytes);
+        uint8_t *w = janas_aligned_alloc(4096, bytes);
         memset(w, 0, bytes);
         struct janas_gpu_expert e[16];
         for (size_t i = 0; i < n; i++) {

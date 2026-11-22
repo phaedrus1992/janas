@@ -3,7 +3,8 @@
 /*
  * hf2jns_mtp.c - the multi-token prediction (MTP) block of Qwen3-Next, or of
  * a dense Qwen3.5, from the original safetensors checkpoint into a one-layer
- * JNS file.
+ * JNS file; or the block of a GGUF draft head (unsloth's MTP files of
+ * Qwen3.8-Flash-Next, qwen4exp), copied as it is.
  *
  * GGUF conversions of these models drop the MTP block; the checkpoint keeps
  * it under mtp.* (bf16). This tool quantizes the matrices to Q4_K with
@@ -26,13 +27,23 @@
  *
  * Usage: hf2jns_mtp <main.jns> <shard.safetensors>... <out.jns>
  *        hf2jns_mtp <main.jns> hf:<owner>/<repo>[@revision] <out.jns>
+ *        hf2jns_mtp <main.jns> <head.gguf> <out.jns>
  * The block may be spread over several shards: give every one that has a
  * part of it (or one file holding just the block's tensors). With hf: the
  * block's tensors alone are read from the repository on Hugging Face, with
  * range requests - Qwen3.5-9B's 487 MB instead of its 14 GB of shards -
  * into <out.jns>.mtp.safetensors, deleted once converted.
+ *
+ * A GGUF head holds the block as its last one (block_count less
+ * nextn_predict_layers, the trunk's blocks absent): its tensors are copied
+ * in their types, blk.N.* as blk.0.* and blk.N.nextn.* as mtp.*, its
+ * experts' three-dimensional tensors cut into the slots; its token
+ * embeddings and output head left out - the engine takes the main model's,
+ * as the head's "shared" files do. Its norms are the GGUF's, already in
+ * their effective form.
  */
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,6 +53,7 @@
 
 #include "common/hf_fetch.h"
 #include "common/pool.h"
+#include "llm/gguf.h"
 #include "llm/jns.h"
 #include "llm/quant.h"
 
@@ -64,7 +76,7 @@ static _Noreturn void die(const char *msg, const char *arg)
 struct st_file {
     FILE *f;
     char *json;
-    uint64_t data_start;
+    uint64_t data_start, size; /* size: of the file */
 };
 
 struct st_tensor {
@@ -84,6 +96,9 @@ static void st_open(struct st_file *s, const char *path)
         die("cannot read the header of", path);
     s->json[n] = 0;
     s->data_start = 8 + n;
+    if (fseeko(s->f, 0, SEEK_END) != 0 || ftello(s->f) < (off_t)s->data_start)
+        die("cannot read", path);
+    s->size = (uint64_t)ftello(s->f);
 }
 
 /* Parses the entry of one tensor: {"dtype":"BF16","shape":[..],
@@ -106,22 +121,36 @@ static int st_find(const struct st_file *s, const char *name,
     if (!dt || !sh || !of || dt > end || sh > end || of > end ||
         !strstr(dt, "\"BF16\"") || strstr(dt, "\"BF16\"") > end)
         return -1;
+    /* what the file says is input: every field inside the entry, a shape
+       of one to four numbers, the data inside the file */
     sh = strchr(sh, '[');
+    of = strchr(of, '[');
+    if (!sh || !of || sh > end || of > end)
+        return -1;
     t->dims = 0;
-    for (const char *q = sh + 1; *q && *q != ']' && t->dims < 4;) {
+    const char *q = sh + 1;
+    while (*q == ' ')
+        q++;
+    while (*q >= '0' && *q <= '9' && t->dims < 4) {
         t->shape[t->dims++] = strtoull(q, (char **)&q, 10);
         while (*q == ',' || *q == ' ')
             q++;
     }
-    of = strchr(of, '[');
-    char *q;
-    t->begin = strtoull(of + 1, &q, 10);
-    while (*q == ',' || *q == ' ')
-        q++;
-    t->end = strtoull(q, NULL, 10);
+    if (*q != ']' || t->dims == 0)
+        return -1;
+    char *r;
+    t->begin = strtoull(of + 1, &r, 10);
+    while (*r == ',' || *r == ' ')
+        r++;
+    t->end = strtoull(r, NULL, 10);
     uint64_t count = 1;
     for (int i = 0; i < t->dims; i++)
-        count *= t->shape[i];
+        if (t->shape[i] == 0 ||
+            __builtin_mul_overflow(count, t->shape[i], &count))
+            return -1;
+    if (count > UINT64_MAX / 2 || t->end < t->begin ||
+        t->end > s->size - s->data_start)
+        return -1;
     return t->end - t->begin == 2 * count ? 0 : -1;
 }
 
@@ -204,6 +233,10 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
     struct st_tensor t;
     uint64_t n;
     float *x = st_load(src, &n, &t);
+    if (t.dims > 2)
+        die("a tensor of more than two dimensions", src);
+    if (n_outs == (int)(sizeof(outs) / sizeof(outs[0])))
+        die("too many tensors in the block", src);
     struct out_tensor *o = &outs[n_outs++];
     snprintf(o->name, sizeof(o->name), "%s", dst);
     o->type = kind;
@@ -216,6 +249,8 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
         o->data = to_q4k(pool, x, o->dims[1], o->dims[0], &o->bytes);
     } else if (kind == T_F16) {
         uint16_t *h = malloc(n * 2);
+        if (!h)
+            die("out of memory", NULL);
         for (uint64_t i = 0; i < n; i++)
             h[i] = janas_fp32_to_fp16(x[i]);
         o->data = (uint8_t *)h;
@@ -225,6 +260,8 @@ static void add(struct janas_pool *pool, const char *src, const char *dst,
             for (uint64_t i = 0; i < n; i++)
                 x[i] += 1.0f;
         o->data = malloc(n * 4);
+        if (!o->data)
+            die("out of memory", NULL);
         memcpy(o->data, x, n * 4);
         o->bytes = n * 4;
     }
@@ -252,47 +289,136 @@ static int shape_of(const char *name, struct st_tensor *t)
     return 0;
 }
 
-int main(int argc, char **argv)
-{
-    if (argc < 4 || argc - 3 > (int)(sizeof(shards) / sizeof(shards[0]))) {
-        fprintf(stderr, "usage: hf2jns_mtp <main.jns> <shard.safetensors>... "
-                        "<out.jns>\n");
-        return 2;
-    }
-    const char *out_path = argv[argc - 1];
-    struct janas_jns main_j;
-    char err[256];
-    if (janas_jns_open(argv[1], &main_j, err, sizeof(err)) != 0)
-        die(err, argv[1]);
-    char fetched[4096] = "";
-    for (int i = 2; i < argc - 1; i++) {
-        if (strncmp(argv[i], "hf:", 3) == 0) {
-            if (*fetched)
-                die("one hf: repository at a time", argv[i]);
-            char repo[512], *rev;
-            snprintf(repo, sizeof(repo), "%s", argv[i] + 3);
-            if ((rev = strchr(repo, '@')))
-                *rev++ = 0;
-            snprintf(fetched, sizeof(fetched), "%s.mtp.safetensors", out_path);
-            if (janas_hf_fetch_tensors(repo, rev, "mtp.", fetched, err,
-                                       sizeof(err)) < 0) {
-                remove(fetched);
-                die(err, NULL);
-            }
-            st_open(&shards[n_shards++], fetched);
-        } else {
-            st_open(&shards[n_shards++], argv[i]);
-        }
-    }
-    /* a dense model is one expert a layer with no router (gguf2jns) */
-    const uint32_t n_exp = (uint32_t)main_j.h.n_expert;
-    const int dense = n_exp == 1;
-    int cpus[64], nt = 12;
-    for (int i = 0; i < nt; i++)
-        cpus[i] = i;
-    struct janas_pool *pool = janas_pool_create(nt, cpus);
+/* ---- a GGUF draft head: its last block as it is ---- */
 
-    const char *L = "mtp.layers.0.";
+static struct janas_gguf head_g;
+static int head_fd = -1;
+/* the experts' tensors: gate, up, down */
+static const struct janas_gguf_tensor *head_exp[3];
+
+static void gguf_read(uint64_t at, void *dst, uint64_t n, const char *what)
+{
+    for (uint64_t done = 0; done < n;) {
+        ssize_t r =
+            pread(head_fd, (uint8_t *)dst + done, n - done, (off_t)(at + done));
+        if (r <= 0)
+            die("cannot read", what);
+        done += (uint64_t)r;
+    }
+}
+
+/* The block's tensors into outs (the experts' apart), the slot's shape into
+   ly; the main model's experts and width must be the head's. */
+static void gguf_collect(const struct janas_jns *main_j, const char *path,
+                         struct janas_jns_layer *ly)
+{
+    char err[256], key[128], name[128];
+    if (janas_gguf_open(path, &head_g, err, sizeof(err)) != 0)
+        die(err, path);
+    head_fd = open(path, O_RDONLY);
+    if (head_fd < 0)
+        die("cannot open", path);
+    struct janas_gguf_str a;
+    if (janas_gguf_string(&head_g, "general.architecture", &a) != 0 ||
+        a.n != strnlen(main_j->h.arch, sizeof(main_j->h.arch)) ||
+        memcmp(a.p, main_j->h.arch, a.n) != 0)
+        die("not a head of the main model's architecture", path);
+    uint64_t blocks = 0, nextn = 0;
+    snprintf(key, sizeof(key), "%.32s.block_count", main_j->h.arch);
+    janas_gguf_uint(&head_g, key, &blocks);
+    snprintf(key, sizeof(key), "%.32s.nextn_predict_layers", main_j->h.arch);
+    janas_gguf_uint(&head_g, key, &nextn);
+    if (nextn != 1 || blocks < 2)
+        die("not a head of one prediction block", path);
+    uint64_t blk = blocks - nextn;
+    char pre[32], nx[48];
+    snprintf(pre, sizeof(pre), "blk.%llu.", (unsigned long long)blk);
+    snprintf(nx, sizeof(nx), "%snextn.", pre);
+    static const char *const ex[3] = {
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
+    for (uint64_t i = 0; i < head_g.n_tensors; i++) {
+        const struct janas_gguf_tensor *t = &head_g.t[i];
+        if (t->name.n >= sizeof(name))
+            continue;
+        memcpy(name, t->name.p, t->name.n);
+        name[t->name.n] = 0;
+        if (strncmp(name, pre, strlen(pre)) != 0)
+            continue; /* token_embd, output: the main model's */
+        int e = -1;
+        for (int p = 0; p < 3; p++)
+            if (!strcmp(name + strlen(pre), ex[p]))
+                e = p;
+        if (e >= 0) {
+            head_exp[e] = t;
+            continue;
+        }
+        if (n_outs == (int)(sizeof(outs) / sizeof(outs[0])))
+            die("too many tensors in the block", path);
+        struct out_tensor *o = &outs[n_outs++];
+        if (!strncmp(name, nx, strlen(nx)))
+            snprintf(o->name, sizeof(o->name), "mtp.%s", name + strlen(nx));
+        else
+            snprintf(o->name, sizeof(o->name), "blk.0.%s", name + strlen(pre));
+        o->type = t->type;
+        o->n_dims = t->n_dims;
+        for (int d = 0; d < 4; d++)
+            o->dims[d] = d < (int)t->n_dims ? t->dims[d] : 1;
+        o->bytes = t->bytes;
+        o->data = malloc(t->bytes);
+        if (!o->data)
+            die("out of memory", NULL);
+        gguf_read(head_g.data_start + t->offset, o->data, t->bytes, name);
+        printf("  %-34s <- %s\n", o->name, name);
+    }
+    uint64_t off = 0;
+    for (int p = 0; p < 3; p++) {
+        const struct janas_gguf_tensor *t = head_exp[p];
+        if (!t || t->n_dims != 3 || t->dims[2] != main_j->h.n_expert)
+            die("experts missing or not as many as the main model's", ex[p]);
+        uint64_t per = t->bytes / t->dims[2];
+        if (per * t->dims[2] != t->bytes ||
+            janas_qtype_row_bytes((int)t->type, t->dims[0]) * t->dims[1] != per)
+            die("experts of an unexpected size", ex[p]);
+        off = align_up(off, MATRIX_ALIGN);
+        ly->m[p] = (struct janas_jns_matrix){.type = t->type,
+                                             .rows = (uint32_t)t->dims[1],
+                                             .cols = (uint32_t)t->dims[0],
+                                             .offset = off,
+                                             .bytes = per};
+        off += per;
+    }
+    if (ly->m[0].cols != main_j->h.d_model ||
+        ly->m[2].rows != main_j->h.d_model)
+        die("experts of another width than the main model's", path);
+    ly->slot_bytes = align_up(off, JANAS_JNS_ALIGN);
+    for (int i = 0; i < 3; i++)
+        ly->level_bytes[i] = ly->slot_bytes;
+}
+
+/* expert e's slot from the head's three tensors */
+static void gguf_slot(const struct janas_jns_layer *ly, uint32_t e,
+                      uint8_t *slot)
+{
+    for (int p = 0; p < 3; p++)
+        gguf_read(head_g.data_start + head_exp[p]->offset + e * ly->m[p].bytes,
+                  slot + ly->m[p].offset, ly->m[p].bytes, "an expert");
+}
+
+/* ---- a safetensors checkpoint: quantized here ---- */
+
+static struct janas_pool *ckpt_pool;
+static int ckpt_dense;
+static const char *const ckpt_parts[3] = {"gate_proj", "up_proj", "down_proj"};
+#define CKPT_LAYER "mtp.layers.0."
+
+static void ckpt_collect(const struct janas_jns *main_j,
+                         struct janas_jns_layer *ly)
+{
+    /* a dense model is one expert a layer with no router (gguf2jns) */
+    const uint32_t n_exp = (uint32_t)main_j->h.n_expert;
+    const int dense = ckpt_dense = n_exp == 1;
+    struct janas_pool *pool = ckpt_pool;
+    const char *L = CKPT_LAYER;
     char a[160];
 #define SRC(x) (snprintf(a, sizeof(a), "%s%s", L, x), a)
     add(pool, SRC("input_layernorm.weight"), "blk.0.attn_norm.weight", T_F32,
@@ -328,13 +454,11 @@ int main(int argc, char **argv)
     /* expert slot: gate, up, down in Q4_K, shaped as the checkpoint's first
        expert (Qwen3-Next: 512 x 2048, 512 x 2048, 2048 x 512), or as its
        dense feed-forward */
-    struct janas_jns_layer ly = {0};
     uint64_t off = 0;
-    const char *parts[3] = {"gate_proj", "up_proj", "down_proj"};
     uint32_t rows[3], cols[3];
     for (int p = 0; p < 3; p++) {
         char nm[160];
-        slot_name(nm, sizeof(nm), L, dense, 0, parts[p]);
+        slot_name(nm, sizeof(nm), L, dense, 0, ckpt_parts[p]);
         struct st_tensor t;
         if (n_shards == 0 || !shape_of(nm, &t) || t.dims != 2)
             die("feed-forward matrix missing or not 2-D", nm);
@@ -343,20 +467,91 @@ int main(int argc, char **argv)
     }
     for (int p = 0; p < 3; p++) {
         off = align_up(off, MATRIX_ALIGN);
-        ly.m[p] = (struct janas_jns_matrix){
+        ly->m[p] = (struct janas_jns_matrix){
             .type = JANAS_Q4_K,
             .rows = rows[p],
             .cols = cols[p],
             .offset = off,
             .bytes = (uint64_t)rows[p] * cols[p] / JANAS_QK *
                      sizeof(struct janas_block_q4k)};
-        off += ly.m[p].bytes;
+        off += ly->m[p].bytes;
     }
-    ly.slot_bytes = align_up(off, JANAS_JNS_ALIGN);
+    ly->slot_bytes = align_up(off, JANAS_JNS_ALIGN);
     /* no bit planes: the three levels of a version 3 slot are all of it
        (left at zero, the file was refused: issue #6) */
     for (int i = 0; i < 3; i++)
-        ly.level_bytes[i] = ly.slot_bytes;
+        ly->level_bytes[i] = ly->slot_bytes;
+#undef SRC
+}
+
+/* expert e's slot, quantized from the checkpoint */
+static void ckpt_slot(const struct janas_jns_layer *ly, uint32_t e,
+                      uint8_t *slot)
+{
+    for (int p = 0; p < 3; p++) {
+        char nm[160];
+        slot_name(nm, sizeof(nm), CKPT_LAYER, ckpt_dense, e, ckpt_parts[p]);
+        struct st_tensor t;
+        uint64_t n, bytes;
+        float *x = st_load(nm, &n, &t);
+        if (t.dims != 2 || t.shape[0] != ly->m[p].rows ||
+            t.shape[1] != ly->m[p].cols)
+            die("unexpected expert shape", nm);
+        uint8_t *q = to_q4k(ckpt_pool, x, ly->m[p].rows, ly->m[p].cols, &bytes);
+        memcpy(slot + ly->m[p].offset, q, bytes);
+        free(q);
+        free(x);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 4 || argc - 3 > (int)(sizeof(shards) / sizeof(shards[0]))) {
+        fprintf(stderr, "usage: hf2jns_mtp <main.jns> <shard.safetensors>... "
+                        "<out.jns>\n"
+                        "       hf2jns_mtp <main.jns> <head.gguf> <out.jns>\n");
+        return 2;
+    }
+    const char *out_path = argv[argc - 1];
+    struct janas_jns main_j;
+    char err[256];
+    if (janas_jns_open(argv[1], &main_j, err, sizeof(err)) != 0)
+        die(err, argv[1]);
+    const uint32_t n_exp = (uint32_t)main_j.h.n_expert;
+    size_t la = strlen(argv[2]);
+    int gguf = argc == 4 && la > 5 && !strcmp(argv[2] + la - 5, ".gguf");
+    char fetched[4096] = "";
+    struct janas_jns_layer ly = {0};
+    struct janas_pool *pool = NULL;
+    if (gguf) {
+        gguf_collect(&main_j, argv[2], &ly);
+    } else {
+        for (int i = 2; i < argc - 1; i++) {
+            if (strncmp(argv[i], "hf:", 3) == 0) {
+                if (*fetched)
+                    die("one hf: repository at a time", argv[i]);
+                char repo[512], *rev;
+                snprintf(repo, sizeof(repo), "%s", argv[i] + 3);
+                if ((rev = strchr(repo, '@')))
+                    *rev++ = 0;
+                snprintf(fetched, sizeof(fetched), "%s.mtp.safetensors",
+                         out_path);
+                if (janas_hf_fetch_tensors(repo, rev, "mtp.", fetched, err,
+                                           sizeof(err)) < 0) {
+                    remove(fetched);
+                    die(err, NULL);
+                }
+                st_open(&shards[n_shards++], fetched);
+            } else {
+                st_open(&shards[n_shards++], argv[i]);
+            }
+        }
+        int cpus[64], nt = 12;
+        for (int i = 0; i < nt; i++)
+            cpus[i] = i;
+        pool = ckpt_pool = janas_pool_create(nt, cpus);
+        ckpt_collect(&main_j, &ly);
+    }
 
     /* layout, as tools/gguf2jns.c */
     uint64_t A = JANAS_JNS_ALIGN, layer_table = A;
@@ -392,21 +587,14 @@ int main(int argc, char **argv)
 
     /* experts, one slot each, with the CRC-32 of the whole slot */
     uint8_t *slot = calloc(1, ly.slot_bytes);
+    if (!slot)
+        die("out of memory", NULL);
     for (uint32_t e = 0; e < n_exp; e++) {
         memset(slot, 0, ly.slot_bytes);
-        for (int p = 0; p < 3; p++) {
-            char nm[160];
-            slot_name(nm, sizeof(nm), L, dense, e, parts[p]);
-            struct st_tensor t;
-            uint64_t n, bytes;
-            float *x = st_load(nm, &n, &t);
-            if (t.dims != 2 || t.shape[0] != rows[p] || t.shape[1] != cols[p])
-                die("unexpected expert shape", nm);
-            uint8_t *q = to_q4k(pool, x, rows[p], cols[p], &bytes);
-            memcpy(slot + ly.m[p].offset, q, bytes);
-            free(q);
-            free(x);
-        }
+        if (gguf)
+            gguf_slot(&ly, e, slot);
+        else
+            ckpt_slot(&ly, e, slot);
         sums[e] = janas_crc32(0, slot, ly.slot_bytes);
         if (fseeko(out, (off_t)slot_off[e], 0) ||
             fwrite(slot, 1, ly.slot_bytes, out) != ly.slot_bytes)
@@ -420,6 +608,8 @@ int main(int argc, char **argv)
     uint64_t tbl_len =
         tensor_dir + sizeof(struct janas_jns_tensor) * n_outs - layer_table;
     uint8_t *tbl = calloc(1, tbl_len);
+    if (!tbl)
+        die("out of memory", NULL);
     memcpy(tbl, &ly, sizeof(ly));
     memcpy(tbl + (expert_table - layer_table), slot_off, 8 * (size_t)n_exp);
     memcpy(tbl + (expert_sums - layer_table), sums, 8 * (size_t)n_exp);
@@ -474,7 +664,12 @@ int main(int argc, char **argv)
     free(sums);
     for (int i = 0; i < n_outs; i++)
         free(outs[i].data);
-    janas_pool_destroy(pool);
+    if (pool)
+        janas_pool_destroy(pool);
+    if (gguf) {
+        close(head_fd);
+        janas_gguf_free(&head_g);
+    }
     janas_jns_close(&main_j);
     if (*fetched)
         remove(fetched);

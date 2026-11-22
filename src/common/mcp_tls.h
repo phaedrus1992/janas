@@ -31,4 +31,31 @@ long janas_tls_read(struct janas_tls *t, void *p, size_t n);
 long janas_tls_write(struct janas_tls *t, const void *p, size_t n);
 void janas_tls_close(struct janas_tls *t);
 
+/* The one lock every use of Mbed TLS in the process takes (it has no
+   threading of its own): janas-server's TLS takes it too. janas_tls_crypto
+   starts the crypto library once, under it: 0, or -1. */
+void janas_tls_lock(void);
+void janas_tls_unlock(void);
+int janas_tls_crypto(void);
+/* A certificate of this computer's own, for a server of Janas's to speak
+   HTTPS (Brebus's): self-signed, an EC P-256 key, valid for days days for
+   the names given (host names, or IPv4/IPv6 addresses as text). The key is
+   written readable by the user alone. 0, or -1 with the reason in err. */
+int janas_tls_make_cert(const char *cert, const char *key,
+                        const char *const *names, size_t n_names, int days,
+                        char *err, size_t err_len);
+/* The SHA-256 of a PEM certificate's DER, as "AB:CD:..." (95 characters
+   and the NUL), what a user compares to trust it: 0, or -1. */
+int janas_tls_fingerprint(const char *cert, char *out, size_t cap);
+/* A file made readable by its owner alone: on Windows, where its mode says
+   nothing, an access list of the user alone, not inherited from its
+   folder (on other systems the caller's mode, 0600, already says it).
+   0, or -1. */
+int janas_tls_private(const char *path);
+/* The certificates of a PEM file trusted too, by the sessions opened after
+   (Brebus trusting its own server's): 0, or -1. */
+int janas_tls_trust(const char *cert);
+/* The SHA-256 of n bytes (OAuth's PKCE): 0, or -1. Takes the lock. */
+int janas_tls_sha256(const void *p, size_t n, unsigned char out[32]);
+
 #endif

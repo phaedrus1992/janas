@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's mix, its first step (model_hc.c norm_worker): each of a
+// token's hc streams of d floats normalized by its RMS and its own weights
+// (w: hc x d), into xn, and the same rounded to bf16 (kept as floats, to
+// nearest, ties to even) into xb, the input of the mix's bf16 products. A
+// workgroup per stream (x) and token (y); the sum of squares in the GPU's
+// order, NOT bit for bit with the CPU.
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { float v[]; };
+
+// res, xn, xb: n rows of hc x d floats
+layout(push_constant) uniform P { uvec2 res, w, xn, xb; uint d, hc; float eps; } p;
+
+shared float sg_part[64];
+
+float wg_sum(float s)
+{
+    float r = subgroupAdd(s);
+    if (subgroupElect())
+        sg_part[gl_SubgroupID] = r;
+    barrier();
+    float tot = sg_part[0];
+    for (uint i = 1u; i < gl_NumSubgroups; i++)
+        tot += sg_part[i];
+    barrier();
+    return tot;
+}
+
+float round_bf16(float f)
+{
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u)
+        return f; /* NaN */
+    u = (u + (0x7fffu + ((u >> 16) & 1u))) & 0xffff0000u;
+    return uintBitsToFloat(u);
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x, c = gl_WorkGroupID.x, j = gl_WorkGroupID.y;
+    uint d = p.d, o = (j * p.hc + c) * d;
+    F X = F(p.res), Wt = F(p.w);
+    float ss = 0.0;
+    for (uint i = t; i < d; i += 256u) {
+        float v = X.v[o + i];
+        ss += v * v;
+    }
+    ss = wg_sum(ss);
+    precise float sc = 1.0 / sqrt(ss / float(d) + p.eps);
+    for (uint i = t; i < d; i += 256u) {
+        precise float v = X.v[o + i] * sc;
+        v = v * Wt.v[c * d + i];
+        W(p.xn).v[o + i] = v;
+        W(p.xb).v[o + i] = round_bf16(v);
+    }
+}
