@@ -23,6 +23,9 @@ char *srv_dup_n(const char *s, size_t n);
 /* A number between lo and hi: 1 with *out set, 0 absent (or null), -1 not a
    number or out of range. */
 int srv_num(yyjson_val *v, double lo, double hi, double *out);
+/* A text part's text ("refusal" for a refusal, else "text"), NULL if absent;
+   it may be a value of any kind, the caller checks it is a string. */
+yyjson_val *srv_part_text(yyjson_val *part, const char *type);
 /* A ceiling on the reasoning by llama.cpp's names, reasoning_budget_tokens
    or thinking_budget_tokens: -1 none, 0 no reasoning, N at most N tokens of
    it, then the answer. 0, or -1 when the value is not one of those. */
