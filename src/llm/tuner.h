@@ -29,12 +29,18 @@
    threads for Qwen3.5-2B's prompts, which ran faster on 12 (10 Oct 2026) */
 #define JANAS_TUNE_CLASSES 4
 #define JANAS_TUNE_BLOCK 64
-#define JANAS_TUNE_MAX_CANDS 8
+#define JANAS_TUNE_MAX_CANDS 16
 
 struct janas_tune_cand {
     int threads; /* compute threads (a prefix of the pool) */
     int gpu;     /* the GPU takes part in the products */
+    int npu;     /* the NPU takes the blocks' products it can (blocks only) */
+    int alone;   /* blocks only: the CPU alone, without the GPU's fast
+                    prompt (which reads them in the other candidates) */
 };
+
+/* " + GPU", " + NPU", " + GPU + NPU" or "": a candidate's devices */
+const char *janas_tune_devices(const struct janas_tune_cand *c);
 
 struct janas_tuner {
     struct janas_tune_cand cand[JANAS_TUNE_MAX_CANDS];
@@ -43,6 +49,11 @@ struct janas_tuner {
     int allow_gpu; /* candidates with the GPU may be chosen */
     int gpu_one;   /* ... for one token too (the GPU takes single tokens) */
     int forced;    /* >= 0: every pass uses this candidate (and is measured) */
+    int trying;    /* the last pick an alternative tried (exploring, or now
+                      and then), not the class's choice */
+    /* the combinations of devices a class may use (common/devices.h: bit
+       gpu | npu << 1), the user's choice; 0 any */
+    int allowed[JANAS_TUNE_CLASSES];
     struct {
         double cost[JANAS_TUNE_MAX_CANDS]; /* seconds per token, averaged */
         uint32_t tried[JANAS_TUNE_MAX_CANDS];
@@ -59,6 +70,12 @@ struct janas_tuner {
         uint32_t retry_at, retry_gap;
         int retry_best, retry_cand; /* and the candidate tried */
         int threads; /* settled by the first tries (0: not yet) */
+        /* blocks: whether the CPU reads them alone, settled with the
+           threads (-1: not yet). The GPU's fast prompt sums in an order of
+           its own, its results differ from the CPU's in the last bits:
+           later tries keep to the side settled, so that a chat's prompts
+           give the same results once it is */
+        int alone;
     } cls[JANAS_TUNE_CLASSES];
 };
 
@@ -75,6 +92,10 @@ void janas_tuner_record(struct janas_tuner *t, int cls, int cand,
 
 /* Every pass on candidate cand (measured all the same), -1 to stop. */
 void janas_tuner_force(struct janas_tuner *t, int cand);
+
+/* The combinations of devices class cls may use (common/devices.h), 0
+   any: the user's --prompt-on, --drafts-on, --reply-on. */
+void janas_tuner_allow(struct janas_tuner *t, int cls, int mask);
 
 /* Whether candidates using the GPU may be chosen (energy saving: no). */
 void janas_tuner_allow_gpu(struct janas_tuner *t, int allow);

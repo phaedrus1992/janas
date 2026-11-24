@@ -1,0 +1,80 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// bf16 weights (rows x cols, row after row, two to a word) times NV float
+// vectors at a time, as the CPU computes them with AVX2 (bf16.h
+// janas_bf16_dot): eight lanes of a subgroup a row, lane l the fused
+// multiply-adds of the elements 8k + l in order; the eight added as
+// janas_hsum8 does through the subgroup - lane l with l ^ 4, then ^ 2,
+// then ^ 1, which gives ((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7)),
+// additions that commute - the elements past the last eight multiplied and
+// added one at a time by the row's first lane, then the scale: the same
+// float operations as the CPU, so the same bits (gpu.c janas_gpu_bf16_mv).
+// precise keeps the compiler from fusing those multiplies and adds. The
+// subgroup a multiple of 8 lanes, a row's eight its own.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NV = 4;
+layout(constant_id = 1) const uint SG = 8; // unused: the subgroup is asked
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U1 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F1 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FO { float v[]; };
+
+// w: row r from element r * cols; x: vector v from float v * xs; y: row r
+// of vector v at y[v * ys + r]
+layout(push_constant) uniform P { uvec2 w, x, y; uint rows, cols, nv, xs, ys; float scale; } p;
+
+/* weight i, from its bf16 bits */
+float wt(U1 W, uint i)
+{
+    uint u = W.v[i >> 1];
+    return uintBitsToFloat((i & 1u) != 0u ? u & 0xffff0000u : u << 16);
+}
+
+void main()
+{
+    U1 W = U1(p.w);
+    F1 X = F1(p.x);
+    FO Y = FO(p.y);
+    /* the row's eight lanes: eight neighbours of the subgroup */
+    uint lane = gl_SubgroupInvocationID % 8u;
+    uint rl = (gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID) / 8u;
+    uint grow = gl_WorkGroupID.y * (gl_WorkGroupSize.x / 8u) + rl;
+    uint row = min(grow, p.rows - 1u);
+    uint v0 = gl_WorkGroupID.x * NV;
+    uint wo = row * p.cols, n8 = p.cols / 8u * 8u;
+    uint xo[NV];
+    precise float acc[NV];
+    for (uint v = 0; v < NV; v++) {
+        xo[v] = min(v0 + v, p.nv - 1u) * p.xs;
+        acc[v] = 0.0;
+    }
+    for (uint i = lane; i < n8; i += 8u) {
+        float w = wt(W, wo + i);
+        for (uint v = 0; v < NV; v++)
+            acc[v] = fma(w, X.v[xo[v] + i], acc[v]);
+    }
+    /* every lane in the shuffles, then the first alone */
+    precise float s[NV];
+    for (uint v = 0; v < NV; v++) {
+        s[v] = acc[v] + subgroupShuffleXor(acc[v], 4u);
+        s[v] = s[v] + subgroupShuffleXor(s[v], 2u);
+        s[v] = s[v] + subgroupShuffleXor(s[v], 1u);
+    }
+    if (lane != 0u)
+        return;
+    for (uint v = 0; v < NV; v++) {
+        for (uint i = n8; i < p.cols; i++) {
+            precise float t = wt(W, wo + i) * X.v[xo[v] + i];
+            s[v] = s[v] + t;
+        }
+        precise float r = s[v] * p.scale;
+        if (grow < p.rows && v0 + v < p.nv)
+            Y.v[(v0 + v) * p.ys + row] = r;
+    }
+}

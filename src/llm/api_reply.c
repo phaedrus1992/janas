@@ -22,6 +22,14 @@ int janas_api_is_stop(const janas_llm *llm, int32_t t)
 }
 
 /* Bytes of pend that form whole UTF-8 characters, at most max. */
+/* a reply ended: its metrics, and the model's state written now and then
+   (a server killed keeps what it learned) */
+static void reply_done(janas_llm_chat *c)
+{
+    janas_metrics_reply(c);
+    janas_llm_model_save_state(c->llm->m);
+}
+
 static size_t whole_chars(const char *s, size_t n, size_t max)
 {
     size_t i = 0;
@@ -145,6 +153,7 @@ void janas_api_update_stats(janas_llm_chat *c)
     s->input_eta_seconds = s->stage == JANAS_LLM_STAGE_INPUT
                                ? input_eta(c, s->input_tokens - s->input_done)
                                : 0;
+    janas_api_monitor_note(c);
 }
 
 /*
@@ -209,6 +218,14 @@ static void take(janas_llm_chat *c, int32_t t)
     char tmp[sizeof(c->pend)];
     if (!c->in_think && t != llm->think_open && t != llm->think_close)
         c->answer_tokens++; /* text or a call: what max_answer counts */
+    /* Inkling: its message marks, never text */
+    if (llm->format == FORMAT_INKLING &&
+        (t == llm->ink_role[1] || t == llm->ink_endmsg)) {
+        if (t == llm->ink_endmsg)
+            c->in_think = 0;
+        janas_api_record(c, t, JANAS_LLM_PART_MARK, "", 0);
+        return;
+    }
     if (t == llm->think_open || t == llm->think_close) {
         c->in_think = t == llm->think_open;
         /* Gemma names its channel before the reasoning: "thought\n" */
@@ -226,6 +243,48 @@ static void take(janas_llm_chat *c, int32_t t)
             return;
         }
         c->chan_label = 0;
+    }
+    if (c->tools && llm->tools == JANAS_TOOLS_DSML && !c->in_think) {
+        /* DeepSeek: "<" then ｜DSML｜ opens a block of calls, which ends
+           with </｜DSML｜tool_calls>; the "<" waits for the next token */
+        if (c->in_call) {
+            size_t k = janas_tokenizer_decode(llm->tok, t, tmp, sizeof(tmp));
+            if (k > sizeof(tmp))
+                k = sizeof(tmp);
+            janas_buf_put(&c->body, tmp, k);
+            janas_api_record(c, t, JANAS_LLM_PART_CALL, tmp, k);
+            static const char end[] = "</｜DSML｜tool_calls>";
+            size_t e = sizeof(end) - 1;
+            if (c->body.n >= e && !memcmp(c->body.p + c->body.n - e, end, e)) {
+                struct janas_buf text = {0};
+                janas_api_close_dsml(c, &text);
+                if (text.n) {
+                    janas_api_rtext_add(c, text.p, text.n);
+                    give(c, text.p, text.n);
+                }
+                janas_buf_free(&text);
+            }
+            return;
+        }
+        if (c->held_lt) {
+            c->held_lt = 0;
+            if (t == llm->call_open) {
+                c->in_call = 1;
+                c->body.n = 0;
+                janas_buf_puts(&c->body, "<｜DSML｜");
+                janas_api_record(c, llm->lt_tok, JANAS_LLM_PART_MARK, "", 0);
+                janas_api_record(c, t, JANAS_LLM_PART_MARK, "", 0);
+                return;
+            }
+            /* not a call: the "<" is text, before this token */
+            janas_api_record(c, llm->lt_tok, JANAS_LLM_PART_ANSWER, "<", 1);
+            janas_api_rtext_add(c, "<", 1);
+            give(c, "<", 1);
+        }
+        if (t == llm->lt_tok) {
+            c->held_lt = 1;
+            return;
+        }
     }
     if (c->tools && t == llm->call_open && !c->in_think && !c->in_call) {
         c->in_call = 1;
@@ -289,8 +348,12 @@ static void close_reasoning(janas_llm_chat *c)
     long n = janas_tokenizer_encode(llm->tok, say, sizeof(say) - 1, 0, ids, 64);
     if (n < 0 || n > 64)
         n = 0;
+    if (llm->format == FORMAT_INKLING) { /* the message ends, a text one */
+        ids[n++] = llm->ink_endmsg;
+        ids[n++] = llm->ink_role[1];
+    }
     ids[n++] = llm->think_close;
-    if (llm->format != FORMAT_GEMMA) {
+    if (llm->format != FORMAT_GEMMA && llm->format != FORMAT_INKLING) {
         long m = janas_tokenizer_encode(llm->tok, "\n\n", 2, 0, ids + n, 8);
         if (m > 0 && m <= 8)
             n += m;
@@ -305,6 +368,26 @@ static void close_reasoning(janas_llm_chat *c)
     c->i_forced = 0;
 }
 
+/*
+ * The room the answer keeps while the model reasons: what it may take
+ * (max_answer), else an eighth of the context, 256 to 2048 tokens, never
+ * more than half of it. Reasoning with no budget used to go on until the
+ * context was full - a model that went round in circles, which reasoning
+ * at temperature 0 does, ended the request with "the context is full" and
+ * no answer (Qwen3.5-9B, 23 Nov 2026: 8171 tokens of reasoning for "what
+ * is your name"). Closed here, it answers with the room left.
+ */
+static uint32_t answer_room(const janas_llm_chat *c)
+{
+    uint32_t n = c->llm->n_ctx;
+    uint32_t r = c->p.max_answer > 0 ? (uint32_t)c->p.max_answer + 32 : n / 8;
+    if (r < 256)
+        r = 256;
+    if (c->p.max_answer <= 0 && r > 2048)
+        r = 2048;
+    return r < n / 2 ? r : n / 2;
+}
+
 int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
                             int32_t *len)
 {
@@ -313,6 +396,22 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
     *len = 0;
     if (!c->replying)
         return JANAS_LLM_DONE;
+    /* Nucleus mode: the Specialist's reply, passed through */
+    if (c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat) {
+        int32_t r = janas_llm_chat_next(c->nuc_chat, buf, cap, len);
+        if (r != JANAS_LLM_OK) {
+            struct janas_llm_chat_stats ss = {.size = sizeof(ss)};
+            janas_llm_chat_stats(c->nuc_chat, &ss);
+            c->stats.output_tokens = ss.output_tokens;
+            c->stats.finish = ss.finish;
+            c->replying = 0;
+            c->ended = 1;
+            c->stats.stage = JANAS_LLM_STAGE_DONE;
+            janas_api_update_stats(c);
+            janas_api_tr_finish(c);
+        }
+        return r;
+    }
     /* the prompt, a block at a time: the caller hears between blocks */
     if (c->stats.stage == JANAS_LLM_STAGE_INPUT) {
         int r = read_input(c);
@@ -327,12 +426,13 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
             c->stats.finish = JANAS_LLM_FINISH_ERROR;
             c->stats.stage = JANAS_LLM_STAGE_DONE;
             janas_api_update_stats(c);
-            janas_metrics_reply(c);
+            reply_done(c);
             return janas_api_fail(JANAS_LLM_EFAIL, "generation failed");
         }
         janas_api_update_stats(c);
         if (c->stats.input_tokens >= 1024)
             janas_metrics_progress(c, 1); /* the whole prompt, read */
+        janas_api_nuc_arm(c); /* Nucleus mode: the gate on the first pass */
     }
     if (!c->ended && c->npend < 4) {
         int32_t t = -1;
@@ -349,6 +449,18 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
         } else {
             r = janas_llm_session_next(c->s, &t);
             got = r == 0;
+            if (got && c->nuc_pending) { /* Nucleus mode: the gate decides */
+                const char *say = janas_api_nuc_decide(c);
+                if (say) { /* "I don't know": that sentence, nothing more */
+                    give(c, say, strlen(say));
+                    janas_api_rtext_add(c, say, strlen(say)); /* said */
+                    got = 0;
+                    c->ended = 1;
+                    c->stats.finish = JANAS_LLM_FINISH_STOP;
+                } else if (c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST) {
+                    got = 0; /* the Specialist answers, next call on */
+                }
+            }
         }
         if (got && c->t_first == 0) { /* the first token of the reply */
             c->t_first = janas_api_now() - c->t_send;
@@ -368,16 +480,18 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
         } else if (got) {
             c->reply_tokens++;
             take(c, t);
-            if (c->in_think && c->p.max_reasoning > 0 &&
-                c->stats.reasoning_tokens >= (uint32_t)c->p.max_reasoning &&
-                c->i_forced >= c->n_forced)
+            if (c->in_think && c->i_forced >= c->n_forced &&
+                ((c->p.max_reasoning > 0 &&
+                  c->stats.reasoning_tokens >= (uint32_t)c->p.max_reasoning) ||
+                 janas_llm_session_length(c->s) + answer_room(c) >=
+                     c->llm->n_ctx))
                 close_reasoning(c);
         }
         janas_api_update_stats(c);
         if (r != 0) {
             c->replying = 0;
             c->stats.stage = JANAS_LLM_STAGE_DONE;
-            janas_metrics_reply(c);
+            reply_done(c);
             return r > 0 ? janas_api_fail(JANAS_LLM_EFULL,
                                           "the context is full (%u "
                                           "tokens)",
@@ -390,8 +504,12 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
         c->replying = 0;
         c->stats.stage = JANAS_LLM_STAGE_DONE;
         janas_api_update_stats(c);
-        janas_metrics_reply(c);
-        janas_api_memo_store(c);
+        reply_done(c);
+        /* a sentence of the gate is not what the model generated: not
+           remembered as its turn */
+        if (c->nuc_route == JANAS_LLM_ROUTE_SELF)
+            janas_api_memo_store(c);
+        janas_api_tr_finish(c);
         return JANAS_LLM_DONE;
     }
     return JANAS_LLM_OK;
@@ -403,7 +521,71 @@ int32_t janas_llm_chat_stats(const janas_llm_chat *c,
     if (!c || !s || s->size < sizeof(uint32_t))
         return janas_api_fail(JANAS_LLM_EINVAL, "invalid argument");
     uint32_t size = s->size < sizeof(c->stats) ? s->size : sizeof(c->stats);
-    memcpy(s, &c->stats, size);
+    struct janas_llm_chat_stats st = c->stats;
+    if (c->nuc_route == JANAS_LLM_ROUTE_SPECIALIST && c->nuc_chat) {
+        /* Nucleus mode: the Specialist's reply, as this chat's, its route
+           kept (or its own gate's "I don't know") and the Nucleus's time
+           before the handover added */
+        st = c->nuc_chat->stats;
+        st.route = st.route == JANAS_LLM_ROUTE_UNKNOWN ? JANAS_LLM_ROUTE_UNKNOWN
+                                                       : c->stats.route;
+        memcpy(st.route_domain, c->stats.route_domain, sizeof(st.route_domain));
+        st.input_seconds += c->stats.input_seconds;
+        st.total_seconds += c->nuc_handoff;
+        if (st.first_token_seconds > 0)
+            st.first_token_seconds += c->nuc_handoff;
+    }
+    memcpy(s, &st, size);
     s->size = size;
     return JANAS_LLM_OK;
+}
+
+/* a chat whose next janas_llm_chat_next would run a pass of the model: in
+   its prompt, or writing with nothing to give yet - not in Nucleus mode,
+   nor at a limit, nor with tokens forced in */
+static int wants_pass(const janas_llm_chat *c)
+{
+    if (!c->replying || c->nuc_chat || c->nuc_pending)
+        return 0;
+    if (c->stats.stage == JANAS_LLM_STAGE_INPUT)
+        return 1;
+    if (c->ended || c->npend >= 4 || c->i_forced < c->n_forced)
+        return 0;
+    return !(
+        (c->p.max_reply > 0 && c->reply_tokens >= (uint32_t)c->p.max_reply) ||
+        (c->p.max_answer > 0 && c->answer_tokens >= (uint32_t)c->p.max_answer));
+}
+
+int32_t janas_llm_chats_step(janas_llm_chat **chats, int32_t n)
+{
+    if (!chats || n < 1)
+        return janas_api_fail(JANAS_LLM_EINVAL, "no chats");
+    struct janas_llm_session *stack[64], **ss = stack;
+    int st[64], *sp = st;
+    if (n > 64) {
+        ss = malloc((size_t)n * sizeof(*ss));
+        sp = malloc((size_t)n * sizeof(int));
+        if (!ss || !sp) {
+            free(ss);
+            free(sp);
+            return janas_api_fail(JANAS_LLM_ENOMEM, "out of memory");
+        }
+    }
+    int k = 0;
+    for (int32_t i = 0; i < n; i++) {
+        if (!chats[i] || chats[i]->llm != chats[0]->llm)
+            continue;
+        if (wants_pass(chats[i]))
+            ss[k++] = chats[i]->s;
+    }
+    int r = k > 0 && janas_llm_parallel_ok(chats[0]->llm)
+                ? janas_llm_sessions_advance(ss, k, sp)
+                : 0;
+    if (ss != stack) {
+        free(ss);
+        free(sp);
+    }
+    /* a failed step leaves each chat to run its pass by itself */
+    return r == 0 ? JANAS_LLM_OK
+                  : janas_api_fail(JANAS_LLM_EFAIL, "the step failed");
 }

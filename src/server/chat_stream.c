@@ -172,11 +172,21 @@ static int produce(struct out *o)
     if (!j->done)
         return bad ? -1 : 0;
     if (j->err != JANAS_LLM_OK || j->ch[0].finish == JANAS_LLM_FINISH_ERROR) {
-        char msg[400];
-        snprintf(msg, sizeof(msg),
-                 "data: {\"error\":{\"message\":\"generation failed\","
-                 "\"type\":\"server_error\",\"param\":null,\"code\":null}}"
-                 "\n\n");
+        /* the engine's reason, as the answer without a stream gives it */
+        yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(d);
+        yyjson_mut_val *e = yyjson_mut_obj_add_obj(d, root, "error");
+        yyjson_mut_obj_add_strcpy(
+            d, e, "message", j->errmsg[0] ? j->errmsg : "generation failed");
+        yyjson_mut_obj_add_str(d, e, "type", "server_error");
+        yyjson_mut_obj_add_null(d, e, "param");
+        yyjson_mut_obj_add_null(d, e, "code");
+        char *t = yyjson_mut_val_write(root, 0, NULL);
+        yyjson_mut_doc_free(d);
+        char msg[600];
+        snprintf(msg, sizeof(msg), "data: %s\n\n",
+                 t ? t : "{\"error\":{\"message\":\"generation failed\"}}");
+        free(t);
         bad |= raw_event(o, msg);
     } else if (o->include_usage) {
         yyjson_mut_doc *d = yyjson_mut_doc_new(NULL);
@@ -191,6 +201,13 @@ static int produce(struct out *o)
     return bad ? -1 : 1;
 }
 
+static double mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
 long srv_chat_stream_next(void *ctx, char *buf, size_t cap)
 {
     struct out *o = ctx;
@@ -202,16 +219,33 @@ long srv_chat_stream_next(void *ctx, char *buf, size_t cap)
         pthread_mutex_lock(&j->mu);
         int end = produce(o);
         if (end == 0 && o->n_pend == 0) {
-            /* nothing new: wait for the engine, and after a while send a
-               comment, which is how a client gone away is noticed */
+            /* nothing new: wait for the engine. While the prompt is read
+               the engine wakes this at every block with no token, so the
+               comments go by the time since the last bytes sent, not by
+               the wait's: the reading's progress, at most once a second,
+               else a keep-alive after 5 s - writing is how a client gone
+               away is noticed, and its reply stopped */
             struct timespec t;
             clock_gettime(CLOCK_REALTIME, &t);
-            t.tv_sec += 5;
-            int rc = pthread_cond_timedwait(&j->cv, &j->mu, &t);
+            t.tv_sec += 1;
+            pthread_cond_timedwait(&j->cv, &j->mu, &t);
             end = produce(o);
-            if (o->n_pend == 0 && rc == ETIMEDOUT)
+            double now = mono_ms();
+            if (!o->last_ms)
+                o->last_ms = now;
+            if (o->n_pend == 0 && j->read_total &&
+                j->read_done != o->read_seen && now - o->last_ms >= 1000) {
+                char c[80];
+                snprintf(c, sizeof c, ": reading %u/%u\n\n", j->read_done,
+                         j->read_total);
+                raw_event(o, c);
+                o->read_seen = j->read_done;
+            } else if (o->n_pend == 0 && now - o->last_ms >= 5000) {
                 raw_event(o, ": keep-alive\n\n");
+            }
         }
+        if (o->n_pend)
+            o->last_ms = mono_ms();
         if (end < 0)
             o->sent_end = 1;
         int finished = end == 1;
