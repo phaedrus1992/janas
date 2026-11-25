@@ -16,9 +16,12 @@
 /* how the model's multi-token prediction file is made, if it has one */
 enum janas_model_extra {
     JANAS_EXTRA_NONE,
-    JANAS_EXTRA_GGUF,  /* a GGUF of its own (Gemma 4's assistant), gguf2jns */
-    JANAS_EXTRA_HF2JNS /* the block of the original checkpoint, hf2jns_mtp hf:
-                        */
+    JANAS_EXTRA_GGUF,   /* a GGUF of its own (Gemma 4's assistant), gguf2jns */
+    JANAS_EXTRA_HF2JNS, /* the block of the original checkpoint, hf2jns_mtp
+                           hf: */
+    JANAS_EXTRA_BLOCK   /* a GGUF of the block alone (unsloth's of
+                           Qwen3.8-Flash-Next), perhaps from another
+                           repository, copied by hf2jns_mtp */
 };
 
 struct janas_model_entry {
@@ -39,12 +42,17 @@ struct janas_model_entry {
                              there are no planes) */
     const char *jns_sha;  /* what jns_planes writes, NULL: one step */
     enum janas_model_extra extra;
-    const char *extra_src;     /* GGUF file of repo, or hf:repo[@rev] */
-    const char *extra_src_sha; /* of that GGUF (JANAS_EXTRA_GGUF) */
+    const char *extra_src; /* GGUF file of repo (of extra_repo, if
+                              given), or hf:repo[@rev] */
+    const char *extra_repo;
+    const char *extra_src_sha; /* of that GGUF (JANAS_EXTRA_GGUF, _BLOCK) */
     const char *extra_out;
     const char *extra_sha;
     int ram_gb;        /* the smallest machine it is meant for */
     int not_chat;      /* 1: not a chat model (embeddings) */
+    int speech;        /* 1: speech to text (Whisper), for the server's
+                          --speech-model; converted from safetensors, so
+                          only its JNS is downloaded */
     int test_only;     /* 1: for testing the engine, not for chatting: left
                           out of janas-chat's list, opened by name with a
                           word of warning */

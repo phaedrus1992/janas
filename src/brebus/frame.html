@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifact</title>
+</head>
+<body>
+<script>
+/*
+ * frame.html - the frame an artifact runs in, beside Brebus's chat. It is
+ * loaded from Brebus in a frame sandboxed without its origin (no access to
+ * Brebus, to its page or to their storage), with a policy of its own: no
+ * network, scripts only inline and from Brebus's /brebus/lib/. The page
+ * sends it the artifact ({type, content, title, dark}); it writes the
+ * document for it:
+ *   html     the page itself, the libraries it asks from a CDN taken from
+ *            Brebus's copies instead (the same files, fetched once, checked)
+ *   react    a component exported as default, its JSX read by Babel, its
+ *            imports given from the libraries' globals, Tailwind for its
+ *            classes, shadcn/ui's components as Janas writes them
+ *   mermaid  a diagram
+ *   svg      a drawing
+ * In each, window.claude.complete(prompt) (also window.janas) asks the
+ * model loaded, window.storage keeps data of this artifact in the
+ * workspace, window.fs.readFile(name) reads a file attached to the
+ * conversation: each asked of the page, which answers. Errors go to the
+ * page, which shows them and offers to ask the model for a fix.
+ */
+(() => {
+/* in a function of its own: the artifact's scripts, written into this
+   document, share its global scope, and might declare these names */
+"use strict";
+const BASE = new URL(location.href).origin;
+const LIB = BASE + "/brebus/lib/";
+
+/* the libraries, by the names they are imported or asked from a CDN by */
+const PKG = {
+  "react": {js: ["react@18.3.1/umd/react.production.min.js"], g: "React"},
+  "react-dom": {js: ["react-dom@18.3.1/umd/react-dom.production.min.js"], g: "ReactDOM", needs: ["react"]},
+  "prop-types": {js: ["prop-types@15.8.1/prop-types.min.js"], g: "PropTypes"},
+  "recharts": {js: ["recharts@2.13.3/umd/Recharts.js"], g: "Recharts", needs: ["react", "react-dom", "prop-types"]},
+  "lucide-react": {js: ["lucide-react@0.460.0/dist/umd/lucide-react.min.js"], g: "LucideReact", needs: ["react"]},
+  "d3": {js: ["d3@7.9.0/dist/d3.min.js"], g: "d3"},
+  "lodash": {js: ["lodash@4.17.21/lodash.min.js"], g: "_"},
+  "papaparse": {js: ["papaparse@5.4.1/papaparse.min.js"], g: "Papa"},
+  "mathjs": {js: ["mathjs@13.2.2/lib/browser/math.js"], g: "math"},
+  "chart.js": {js: ["chart.js@4.4.6/dist/chart.umd.js"], g: "Chart"},
+  "three": {js: ["three@0.128.0/build/three.min.js"], g: "THREE"},
+  "plotly.js": {js: ["plotly.js-dist-min@2.35.2/plotly.min.js"], g: "Plotly"},
+  "xlsx": {js: ["xlsx@0.18.5/dist/xlsx.full.min.js"], g: "XLSX"},
+  "mermaid": {js: ["mermaid@11.4.1/dist/mermaid.min.js"], g: "mermaid"},
+  "katex": {js: ["katex@0.16.11/dist/katex.min.js", "katex@0.16.11/dist/contrib/auto-render.min.js"],
+            css: ["katex@0.16.11/dist/katex.min.css"], g: "katex"},
+  "highlight.js": {js: ["@highlightjs/cdn-assets@11.10.0/highlight.min.js"],
+                   css: ["@highlightjs/cdn-assets@11.10.0/styles/github.min.css"], g: "hljs"},
+  "tone": {js: ["tone@15.0.4/build/Tone.js"], g: "Tone"},
+  "mammoth": {js: ["mammoth@1.8.0/mammoth.browser.min.js"], g: "mammoth"},
+  "tailwindcss": {js: ["@tailwindcss/browser@4.1.10/dist/index.global.js"]},
+  "@babel/standalone": {js: ["@babel/standalone@7.26.4/babel.min.js"], g: "Babel"},
+};
+const ALIAS = {
+  "react-dom/client": "react-dom", "chart.js/auto": "chart.js", "plotly": "plotly.js",
+  "plotly.js-dist": "plotly.js", "plotly.js-dist-min": "plotly.js", "@tailwindcss/browser": "tailwindcss",
+  "babel-standalone": "@babel/standalone", "lodash-es": "lodash", "katex/dist/contrib/auto-render": "katex",
+  /* cdnjs's names */
+  "Chart.js": "chart.js", "three.js": "three", "lodash.js": "lodash", "PapaParse": "papaparse",
+  "KaTeX": "katex", "highlight.js": "highlight.js", "babel-core": "@babel/standalone",
+};
+const pkgOf = (name) => PKG[name] ? name : ALIAS[name] && PKG[ALIAS[name]] ? ALIAS[name] : null;
+
+/* a library and those it needs, in order, as script tags */
+function scripts(names) {
+  const seen = new Set(), out = [];
+  const add = (n) => {
+    if (seen.has(n)) return;
+    seen.add(n);
+    for (const d of PKG[n].needs || []) add(d);
+    for (const c of PKG[n].css || []) out.push(`<link rel="stylesheet" href="${LIB + c}">`);
+    for (const j of PKG[n].js) out.push(`<script src="${LIB + j}"><\/script>`);
+    /* lucide-react's UMD looks for React as "react" */
+    if (n === "react") out.push("<script>window.react = window.React;<\/script>");
+  };
+  for (const n of names) add(n);
+  return out.join("\n");
+}
+
+/* a CDN's address of a library, as Brebus's copy; null: not one known */
+function fromCdn(url) {
+  let u;
+  try { u = new URL(url); } catch (e) { return null; }
+  let name = null, file = "";
+  const npm = u.pathname.match(/^\/(?:npm\/)?((?:@[^/@]+\/)?[^/@]+)(?:@[^/]*)?(\/.*)?$/);
+  if (u.hostname === "cdn.jsdelivr.net" && u.pathname.startsWith("/npm/") && npm ||
+      u.hostname === "unpkg.com" && npm) {
+    name = npm[1]; file = npm[2] || "";
+  } else if (u.hostname === "cdnjs.cloudflare.com") {
+    const m = u.pathname.match(/^\/ajax\/libs\/([^/]+)\/[^/]+\/(.*)$/);
+    if (m) { name = m[1]; file = m[2]; }
+  } else if (u.hostname === "cdn.tailwindcss.com") name = "tailwindcss";
+  else if (u.hostname === "cdn.plot.ly") name = "plotly.js";
+  else if (u.hostname === "d3js.org") name = "d3";
+  else if (u.hostname === "cdn.sheetjs.com") name = "xlsx";
+  const p = name && pkgOf(name);
+  if (!p) return null;
+  const base = file.split("/").pop();
+  const all = [...PKG[p].js, ...(PKG[p].css || [])];
+  const same = base && all.find((f) => f.split("/").pop() === base);
+  if (same) return LIB + same;
+  if (/\.css$/.test(file)) return PKG[p].css ? LIB + PKG[p].css[0] : null;
+  return LIB + PKG[p].js[0];
+}
+
+/* the page's address of every script and stylesheet of a CDN, as Brebus's */
+function rewrite(html) {
+  return html.replace(/(<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*)(["'])(https?:\/\/[^"']+)\2/gi,
+    (all, head, q, url) => {
+      const to = fromCdn(url);
+      return to ? head + q + to + q : all;
+    });
+}
+
+/* in the artifact's document: the model, its storage and the attached
+   files, asked of the page; errors told to it */
+function bridge() {
+  let n = 0;
+  const wait = new Map();
+  addEventListener("message", (e) => {
+    const r = e.source === parent && e.data && e.data.janasReply;
+    const w = r && wait.get(r.id);
+    if (!w) return;
+    wait.delete(r.id);
+    if (r.ok) w[0](r.value); else w[1](new Error(r.error));
+  });
+  const call = (op, args) => new Promise((ok, no) => {
+    const id = ++n;
+    wait.set(id, [ok, no]);
+    parent.postMessage({janasCall: {id, op, ...args}}, "*");
+  });
+  const complete = (prompt) => call("complete", {prompt: String(prompt)});
+  /* the answer is a string, as Claude's; code that reads it as {text}
+     (a frequent slip) gets the same string */
+  if (!("text" in String.prototype))
+    Object.defineProperty(String.prototype, "text", {get() { return String(this); }});
+  window.claude = {complete};
+  window.janas = {complete};
+  window.storage = {
+    get: (key) => call("storage", {act: "get", key: String(key)}),
+    set: (key, value) => call("storage", {act: "set", key: String(key), value}),
+    delete: (key) => call("storage", {act: "delete", key: String(key)}),
+    list: (prefix) => call("storage", {act: "list", prefix: prefix ? String(prefix) : ""}),
+  };
+  window.fs = {
+    readFile: async (name, o) => {
+      const b = await call("file", {name: String(name)});
+      const enc = o && o.encoding;
+      return enc ? new TextDecoder(/^utf-?8$/i.test(enc) ? "utf-8" : enc).decode(b) : b;
+    },
+  };
+  /* its own zoom, the page's to keep: drawn larger it keeps the layout it
+     has at 100% and scrolls, smaller it takes the room; Ctrl+wheel and
+     Ctrl+plus, minus or 0 over it ask the page for a step */
+  let zoom = +window.__janasZoom || 1;
+  const fitZoom = () => {
+    const h = document.documentElement;
+    h.style.zoom = zoom === 1 ? "" : zoom;
+    h.style.minWidth = zoom > 1 ? innerWidth + "px" : "";
+  };
+  fitZoom();
+  addEventListener("resize", () => { if (zoom > 1) fitZoom(); });
+  addEventListener("message", (e) => {
+    const z = e.source === parent && e.data && e.data.janasZoom;
+    if (z > 0) { zoom = z; fitZoom(); }
+  });
+  let acc = 0, last = 0;
+  addEventListener("wheel", (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    const now = Date.now();
+    if (now - last > 400) acc = 0;
+    last = now;
+    acc += e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+    if (Math.abs(acc) < 40) return;
+    parent.postMessage({janasZoomStep: acc < 0 ? 1 : -1}, "*");
+    acc = 0;
+  }, {passive: false, capture: true});
+  addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const d = e.key === "+" || e.key === "=" ? 1 : e.key === "-" || e.key === "_" ? -1 : e.key === "0" ? 0 : null;
+    if (d === null) return;
+    e.preventDefault();
+    parent.postMessage({janasZoomStep: d}, "*");
+  }, true);
+  const report = (m) => parent.postMessage({janasError: String(m).slice(0, 3000)}, "*");
+  window.__janasReport = report;
+  addEventListener("error", (e) => {
+    const t = e.target;
+    if (t && t !== window && (t.src || t.href))
+      report("Could not load " + (t.src || t.href) + ": an artifact has no network, and Brebus serves only the libraries it knows.");
+    else
+      report(e.error && e.error.stack ? e.error.stack : e.message);
+  }, true);
+  addEventListener("unhandledrejection", (e) =>
+    report(e.reason && e.reason.stack ? e.reason.stack : String(e.reason)));
+}
+
+/* shadcn/ui's components, as Janas writes them: the same names and props,
+   Tailwind's classes; @/components/ui/<any> gives them all */
+function uiKit() {
+  const h = React.createElement;
+  const cn = (...a) => a.flat(Infinity).filter(Boolean).join(" ");
+  const el = (tag, base) => React.forwardRef(({className, ...p}, ref) =>
+    h(tag, {ref, className: cn(base, className), ...p}));
+  const BV = {
+    default: "bg-slate-900 text-white hover:bg-slate-800",
+    destructive: "bg-red-600 text-white hover:bg-red-500",
+    outline: "border border-slate-300 bg-white hover:bg-slate-100",
+    secondary: "bg-slate-100 text-slate-900 hover:bg-slate-200",
+    ghost: "hover:bg-slate-100", link: "text-slate-900 underline-offset-4 hover:underline",
+  };
+  const BS = {default: "h-10 px-4 py-2", sm: "h-9 px-3", lg: "h-11 px-8", icon: "h-10 w-10"};
+  const Button = React.forwardRef(({className, variant = "default", size = "default", asChild, ...p}, ref) =>
+    h("button", {ref, className: cn("inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:pointer-events-none", BV[variant] || BV.default, BS[size] || BS.default, className), ...p}));
+  const BadgeV = {default: "bg-slate-900 text-white", secondary: "bg-slate-100 text-slate-900",
+                  destructive: "bg-red-600 text-white", outline: "border border-slate-300 text-slate-900"};
+  const Badge = ({className, variant = "default", ...p}) =>
+    h("span", {className: cn("inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold", BadgeV[variant] || BadgeV.default, className), ...p});
+  const AlertV = {default: "bg-white text-slate-900 border-slate-200", destructive: "border-red-500 text-red-700"};
+  const Alert = ({className, variant = "default", ...p}) =>
+    h("div", {role: "alert", className: cn("relative w-full rounded-lg border p-4", AlertV[variant] || AlertV.default, className), ...p});
+  const Progress = ({className, value = 0, ...p}) =>
+    h("div", {className: cn("relative h-4 w-full overflow-hidden rounded-full bg-slate-200", className), ...p},
+      h("div", {className: "h-full bg-slate-900 transition-all", style: {width: Math.max(0, Math.min(100, value)) + "%"}}));
+  const Switch = ({className, checked, defaultChecked, onCheckedChange, disabled, ...p}) => {
+    const [own, setOwn] = React.useState(!!defaultChecked);
+    const on = checked === undefined ? own : checked;
+    return h("button", {type: "button", role: "switch", "aria-checked": on, disabled,
+      onClick: () => { setOwn(!on); onCheckedChange && onCheckedChange(!on); },
+      className: cn("inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors", on ? "bg-slate-900" : "bg-slate-300", className), ...p},
+      h("span", {className: cn("block h-5 w-5 rounded-full bg-white shadow transition-transform", on ? "translate-x-5" : "translate-x-0.5")}));
+  };
+  const Checkbox = ({className, checked, onCheckedChange, ...p}) =>
+    h("input", {type: "checkbox", checked, onChange: (e) => onCheckedChange && onCheckedChange(e.target.checked),
+      className: cn("h-4 w-4 accent-slate-900", className), ...p});
+  /* value is an array, as Radix's */
+  const Slider = ({className, value, defaultValue, onValueChange, min = 0, max = 100, step = 1, ...p}) => {
+    const [own, setOwn] = React.useState((defaultValue || [min])[0]);
+    const v = value ? value[0] : own;
+    return h("input", {type: "range", min, max, step, value: v,
+      onChange: (e) => { const x = +e.target.value; setOwn(x); onValueChange && onValueChange([x]); },
+      className: cn("w-full accent-slate-900", className), ...p});
+  };
+  const TabsCtx = React.createContext(null);
+  const Tabs = ({value, defaultValue, onValueChange, className, children, ...p}) => {
+    const [own, setOwn] = React.useState(defaultValue);
+    const v = value === undefined ? own : value;
+    const set = (x) => { setOwn(x); onValueChange && onValueChange(x); };
+    return h(TabsCtx.Provider, {value: {v, set}}, h("div", {className, ...p}, children));
+  };
+  const TabsList = el("div", "inline-flex h-10 items-center rounded-md bg-slate-100 p-1 text-slate-500");
+  const TabsTrigger = ({value, className, ...p}) => {
+    const c = React.useContext(TabsCtx);
+    return h("button", {type: "button", onClick: () => c.set(value),
+      className: cn("inline-flex items-center justify-center rounded-sm px-3 py-1.5 text-sm font-medium", c.v === value ? "bg-white text-slate-900 shadow-sm" : "", className), ...p});
+  };
+  const TabsContent = ({value, className, ...p}) => {
+    const c = React.useContext(TabsCtx);
+    return c.v === value ? h("div", {className: cn("mt-2", className), ...p}) : null;
+  };
+  /* Select as Radix's API, a list of its own */
+  const SelCtx = React.createContext(null);
+  const Select = ({value, defaultValue, onValueChange, children}) => {
+    const [own, setOwn] = React.useState(defaultValue);
+    const [open, setOpen] = React.useState(false);
+    const [labels] = React.useState(() => new Map());
+    const v = value === undefined ? own : value;
+    const set = (x) => { setOwn(x); setOpen(false); onValueChange && onValueChange(x); };
+    return h(SelCtx.Provider, {value: {v, set, open, setOpen, labels}}, h("div", {className: "relative"}, children));
+  };
+  const SelectTrigger = ({className, children, ...p}) => {
+    const c = React.useContext(SelCtx);
+    return h("button", {type: "button", onClick: () => c.setOpen(!c.open),
+      className: cn("flex h-10 w-full items-center justify-between rounded-md border border-slate-300 bg-white px-3 py-2 text-sm", className), ...p},
+      children, h("span", {className: "opacity-50"}, "▾"));
+  };
+  const SelectValue = ({placeholder}) => {
+    const c = React.useContext(SelCtx);
+    return h("span", null, c.v === undefined ? placeholder || "" : c.labels.get(c.v) || c.v);
+  };
+  const SelectContent = ({className, children}) => {
+    const c = React.useContext(SelCtx);
+    return h("div", {className: cn("absolute z-50 mt-1 w-full rounded-md border border-slate-200 bg-white p-1 shadow-md", c.open ? "" : "hidden", className)}, children);
+  };
+  const SelectItem = ({value, className, children}) => {
+    const c = React.useContext(SelCtx);
+    if (typeof children === "string") c.labels.set(value, children);
+    return h("div", {onClick: () => c.set(value),
+      className: cn("cursor-pointer rounded-sm px-2 py-1.5 text-sm hover:bg-slate-100", c.v === value ? "font-semibold" : "", className)}, children);
+  };
+  const pass = ({children}) => h(React.Fragment, null, children);
+  return {
+    cn,
+    Card: el("div", "rounded-lg border border-slate-200 bg-white text-slate-900 shadow-sm"),
+    CardHeader: el("div", "flex flex-col space-y-1.5 p-6"),
+    CardTitle: el("h3", "text-2xl font-semibold leading-none tracking-tight"),
+    CardDescription: el("p", "text-sm text-slate-500"),
+    CardContent: el("div", "p-6 pt-0"),
+    CardFooter: el("div", "flex items-center p-6 pt-0"),
+    Button, Badge, Alert, Progress, Switch, Checkbox, Slider,
+    AlertTitle: el("h5", "mb-1 font-medium leading-none tracking-tight"),
+    AlertDescription: el("div", "text-sm"),
+    Input: el("input", "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"),
+    Textarea: el("textarea", "flex min-h-[80px] w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"),
+    Label: el("label", "text-sm font-medium leading-none"),
+    Separator: el("div", "h-px w-full bg-slate-200"),
+    ScrollArea: el("div", "overflow-auto"),
+    Table: el("table", "w-full caption-bottom text-sm"),
+    TableHeader: el("thead", "[&_tr]:border-b"),
+    TableBody: el("tbody", "[&_tr:last-child]:border-0"),
+    TableFooter: el("tfoot", "border-t bg-slate-100 font-medium"),
+    TableRow: el("tr", "border-b transition-colors hover:bg-slate-50"),
+    TableHead: el("th", "h-12 px-4 text-left align-middle font-medium text-slate-500"),
+    TableCell: el("td", "p-4 align-middle"),
+    TableCaption: el("caption", "mt-4 text-sm text-slate-500"),
+    Avatar: el("span", "relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full"),
+    AvatarImage: el("img", "aspect-square h-full w-full"),
+    AvatarFallback: el("span", "flex h-full w-full items-center justify-center rounded-full bg-slate-100"),
+    Tabs, TabsList, TabsTrigger, TabsContent,
+    Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup: pass, SelectLabel: el("div", "px-2 py-1.5 text-sm font-semibold"),
+    Tooltip: pass, TooltipProvider: pass, TooltipTrigger: pass, TooltipContent: () => null,
+  };
+}
+
+/* Brebus's kit: the pieces an app is made of, the same in every one, so
+   that a model composes them rather than writing them all (import {...}
+   from "brebus-kit"). Tailwind's classes, React; charts by Recharts, files
+   by PapaParse and SheetJS, data kept by window.storage. */
+function brebusKit(ui) {
+  const h = React.createElement, {useState, useEffect, useMemo, useRef} = React;
+  const cn = ui.cn;
+  /* toasts and the confirm dialog: one host, in Shell or Toaster */
+  let host = null;
+  const toast = (text, kind = "info") => host ? host.toast(String(text), kind) : alert(text);
+  const confirm = (text) => host ? host.confirm(String(text)) : Promise.resolve(window.confirm(text));
+  const Toaster = () => {
+    const [items, setItems] = useState([]), [ask, setAsk] = useState(null);
+    useEffect(() => {
+      host = {
+        toast: (t, k) => { const id = Math.random(); setItems((x) => [...x, {id, t, k}]);
+          setTimeout(() => setItems((x) => x.filter((i) => i.id !== id)), 4000); },
+        confirm: (t) => new Promise((done) => setAsk({t, done})),
+      };
+      return () => { host = null; };
+    }, []);
+    const tone = {info: "bg-slate-900", ok: "bg-emerald-600", error: "bg-red-600", warn: "bg-amber-600"};
+    return h(React.Fragment, null,
+      h("div", {className: "fixed bottom-4 right-4 z-50 flex flex-col gap-2"},
+        items.map((i) => h("div", {key: i.id, className: cn("rounded-md px-4 py-2 text-sm text-white shadow", tone[i.k] || tone.info)}, i.t))),
+      ask && h("div", {className: "fixed inset-0 z-50 flex items-center justify-center bg-black/40"},
+        h("div", {className: "w-full max-w-sm rounded-lg bg-white p-6 text-slate-900 shadow-lg"},
+          h("p", {className: "mb-4"}, ask.t),
+          h("div", {className: "flex justify-end gap-2"},
+            h(ui.Button, {variant: "outline", onClick: () => { ask.done(false); setAsk(null); }}, "Cancel"),
+            h(ui.Button, {onClick: () => { ask.done(true); setAsk(null); }}, "OK")))));
+  };
+  /* the app's frame: a title, its pages by name, the one shown */
+  const Shell = ({title, pages = {}, children}) => {
+    const names = Object.keys(pages);
+    const [at, setAt] = useState(names[0]);
+    return h("div", {className: "min-h-screen bg-slate-50 text-slate-900"},
+      h("header", {className: "flex items-center gap-6 border-b bg-white px-6 py-3"},
+        h("h1", {className: "text-lg font-semibold"}, title),
+        names.length > 1 && h("nav", {className: "flex gap-1"}, names.map((n) =>
+          h("button", {key: n, onClick: () => setAt(n),
+            className: cn("rounded-md px-3 py-1.5 text-sm", n === at ? "bg-slate-900 text-white" : "hover:bg-slate-100")}, n)))),
+      h("main", {className: "mx-auto max-w-6xl p-6"}, names.length ? pages[at] : children),
+      h(Toaster));
+  };
+  const Stat = ({label, value, hint}) => h("div", {className: "rounded-lg border bg-white p-4 shadow-sm"},
+    h("div", {className: "text-sm text-slate-500"}, label),
+    h("div", {className: "mt-1 text-2xl font-semibold"}, value),
+    hint && h("div", {className: "mt-1 text-xs text-slate-500"}, hint));
+  /* a field's value checked by its rules: the message, or "" */
+  const check = (f, v) => {
+    const empty = v === undefined || v === null || v === "" || (f.type === "checkbox" && !v);
+    if (f.required && empty) return f.message || `${f.label || f.name} is required`;
+    if (empty) return "";
+    if (f.type === "number" && isNaN(+v)) return `${f.label || f.name} must be a number`;
+    if (f.type === "number" && f.min !== undefined && +v < f.min) return `${f.label || f.name}: at least ${f.min}`;
+    if (f.type === "number" && f.max !== undefined && +v > f.max) return `${f.label || f.name}: at most ${f.max}`;
+    if (f.type === "email" && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) return "Not an e-mail address";
+    if (f.pattern && !new RegExp(f.pattern).test(v)) return f.message || `${f.label || f.name} is not valid`;
+    if (f.minLength && String(v).length < f.minLength) return `${f.label || f.name}: at least ${f.minLength} characters`;
+    return "";
+  };
+  const Form = ({fields = [], initial = {}, onSubmit, submitLabel = "Save", reset = true}) => {
+    const [v, setV] = useState(initial), [err, setErr] = useState({});
+    const set = (n, x) => setV((o) => ({...o, [n]: x}));
+    const submit = async (e) => {
+      e.preventDefault();
+      const errs = {};
+      for (const f of fields) { const m = check(f, v[f.name]); if (m) errs[f.name] = m; }
+      setErr(errs);
+      if (Object.keys(errs).length) return;
+      const out = {};
+      for (const f of fields) out[f.name] = f.type === "number" && v[f.name] !== "" && v[f.name] !== undefined ? +v[f.name] : v[f.name];
+      await (onSubmit && onSubmit(out));
+      if (reset) setV(initial);
+    };
+    return h("form", {onSubmit: submit, className: "space-y-4"},
+      fields.map((f) => {
+        const id = "f-" + f.name, val = v[f.name] ?? (f.type === "checkbox" ? false : "");
+        const input = f.type === "select"
+          ? h("select", {id, value: val, onChange: (e) => set(f.name, e.target.value),
+              className: "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm"},
+              h("option", {value: ""}, f.placeholder || "—"),
+              (f.options || []).map((o) => typeof o === "object"
+                ? h("option", {key: o.value, value: o.value}, o.label) : h("option", {key: o, value: o}, o)))
+          : f.type === "textarea"
+          ? h(ui.Textarea, {id, value: val, onChange: (e) => set(f.name, e.target.value), placeholder: f.placeholder})
+          : f.type === "checkbox"
+          ? h("input", {id, type: "checkbox", checked: !!val, onChange: (e) => set(f.name, e.target.checked), className: "h-4 w-4"})
+          : h(ui.Input, {id, type: f.type || "text", value: val, placeholder: f.placeholder,
+              onChange: (e) => set(f.name, e.target.value)});
+        return h("div", {key: f.name, className: "space-y-1"},
+          h(ui.Label, {htmlFor: id}, f.label || f.name, f.required ? " *" : ""), input,
+          err[f.name] && h("p", {className: "text-xs text-red-600"}, err[f.name]));
+      }),
+      h(ui.Button, {type: "submit"}, submitLabel));
+  };
+  const show = (c, x) => x === undefined || x === null ? "" : c.format ? c.format(x)
+    : c.type === "number" && typeof x === "number" ? x.toLocaleString() : String(x);
+  /* rows of objects: sorted by a header's click, filtered by the box,
+     in pages; a column with edit: true is changed in place, onChange gets
+     the rows; deletable: a button to remove a row */
+  const Grid = ({rows = [], columns, pageSize = 10, onChange, deletable, search = true}) => {
+    const cols = columns || Object.keys(rows[0] || {}).map((k) => ({key: k, label: k}));
+    const [sort, setSort] = useState(null), [q, setQ] = useState(""), [page, setPage] = useState(0);
+    const [editing, setEditing] = useState(null);
+    const view = useMemo(() => {
+      let r = rows.map((row, i) => ({row, i}));
+      if (q) { const t = q.toLowerCase(); r = r.filter(({row}) => cols.some((c) => String(row[c.key] ?? "").toLowerCase().includes(t))); }
+      if (sort) r.sort((a, b) => {
+        const x = a.row[sort.key], y = b.row[sort.key];
+        const d = typeof x === "number" && typeof y === "number" ? x - y : String(x ?? "").localeCompare(String(y ?? ""));
+        return sort.desc ? -d : d;
+      });
+      return r;
+    }, [rows, q, sort]);
+    const pages = Math.max(1, Math.ceil(view.length / pageSize)), p = Math.min(page, pages - 1);
+    const change = (i, key, x) => {
+      const c = cols.find((c) => c.key === key);
+      const next = rows.map((r, k) => k === i ? {...r, [key]: c && c.type === "number" && x !== "" ? +x : x} : r);
+      onChange && onChange(next);
+    };
+    return h("div", {className: "space-y-2"},
+      search && h(ui.Input, {placeholder: "Filter…", value: q, onChange: (e) => { setQ(e.target.value); setPage(0); }, className: "max-w-xs"}),
+      h("div", {className: "overflow-auto rounded-lg border bg-white"},
+        h("table", {className: "w-full text-sm"},
+          h("thead", null, h("tr", {className: "border-b bg-slate-50"},
+            cols.map((c) => h("th", {key: c.key, className: "cursor-pointer select-none px-3 py-2 text-left font-medium text-slate-600",
+              onClick: () => setSort(sort && sort.key === c.key ? {key: c.key, desc: !sort.desc} : {key: c.key, desc: false})},
+              c.label || c.key, sort && sort.key === c.key ? (sort.desc ? " ↓" : " ↑") : "")),
+            deletable && h("th", null))),
+          h("tbody", null, view.slice(p * pageSize, (p + 1) * pageSize).map(({row, i}) =>
+            h("tr", {key: i, className: "border-b last:border-0 hover:bg-slate-50"},
+              cols.map((c) => h("td", {key: c.key, className: cn("px-3 py-2", c.type === "number" && "text-right"),
+                onClick: () => c.edit && setEditing(i + ":" + c.key)},
+                editing === i + ":" + c.key
+                  ? h("input", {autoFocus: true, defaultValue: row[c.key] ?? "", className: "w-full rounded border px-1",
+                      onBlur: (e) => { change(i, c.key, e.target.value); setEditing(null); },
+                      onKeyDown: (e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setEditing(null); }})
+                  : show(c, row[c.key]))),
+              deletable && h("td", {className: "px-2 text-right"},
+                h("button", {className: "text-red-600 hover:underline", onClick: async () => {
+                  if (await confirm("Delete this row?")) onChange && onChange(rows.filter((_, k) => k !== i));
+                }}, "Delete"))))))),
+      pages > 1 && h("div", {className: "flex items-center gap-2 text-sm"},
+        h(ui.Button, {variant: "outline", size: "sm", disabled: p === 0, onClick: () => setPage(p - 1)}, "‹"),
+        `${p + 1} / ${pages} · ${view.length} rows`,
+        h(ui.Button, {variant: "outline", size: "sm", disabled: p >= pages - 1, onClick: () => setPage(p + 1)}, "›")));
+  };
+  const COLORS = ["#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed", "#0891b2", "#db2777"];
+  /* a chart of rows: x their category, y one key or several */
+  const Chart = ({type = "bar", data = [], x, y, height = 300}) => {
+    const R = window.Recharts;
+    if (!R) return h("p", null, "Charts are not loaded");
+    const ys = [].concat(y || Object.keys(data[0] || {}).filter((k) => k !== x && typeof data[0][k] === "number"));
+    if (type === "pie")
+      return h(R.ResponsiveContainer, {width: "100%", height},
+        h(R.PieChart, null, h(R.Tooltip), h(R.Legend),
+          h(R.Pie, {data, dataKey: ys[0], nameKey: x, outerRadius: "80%", label: true},
+            data.map((_, i) => h(R.Cell, {key: i, fill: COLORS[i % COLORS.length]})))));
+    const C = {bar: R.BarChart, line: R.LineChart, area: R.AreaChart}[type] || R.BarChart;
+    const S = {bar: R.Bar, line: R.Line, area: R.Area}[type] || R.Bar;
+    return h(R.ResponsiveContainer, {width: "100%", height},
+      h(C, {data}, h(R.CartesianGrid, {strokeDasharray: "3 3"}), h(R.XAxis, {dataKey: x}), h(R.YAxis), h(R.Tooltip), h(R.Legend),
+        ys.map((k, i) => h(S, {key: k, dataKey: k, fill: COLORS[i % COLORS.length], stroke: COLORS[i % COLORS.length]}))));
+  };
+  /* a file of the user's read into rows (CSV, Excel) or text */
+  const readFile = (file) => new Promise((done, fail) => {
+    const name = file.name.toLowerCase(), r = new FileReader();
+    r.onerror = () => fail(r.error);
+    if (/\.(xlsx|xls|ods)$/.test(name) && window.XLSX) {
+      r.onload = () => { const wb = XLSX.read(r.result, {type: "array"});
+        done(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]])); };
+      r.readAsArrayBuffer(file);
+    } else {
+      r.onload = () => {
+        if (/\.(csv|tsv)$/.test(name) && window.Papa)
+          done(Papa.parse(r.result, {header: true, dynamicTyping: true, skipEmptyLines: true}).data);
+        else if (name.endsWith(".json")) { try { done(JSON.parse(r.result)); } catch (e) { fail(e); } }
+        else done(r.result);
+      };
+      r.readAsText(file);
+    }
+  });
+  const Upload = ({accept = ".csv,.tsv,.xlsx,.xls,.json,.txt", onData, label = "Choose a file"}) => {
+    const ref = useRef(null), [name, setName] = useState("");
+    return h("div", {className: "flex items-center gap-3"},
+      h("input", {ref, type: "file", accept, className: "hidden", onChange: async (e) => {
+        const f = e.target.files[0]; if (!f) return; setName(f.name);
+        try { onData && onData(await readFile(f), f); } catch (x) { toast("Not read: " + x.message, "error"); }
+      }}),
+      h(ui.Button, {variant: "outline", onClick: () => ref.current.click()}, label),
+      name && h("span", {className: "text-sm text-slate-500"}, name));
+  };
+  /* a value kept between visits (the artifact's storage): [value, set] */
+  const useStored = (key, initial) => {
+    const [v, setV] = useState(initial);
+    useEffect(() => { window.storage && window.storage.get(key).then((r) => {
+      if (r && r.value !== undefined) try { setV(JSON.parse(r.value)); } catch (e) {} }).catch(() => {}); }, [key]);
+    const set = (x) => setV((old) => { const n = typeof x === "function" ? x(old) : x;
+      window.storage && window.storage.set(key, JSON.stringify(n)).catch(() => {}); return n; });
+    return [v, set];
+  };
+  return {Shell, Stat, Form, Grid, Chart, Upload, Toaster, toast, confirm, useStored, readFile, cn};
+}
+
+/* a React component: its code read by Babel, run with its imports */
+function runReact(src) {
+  const report = window.__janasReport;
+  let code;
+  try {
+    code = Babel.transform(src, {filename: "artifact.tsx",
+      presets: [["typescript", {isTSX: true, allExtensions: true}], "react"],
+      plugins: ["transform-modules-commonjs"]}).code;
+  } catch (e) { report(e.message); return; }
+  const ui = uiKit();
+  let kit = null;
+  const req = (name) => {
+    if (/^@\/components\/ui\//.test(name)) return ui;
+    if (name === "brebus-kit" || name === "@brebus/kit") return kit || (kit = brebusKit(ui));
+    if (name === "@/lib/utils") return {cn: ui.cn};
+    const p = pkgOf(name);
+    const g = p && PKG[p].g && window[PKG[p].g];
+    if (!g) throw new Error(`"${name}" is not among the libraries an artifact can import`);
+    if (p === "chart.js") return Object.assign({}, g, {Chart: g, default: g});
+    return g;
+  };
+  const module = {exports: {}};
+  try {
+    new Function("require", "module", "exports", "React",
+      code + "\n;try { if (!module.exports.default && typeof App !== 'undefined') module.exports.default = App; } catch (e) {}")(
+      req, module, module.exports, React);
+  } catch (e) { report(e.stack || e.message); return; }
+  const C = module.exports.default;
+  if (typeof C !== "function" && !(C && C.$$typeof)) { report("The artifact exports no component as default."); return; }
+  class Guard extends React.Component {
+    constructor(p) { super(p); this.state = {e: null}; }
+    static getDerivedStateFromError(e) { return {e}; }
+    componentDidCatch(e) { report(e.stack || e.message); }
+    render() {
+      return this.state.e ? React.createElement("pre", {style: {color: "#b00", padding: 16, whiteSpace: "pre-wrap"}}, String(this.state.e.message))
+                          : React.createElement(C);
+    }
+  }
+  ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(Guard));
+}
+
+/* the imports of a component's code */
+function imports(src) {
+  const out = new Set();
+  for (const m of src.matchAll(/(?:^|\n)\s*import\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g)) out.add(m[1]);
+  for (const m of src.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)) out.add(m[1]);
+  return [...out];
+}
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
+
+function documentFor(a) {
+  const head = `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>(${bridge})()<\/script>`;
+  if (a.type === "svg")
+    return `<!doctype html><html><head>${head}<style>html,body{margin:0;height:100%}body{display:flex;justify-content:center;align-items:center}svg{max-width:100%;max-height:100vh;height:auto}</style></head><body>${a.content}</body></html>`;
+  if (a.type === "mermaid")
+    return `<!doctype html><html><head>${head}${scripts(["mermaid"])}<style>body{margin:16px;display:flex;justify-content:center}</style></head><body><pre class="mermaid">${esc(a.content)}</pre>
+<script>mermaid.initialize({startOnLoad: false, theme: ${a.dark ? '"dark"' : '"default"'}, securityLevel: "strict"});
+mermaid.run().catch((e) => __janasReport(e.message || e));<\/script></body></html>`;
+  if (a.type === "react") {
+    const libs = ["react", "react-dom", "prop-types", "tailwindcss", "@babel/standalone"];
+    for (const n of imports(a.content)) { const p = pkgOf(n); if (p && !libs.includes(p)) libs.push(p); }
+    /* Brebus's kit: its charts and its files' readers with it */
+    if (imports(a.content).some((n) => n === "brebus-kit" || n === "@brebus/kit"))
+      for (const p of ["recharts", "papaparse", "xlsx"]) if (!libs.includes(p)) libs.push(p);
+    return `<!doctype html><html><head>${head}${scripts(libs)}</head><body><div id="root"></div>
+<script>window.__janasRun(${JSON.stringify(a.content).replace(/<\//g, "<\\/")})<\/script></body></html>`;
+  }
+  /* html: the bridge first, the CDN's libraries Brebus's */
+  let html = rewrite(a.content);
+  if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (m) => m + head);
+  else if (/<html[^>]*>/i.test(html)) html = html.replace(/<html[^>]*>/i, (m) => m + "<head>" + head + "</head>");
+  else html = head + html;
+  return html;
+}
+
+addEventListener("message", (e) => {
+  const a = e.source === parent && e.data && e.data.janasArtifact;
+  if (!a || window.__janasShown) return;
+  window.__janasShown = true;
+  /* kept across the document written: its globals stay, its listeners go */
+  window.__janasRun = runReact;
+  window.__janasZoom = a.zoom;
+  document.open();
+  document.write(documentFor(a));
+  document.close();
+});
+parent.postMessage({janasReady: true}, "*");
+})();
+</script>
+</body>
+</html>

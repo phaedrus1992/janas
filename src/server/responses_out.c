@@ -61,17 +61,18 @@ static yyjson_mut_val *reasoning_item(yyjson_mut_doc *d, struct resp *x,
     return it;
 }
 
-static yyjson_mut_val *text_part(yyjson_mut_doc *d, const struct srv_choice *ch,
-                                 int done)
+static yyjson_mut_val *text_part(yyjson_mut_doc *d, const struct resp *x,
+                                 const struct srv_choice *ch, int done)
 {
     yyjson_mut_val *p = yyjson_mut_obj(d);
     yyjson_mut_obj_add_str(d, p, "type", "output_text");
-    if (done)
-        yyjson_mut_obj_add_val(
-            d, p, "text", trimmed(d, ch->text ? ch->text : "", ch->n_text));
-    else
-        yyjson_mut_obj_add_str(d, p, "text", "");
-    yyjson_mut_obj_add_arr(d, p, "annotations");
+    yyjson_mut_val *t = done ? trimmed(d, ch->text ? ch->text : "", ch->n_text)
+                             : yyjson_mut_str(d, "");
+    yyjson_mut_obj_add_val(d, p, "text", t);
+    yyjson_mut_val *an = yyjson_mut_obj_add_arr(d, p, "annotations");
+    if (done) /* the sources of web_search it cites */
+        resp_web_annotate(d, an, x, yyjson_mut_get_str(t),
+                          yyjson_mut_get_len(t));
     if (done && ch->n_lp)
         yyjson_mut_obj_add_val(
             d, p, "logprobs",
@@ -91,7 +92,7 @@ static yyjson_mut_val *message_item(yyjson_mut_doc *d, struct resp *x,
     yyjson_mut_obj_add_str(d, it, "status", done ? "completed" : "in_progress");
     yyjson_mut_val *c = yyjson_mut_obj_add_arr(d, it, "content");
     if (done)
-        yyjson_mut_arr_append(c, text_part(d, ch, 1));
+        yyjson_mut_arr_append(c, text_part(d, x, ch, 1));
     return it;
 }
 
@@ -264,8 +265,11 @@ void resp_keep(struct resp *x)
         size_t m;
         char *items =
             yyjson_mut_val_write(arr, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &m);
-        if (items)
-            conv_append(x->srv, x->conv, items);
+        if (!items || conv_append(x->srv, x->conv, items) != 0)
+            fprintf(stderr,
+                    "janas-server: response %s not added to conversation "
+                    "%s\n",
+                    x->id, x->conv);
         free(items);
         yyjson_mut_doc_free(d);
         yyjson_doc_free(in);
@@ -374,7 +378,7 @@ static int close_text(struct resp *x, const struct srv_choice *ch)
     d = yyjson_mut_doc_new(NULL);
     e = item_ev(d, x, x->item_text);
     yyjson_mut_obj_add_int(d, e, "content_index", 0);
-    yyjson_mut_obj_add_val(d, e, "part", text_part(d, ch, 1));
+    yyjson_mut_obj_add_val(d, e, "part", text_part(d, x, ch, 1));
     bad |= event(x, d, e, "response.content_part.done");
     d = yyjson_mut_doc_new(NULL);
     bad |= item_added(x, d, message_item(d, x, ch, 1),
@@ -504,7 +508,7 @@ static int produce(struct resp *x)
                 d = yyjson_mut_doc_new(NULL);
                 yyjson_mut_val *e = item_ev(d, x, x->item_text);
                 yyjson_mut_obj_add_int(d, e, "content_index", 0);
-                yyjson_mut_obj_add_val(d, e, "part", text_part(d, ch, 0));
+                yyjson_mut_obj_add_val(d, e, "part", text_part(d, x, ch, 0));
                 bad |= event(x, d, e, "response.content_part.added");
                 x->text_open = 1;
             }
@@ -579,12 +583,20 @@ long resp_stream_next(void *ctx, char *buf, size_t cap)
             end = produce(x);
         }
         if (end == 0 && x->n_pend == 0) {
+            /* a keep-alive after 5 s with nothing sent, however often the
+               engine woke this meanwhile (a long prompt read wakes it at
+               every block): writing is how a client gone is noticed */
             struct timespec t;
             clock_gettime(CLOCK_REALTIME, &t);
-            t.tv_sec += 5;
-            int rc = pthread_cond_timedwait(&j->cv, &j->mu, &t);
+            t.tv_sec += 1;
+            pthread_cond_timedwait(&j->cv, &j->mu, &t);
             end = produce(x);
-            if (x->n_pend == 0 && rc == ETIMEDOUT) {
+            struct timespec m;
+            clock_gettime(CLOCK_MONOTONIC, &m);
+            double now = m.tv_sec * 1e3 + m.tv_nsec / 1e6;
+            if (!x->last_ms)
+                x->last_ms = now;
+            if (x->n_pend == 0 && now - x->last_ms >= 5000) {
                 char *p = realloc(x->pend, 16);
                 if (p) {
                     x->pend = p;
@@ -592,6 +604,11 @@ long resp_stream_next(void *ctx, char *buf, size_t cap)
                     x->n_pend = 14;
                 }
             }
+        }
+        if (x->n_pend) {
+            struct timespec m;
+            clock_gettime(CLOCK_MONOTONIC, &m);
+            x->last_ms = m.tv_sec * 1e3 + m.tv_nsec / 1e6;
         }
         if (end < 0)
             x->done_sent = 1;

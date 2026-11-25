@@ -47,6 +47,11 @@ void janas_cpus_restore(const unsigned char save[JANAS_CPU_SAVE_BYTES]);
 int janas_exe_path(char *buf, size_t len);
 /* The processor's name ("Intel(R) Core(TM) Ultra 9 185H"), or "". */
 void janas_cpu_name(char *buf, size_t len);
+/* The processor's instructions that matter to a model's products, those
+   used and those not yet ("avx2 avx-vnni avx512vnni amx-int8..."), each
+   counted where the system enables it (cpu_features.c); empty when none
+   is known. */
+void janas_cpu_features(char *buf, size_t len);
 
 /* Whether the machine runs on mains power: 1 yes, 0 on battery, -1 unknown
    (no power supply information: a desktop, most likely). */
@@ -57,5 +62,25 @@ uint64_t janas_mem_available(void);
 
 /* Installed memory, in bytes (0 if unknown). */
 uint64_t janas_mem_total(void);
+
+/* The process's resident memory now, in bytes (0 if unknown). */
+uint64_t janas_rss_bytes(void);
+
+/* Processor time of the process so far, every thread summed, in seconds
+   (-1 if unknown): its growth over a second is how many threads were
+   busy. */
+double janas_cpu_seconds(void);
+
+/* The logical processors the system runs (1 if unknown). */
+int janas_cpu_count(void);
+
+/* The energy the processor package has used so far, joules, where it can
+   be read without privileges (Linux's RAPL, through powercap: Intel, and
+   AMD from Zen); -1 elsewhere. The whole processor's, not this process's;
+   its growth over a second is the watts. */
+double janas_package_joules(void);
+
+/* The level-2 cache of the first CPU, in bytes (0 if unknown). */
+size_t janas_l2_bytes(void);
 
 #endif

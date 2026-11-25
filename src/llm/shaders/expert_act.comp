@@ -3,7 +3,8 @@
 #version 450
 // The experts' activation on the GPU, bit for bit as the CPU does it
 // (src/llm/vmath.h janas_silu_mul_det, src/llm/quant.c
-// janas_q8k_quantize_det): h = SiLU(gate) * up with the deterministic e^x
+// janas_q8k_quantize_det): h = SiLU(gate) * up (gelu: GELU's tanh form,
+// janas_gelu_mul_det, Gemma 4) with the deterministic e^x
 // and reciprocal, then Q8_K quantization of h, written in the layout the
 // product shaders read (320 bytes a block: 256 quants, 16 pair sums, d).
 // KIND 1, for a down matrix in blocks of 32 (MXFP4): the layout of the
@@ -24,7 +25,7 @@ layout(constant_id = 2) const uint KIND = 0;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer U { uint v[]; };
 
-layout(push_constant) uniform P { uvec2 g, u, x; uint blocks; } p;
+layout(push_constant) uniform P { uvec2 g, u, x; uint blocks, gelu; } p;
 
 /* The workgroup's maximum: each subgroup's in one operation, then the
    subgroups' - two barriers, not one per level of a tree. */
@@ -83,7 +84,11 @@ void main()
     F G = F(p.g), Uu = F(p.u);
     U X = U(p.x);
     float gv = G.v[blk * 256u + t], uv = Uu.v[blk * 256u + t];
-    precise float e = exp_det(clamp(-gv, -88.0, 30.0));
+    /* GELU(g) = g / (1 + e^-2z), z = sqrt(2/pi) (g + 0.044715 g^3) */
+    precise float z2 = gv;
+    if (p.gelu != 0u)
+        z2 = 1.5957691216057308 * fma(0.044715 * gv, gv * gv, gv);
+    precise float e = exp_det(clamp(-z2, -88.0, 30.0));
     precise float s = recip_det(1.0 + e);
     precise float gs = gv * s;
     precise float h = gs * uv;

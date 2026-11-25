@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Maurizio Cammalleri
 #
-# The binary package of Janas for Linux x86-64: built on Ubuntu 22.04, so
-# that it runs with the C library of Ubuntu 22.04, Debian 12 and later;
-# tested; packed as janas-linux-x86_64.tar.gz with the SHA-256 of every
-# file. The one for Windows x86-64 is built from the same sources with
+# The binary packages of Janas for Linux x86-64 and Linux on 64-bit ARM:
+# each built on Ubuntu 22.04 on a machine of its kind, so that it runs with
+# the C library of Ubuntu 22.04, Debian 12 and later; tested; packed as
+# janas-linux-x86_64.tar.gz and janas-linux-aarch64.tar.gz with the SHA-256
+# of every file. The one for Windows x86-64 is built from the same sources with
 # MinGW-w64 on Linux, tested on a Windows machine of GitHub's and packed as
 # janas-windows-x86_64.zip, attached to the same release. A tag v* publishes it as that tag's release (the name never
 # changes, so releases/latest/download/janas-linux-x86_64.tar.gz is always
 # the newest); run by hand, it only builds the package and keeps it as an
 # artifact of the run. The shaders' compiler and the Vulkan headers are
-# Khronos's own, at fixed versions: Ubuntu 22.04's are from 2022.
+# Khronos's own, at fixed versions: Ubuntu 22.04's are from 2022 (the
+# compiler built from its sources on ARM, where Khronos builds none).
 name: release
 
 on:
@@ -24,25 +26,55 @@ permissions:
 env:
   GLSLANG_VERSION: 16.6.0
   GLSLANG_SHA256: 2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce
+  GLSLANG_COMMIT: e1b562a8bed273a02f30b59b66a5d499793cede5
   VULKAN_HEADERS_TAG: vulkan-sdk-1.4.363.0
   VULKAN_HEADERS_COMMIT: 6802bb4733b63ed5efd3adb308a6c885ef180ea1
-  PACKAGE: janas-linux-x86_64
 
 jobs:
-  linux-x86_64:
-    runs-on: ubuntu-22.04
+  # Linux on x86-64 and on 64-bit ARM, each built and tested on a machine
+  # of its own kind (Ubuntu 22.04: its C library), packed the same way
+  linux:
+    strategy:
+      # each machine's build and tests to their end, whatever the other's
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      PACKAGE: janas-linux-${{ matrix.arch }}
+      DIAG: janas-diag-linux-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
 
       - name: The shaders' compiler and the Vulkan headers
         run: |
           set -euo pipefail
+          # clang and lld: the CUDA and HIP kernels (build.sh)
+          export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+          sudo -E apt-get update -q
+          sudo -E apt-get install -y -q --no-install-recommends clang lld
           mkdir -p "$RUNNER_TEMP/khronos"
           cd "$RUNNER_TEMP/khronos"
-          curl -fsSL -o glslang.tar.gz \
-            "https://github.com/KhronosGroup/glslang/releases/download/$GLSLANG_VERSION/glslang-$GLSLANG_VERSION-linux-x86_64-release.tar.gz"
-          echo "$GLSLANG_SHA256  glslang.tar.gz" | sha256sum -c -
-          mkdir glslang && tar xzf glslang.tar.gz -C glslang
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            curl -fsSL -o glslang.tar.gz \
+              "https://github.com/KhronosGroup/glslang/releases/download/$GLSLANG_VERSION/glslang-$GLSLANG_VERSION-linux-x86_64-release.tar.gz"
+            echo "$GLSLANG_SHA256  glslang.tar.gz" | sha256sum -c -
+            mkdir glslang && tar xzf glslang.tar.gz -C glslang
+          else
+            # Khronos builds none for ARM: the same version from its tag's
+            # sources (the compiler alone, no optimizer)
+            git clone -q --depth 1 --branch "$GLSLANG_VERSION" \
+              https://github.com/KhronosGroup/glslang.git glslang-src
+            test "$(git -C glslang-src rev-parse HEAD)" = "$GLSLANG_COMMIT"
+            cmake -S glslang-src -B glslang-build -DCMAKE_BUILD_TYPE=Release \
+              -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=ON \
+              -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/khronos/glslang" >/dev/null
+            cmake --build glslang-build -j "$(nproc)" --target install >/dev/null
+          fi
           echo "$RUNNER_TEMP/khronos/glslang/bin" >> "$GITHUB_PATH"
           git clone -q --depth 1 --branch "$VULKAN_HEADERS_TAG" \
             https://github.com/KhronosGroup/Vulkan-Headers.git
@@ -59,6 +91,10 @@ jobs:
           if grep -q "building without GPU support" build.log; then
             echo "the build left the GPU out"; exit 1
           fi
+          # nor NVIDIA's and AMD's own ways to their cards
+          if grep -qE "building without (CUDA|HIP)" build.log; then
+            echo "the build left CUDA or HIP out"; exit 1
+          fi
 
       - name: Test
         run: ./build.sh release test
@@ -66,23 +102,32 @@ jobs:
       - name: Pack
         run: |
           set -euo pipefail
-          B=bin/x86_64-linux
+          B=bin/${{ matrix.arch }}-linux
           P="$PACKAGE/janas"
-          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
-          for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
+          mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs" "$P/node"
+          for f in janas-chat janas-server janas-get janas-setup janas-bench janas-mcp brebus \
+                   janas-brebus-helper \
+                   gguf2jns jns_planes hf2jns_mtp hf2jns_ds4 hf2jns_vision hf2jns_whisper \
+                   silero2jns wespeaker2jns jns_check vkcheck gpu_check; do
             install -m 755 "$B/$f" "$P/"
           done
+          # Brebus served to the users of the system: its PAM service
+          install -m 644 dist/brebus.pam "$P/brebus.pam"
           for s in src/services/*/; do
             s=$(basename "$s")
             [ "$s" = common ] && continue
             install -m 755 "$B/janas-$s" "$P/services/"
             # each service's page, its links made to point beside it
             install -m 644 "src/services/$s/README.md" "$P/services/janas-$s.md"
+            # its instructions for the model, a skill in Claude's format
+            install -Dm 644 "src/services/$s/SKILL.md" "$P/skills/janas-$s/SKILL.md"
           done
           sed -E 's#\(([a-z]+)/README\.md\)#(janas-\1.md)#g' \
             src/services/README.md > "$P/services/README.md"
           install -m 755 "$B/libjanas_llm.so" "$B/libjanas_mcp.so" "$P/lib/"
+          # the library as a module for Node.js, with its types for TypeScript
+          install -m 755 "$B/janas.node" "$P/node/"
+          install -m 644 "$B/janas.d.ts" "$P/node/"
           install -m 644 include/janas/* "$P/include/janas/"
           install -m 644 docs/*.md "$P/docs/"
           install -m 644 dist/README.md "$P/README.md"
@@ -90,6 +135,13 @@ jobs:
           # nothing but programs, libraries and text: no script of any kind
           if find "$P" -type f \( -name '*.sh' -o -name '*.py' \) | grep -q .; then
             echo "a script in the package"; exit 1
+          fi
+          # the module, as packed, loads where the runner has Node.js
+          if command -v node >/dev/null; then
+            node -e 'const j = require(process.argv[1]);
+              if (j.abiVersion() !== 1) process.exit(1);
+              console.log("janas.node " + j.version + " loads in Node " + process.version)' \
+              "$(realpath "$P/node/janas.node")"
           fi
           # the newest C library the programs ask for
           find "$P" -type f -perm -u+x ! -name '*.so' -print0 |
@@ -101,24 +153,56 @@ jobs:
           sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256"
           cat "$PACKAGE.tar.gz.sha256"
 
-      - name: Keep the package (run by hand)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Pack the diagnostics
+        run: |
+          set -euo pipefail
+          # vkcheck and gpu_check alone, for a tester who only has to tell
+          # whether the GPU works: no model, no engine, a few megabytes
+          B=bin/${{ matrix.arch }}-linux
+          D="$DIAG/janas-diag"
+          mkdir -p "$D"
+          install -m 755 "$B/vkcheck" "$B/gpu_check" "$D/"
+          install -m 644 dist/README-diag.md "$D/README.md"
+          install -m 644 LICENSE "$D/"
+          (cd "$D" && find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS)
+          tar -C "$DIAG" -czf "$DIAG.tar.gz" janas-diag
+          sha256sum "$DIAG.tar.gz" > "$DIAG.tar.gz.sha256"
+          cat "$DIAG.tar.gz.sha256"
+
+      - name: Keep the package
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PACKAGE }}
           path: |
             ${{ env.PACKAGE }}.tar.gz
             ${{ env.PACKAGE }}.tar.gz.sha256
+            ${{ env.DIAG }}.tar.gz
+            ${{ env.DIAG }}.tar.gz.sha256
+
+  # the release, once both Linux packages are made: the x86-64 and the ARM
+  # one attached together (Windows's added by windows-package)
+  linux-release:
+    needs: linux
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: janas-linux-*
+          merge-multiple: true
 
       - name: Publish the release (a tag)
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "$PACKAGE.tar.gz" "$PACKAGE.tar.gz.sha256" \
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            janas-linux-x86_64.tar.gz janas-linux-x86_64.tar.gz.sha256 \
+            janas-diag-linux-x86_64.tar.gz janas-diag-linux-x86_64.tar.gz.sha256 \
+            janas-linux-aarch64.tar.gz janas-linux-aarch64.tar.gz.sha256 \
+            janas-diag-linux-aarch64.tar.gz janas-diag-linux-aarch64.tar.gz.sha256 \
             --title "Janas $GITHUB_REF_NAME" \
-            --notes "Janas for Linux x86-64 (Ubuntu 22.04, Debian 12 and later): janas-linux-x86_64.tar.gz; for Windows 10 and 11 x86-64: janas-windows-x86_64.zip. Unpack it and start: janas-get list, then janas-chat <model>. What changed: ChangeLog.md. The SHA-256 of every file: SHA256SUMS in the package."
+            --notes "Janas for Linux x86-64 (Ubuntu 22.04, Debian 12 and later): janas-linux-x86_64.tar.gz; for Linux on 64-bit ARM (the same systems, Raspberry Pi OS 64-bit): janas-linux-aarch64.tar.gz; for Windows 10 and 11 x86-64: janas-windows-x86_64.zip. Only the GPU checks (vkcheck, gpu_check), to tell whether a GPU computes what the CPU does: janas-diag-linux-x86_64.tar.gz, janas-diag-linux-aarch64.tar.gz, janas-diag-windows-x86_64.zip. Unpack it and start: janas-get list, then janas-chat <model>. What changed: ChangeLog.md. The SHA-256 of every file: SHA256SUMS in the package."
 
   # Windows x86-64: the same sources built with MinGW-w64 on Linux (a
   # newer Ubuntu: the C library does not matter for Windows, the MinGW
@@ -136,7 +220,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
           sudo -E apt-get update -q
           sudo -E apt-get install -y -q --no-install-recommends \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 clang lld
           mkdir -p "$RUNNER_TEMP/khronos"
           cd "$RUNNER_TEMP/khronos"
           curl -fsSL -o glslang.tar.gz \
@@ -157,10 +241,14 @@ jobs:
           if grep -q "building without GPU support" build.log; then
             echo "the build left the GPU out"; exit 1
           fi
+          # nor NVIDIA's and AMD's own ways to their cards
+          if grep -qE "building without (CUDA|HIP)" build.log; then
+            echo "the build left CUDA or HIP out"; exit 1
+          fi
           # nothing but Windows's own DLLs
           for f in bin/x86_64-windows/*.exe bin/x86_64-windows/*.dll; do
             x86_64-w64-mingw32-objdump -p "$f" | grep "DLL Name" |
-              grep -v -i -E 'kernel32|msvcrt|ws2_32|bcrypt|crypt32|powrprof|advapi32|iphlpapi|ole32|wevtapi|wlanapi|shell32|psapi|user32' &&
+              grep -v -i -E 'kernel32|msvcrt|ws2_32|bcrypt|crypt32|powrprof|advapi32|iphlpapi|ole32|wevtapi|wlanapi|shell32|psapi|user32|gdi32|setupapi' &&
               { echo "$f needs a DLL Windows does not have"; exit 1; } || true
           done
 
@@ -193,11 +281,12 @@ jobs:
           if ($failed.Count -gt 0) { Write-Host "failed: $failed"; exit 1 }
 
   windows-package:
-    needs: [linux-x86_64, windows-build, windows-test]
+    needs: [linux-release, windows-build, windows-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       WPACKAGE: janas-windows-x86_64
+      WDIAG: janas-diag-windows-x86_64
     steps:
       - uses: actions/checkout@v7
 
@@ -212,15 +301,31 @@ jobs:
           B=bin/x86_64-windows
           P="$WPACKAGE/janas"
           mkdir -p "$P/services" "$P/lib" "$P/include/janas" "$P/docs"
-          for f in janas-chat janas-server janas-get janas-bench janas-mcp \
-                   gguf2jns jns_planes hf2jns_mtp jns_check vkcheck; do
+          for f in janas-chat janas-server janas-get janas-setup janas-bench janas-mcp \
+                   brebus gguf2jns jns_planes hf2jns_mtp hf2jns_ds4 hf2jns_vision \
+                   hf2jns_whisper silero2jns wespeaker2jns jns_check vkcheck gpu_check; do
             install -m 755 "$B/$f.exe" "$P/"
           done
+          # Brebus's window: WebView2's loader beside brebus.exe, from
+          # Microsoft's SDK (src/third_party/webview2/README.md), checked
+          curl -sfL -o wv2.nupkg \
+            https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.4314.35
+          echo "90778deb1b77e36292828b4b5833c9255c27533f40e0ddd55891ae718944edc4  wv2.nupkg" |
+            sha256sum -c -
+          unzip -q -j wv2.nupkg build/native/x64/WebView2Loader.dll -d "$P/"
+          echo "d3fce90bdeecb08596e377dea6a316354dd8949e32ff09b89d51be00c14e21b6  $P/WebView2Loader.dll" |
+            sha256sum -c -
+          install -m 644 src/third_party/webview2/LICENSE.txt "$P/LICENSE-WebView2.txt"
+          rm -f wv2.nupkg
           for s in src/services/*/; do
             s=$(basename "$s")
             [ "$s" = common ] && continue
+            # a service not built for Windows yet (janas-files) stays out
+            [ -f "$B/janas-$s.exe" ] || continue
             install -m 755 "$B/janas-$s.exe" "$P/services/"
             install -m 644 "src/services/$s/README.md" "$P/services/janas-$s.md"
+            # its instructions for the model, a skill in Claude's format
+            install -Dm 644 "src/services/$s/SKILL.md" "$P/skills/janas-$s/SKILL.md"
           done
           sed -E 's#\(([a-z]+)/README\.md\)#(janas-\1.md)#g' \
             src/services/README.md > "$P/services/README.md"
@@ -238,6 +343,17 @@ jobs:
           (cd "$WPACKAGE" && zip -q -r -X "../$WPACKAGE.zip" janas)
           sha256sum "$WPACKAGE.zip" > "$WPACKAGE.zip.sha256"
           cat "$WPACKAGE.zip.sha256"
+          # the diagnostics alone, as for Linux
+          D="$WDIAG/janas-diag"
+          mkdir -p "$D"
+          install -m 755 "$B/vkcheck.exe" "$B/gpu_check.exe" "$D/"
+          install -m 644 dist/README-diag.md "$D/README.md"
+          install -m 644 LICENSE "$D/"
+          (cd "$D" && find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS)
+          (cd "$WDIAG" && zip -q -r -X "../$WDIAG.zip" janas-diag)
+          sha256sum "$WDIAG.zip" > "$WDIAG.zip.sha256"
+          cat "$WDIAG.zip.sha256"
 
       - name: Keep the package (run by hand)
         if: github.event_name == 'workflow_dispatch'
@@ -247,6 +363,8 @@ jobs:
           path: |
             ${{ env.WPACKAGE }}.zip
             ${{ env.WPACKAGE }}.zip.sha256
+            ${{ env.WDIAG }}.zip
+            ${{ env.WDIAG }}.zip.sha256
 
       - name: Add it to the release (a tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -254,7 +372,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
-            "$WPACKAGE.zip" "$WPACKAGE.zip.sha256"
+            "$WPACKAGE.zip" "$WPACKAGE.zip.sha256" \
+            "$WDIAG.zip" "$WDIAG.zip.sha256"
 
   # The wiki, made from the same pages as the repository: README.md becomes
   # Home, each docs/*.md a page named after its title. It is never edited
@@ -262,7 +381,7 @@ jobs:
   # release. Links between the pages become the wiki's own; links to the
   # sources point to the tag's files on GitHub.
   wiki:
-    needs: linux-x86_64
+    needs: linux-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     steps:
@@ -277,6 +396,7 @@ jobs:
           git clone -q "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.wiki.git" "$W"
           find "$W" -maxdepth 1 -name '*.md' -delete
           BLOB="https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME"
+          RAW="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME"
           # the order of the README's list, then any page not in it
           ORDER="features models chat library serving code-completion tools hardware"
           for f in docs/*.md; do
@@ -295,8 +415,10 @@ jobs:
             done
           }
           # Home: docs/x.md -> the page, other files -> the tag's sources
+          # pictures (<img src=...>) -> the tag's files themselves
           sed -E -e 's#\]\(docs/([a-z-]+)\.md(\#[^)]*)?\)#](@@\1@@\2)#g' \
-                 -e "s#\\]\\(([A-Za-z][^):@]*)\\)#](${BLOB}/\\1)#g" README.md |
+                 -e "s#\\]\\(([A-Za-z][^):@]*)\\)#](${BLOB}/\\1)#g" \
+                 -e "s#src=\"([A-Za-z][^\":]*)\"#src=\"${RAW}/\\1\"#g" README.md |
             sed -E -f <(names) > "$W/Home.md"
           for n in $ORDER; do
             t=$(head -1 "docs/$n.md" | sed -E 's/^# //')
