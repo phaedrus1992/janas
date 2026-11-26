@@ -16,6 +16,7 @@ struct janas_proc {
     intptr_t id;  /* 0: none. POSIX its pid, Windows its process's handle */
     intptr_t job; /* Windows: the job object; 0 elsewhere */
     unsigned long pid;
+    int adopted; /* POSIX: not a child of this process (janas_proc_adopt) */
 };
 
 /* A group of its own: the terminal's Ctrl-C does not reach it, and
@@ -40,6 +41,15 @@ int janas_proc_start(struct janas_proc *p, const char *const argv[],
                      size_t err_len);
 
 /*
+ * A process this one did not start (one of an earlier run, found by its
+ * pid), followed as if it had: waited for, killed (its group too when
+ * group, as JANAS_PROC_GROUP started it). On Windows it is put in a job of
+ * this process's, so that it ends with it. 0, or -1 when there is no such
+ * process to follow.
+ */
+int janas_proc_adopt(struct janas_proc *p, unsigned long pid, int group);
+
+/*
  * Waits up to timeout_ms (-1: as long as it takes, 0: only looks) for it
  * to end: 1 when it has, with its exit status in *code (may be NULL; -1
  * when a signal ended it), 0 when it still runs, -1 on an error. Once it
@@ -58,5 +68,10 @@ int janas_pipe(int fd[2]);
 /* A descriptor of the null device (/dev/null, NUL), for writing or for
    reading. */
 int janas_null_fd(int for_writing);
+
+/* A link opened as the user's desktop opens one, in its default browser:
+   xdg-open on Linux, open on macOS, the shell on Windows; their messages
+   not shown. 0 when it opened, -1 when not. */
+int janas_open_url(const char *url);
 
 #endif

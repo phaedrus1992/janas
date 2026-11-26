@@ -20,6 +20,8 @@ struct janas_toolset {
 
 enum janas_tool_dialect janas_tools_dialect(const char *tmpl)
 {
+    if (tmpl && strstr(tmpl, "<|content_invoke_tool_json|>"))
+        return JANAS_TOOLS_INK;
     if (tmpl && strstr(tmpl, "<|tool_call>"))
         return JANAS_TOOLS_GEMMA;
     if (!tmpl || !strstr(tmpl, "<tool_call>"))
@@ -130,6 +132,29 @@ static const char XML_FORMAT[] =
     "function calls\n</IMPORTANT>";
 
 /* s without the white space at either end */
+#define DSML                                                                   \
+    "\xef\xbd\x9c"                                                             \
+    "DSML"                                                                     \
+    "\xef\xbd\x9c"
+static const char DSML_TOOLS_HEAD[] =
+    "\n\n## Tools\n\nYou have access to a set of tools to help answer the "
+    "user's question. You can invoke tools by writing a \"<" DSML
+    "tool_calls>\" block like the following:\n\n<" DSML "tool_calls>\n<" DSML
+    "invoke name=\"$TOOL_NAME\">\n<" DSML
+    "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">"
+    "$PARAMETER_VALUE</" DSML "parameter>\n...\n</" DSML "invoke>\n<" DSML
+    "invoke name=\"$TOOL_NAME2\">\n...\n</" DSML "invoke>\n</" DSML
+    "tool_calls>\n\nString parameters should be specified as is and set "
+    "`string=\"true\"`. For all other types (numbers, booleans, arrays, "
+    "objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+    "If thinking_mode is enabled (triggered by <think>), you MUST output "
+    "your complete reasoning inside <think>...</think> BEFORE any tool calls "
+    "or final response.\n\nOtherwise, output directly after </think> with "
+    "tool calls or final response.\n\n### Available Tool Schemas\n\n";
+static const char DSML_TOOLS_TAIL[] =
+    "\n\nYou MUST strictly follow the above defined tool name and parameter "
+    "schemas to invoke tool calls.\n";
+
 static const char *trim(const char *s, size_t *n)
 {
     while (*n && (unsigned char)s[0] <= ' ') {
@@ -172,6 +197,83 @@ static void extra_keys(struct janas_buf *out, const struct janas_json *obj,
         janas_buf_put(out, k->key, k->key_n);
         janas_buf_puts(out, ">");
     }
+}
+
+/* ---- Inkling's JSON: Python's json.dumps with sort_keys, no spaces ---- */
+
+/* An object's members by key, as Python sorts strings (by code point: the
+   bytes of UTF-8 sort the same). */
+static size_t by_key(const struct janas_json *obj,
+                     const struct janas_json **out, size_t cap)
+{
+    size_t n = 0;
+    for (const struct janas_json *k = obj ? obj->child : NULL; k && n < cap;
+         k = k->next) {
+        size_t i = n++;
+        for (; i > 0; i--) {
+            const struct janas_json *p = out[i - 1];
+            size_t m = p->key_n < k->key_n ? p->key_n : k->key_n;
+            int c = memcmp(p->key, k->key, m);
+            if (c < 0 || (c == 0 && p->key_n <= k->key_n))
+                break;
+            out[i] = p;
+        }
+        out[i] = k;
+    }
+    return n;
+}
+
+/* v as JSON, its objects' keys sorted (all of them, deep: sort), or only
+   the outer object's (the call's arguments: Jinja's dictsort, then each
+   value's tojson as it is). */
+static void ink_json(struct janas_buf *out, const struct janas_json *v,
+                     int deep)
+{
+    if (v->type == JANAS_JSON_ARRAY) {
+        janas_buf_puts(out, "[");
+        for (const struct janas_json *e = v->child; e; e = e->next) {
+            if (e != v->child)
+                janas_buf_puts(out, ",");
+            ink_json(out, e, deep);
+        }
+        janas_buf_puts(out, "]");
+        return;
+    }
+    if (v->type != JANAS_JSON_OBJECT) {
+        janas_json_write(out, v);
+        return;
+    }
+    const struct janas_json *k[256];
+    size_t m = by_key(v, k, 256);
+    janas_buf_puts(out, "{");
+    for (size_t i = 0; i < m; i++) {
+        if (i)
+            janas_buf_puts(out, ",");
+        janas_json_write_str(out, k[i]->key, k[i]->key_n);
+        janas_buf_puts(out, ":");
+        if (deep)
+            ink_json(out, k[i], 1);
+        else
+            janas_json_write(out, k[i]);
+    }
+    janas_buf_puts(out, "}");
+}
+
+void janas_tools_ink_call(struct janas_buf *out,
+                          const struct janas_tool_call *call)
+{
+    janas_buf_puts(out, "{\"name\":");
+    janas_json_write_str(out, call->name, call->name_n);
+    janas_buf_puts(out, ",\"args\":");
+    struct janas_json_doc *doc =
+        janas_json_parse(call->args, call->args_n, NULL, 0);
+    const struct janas_json *r = janas_json_root(doc);
+    if (r && r->type == JANAS_JSON_OBJECT)
+        ink_json(out, r, 0);
+    else
+        janas_buf_puts(out, "{}");
+    janas_json_free(doc);
+    janas_buf_puts(out, "}");
 }
 
 /* ---- Gemma 4's notation ---- */
@@ -645,6 +747,55 @@ void janas_tools_system(struct janas_buf *out, enum janas_tool_dialect d,
         janas_buf_puts(out, "\n</tools>");
         janas_buf_puts(out, XML_FORMAT);
         break;
+    case JANAS_TOOLS_INK:
+        /* the declaration's content alone: each tool as {"description",
+           "name", "parameters", "type"}, sorted deep; the system message,
+           a message of its own, is the caller's */
+        janas_buf_puts(out, "[");
+        for (uint32_t i = 0; i < t->n; i++) {
+            const struct janas_json *f = t->fn[i];
+            const struct janas_json *d = janas_json_get(f, "description");
+            const struct janas_json *nm = janas_json_get(f, "name");
+            const struct janas_json *p = janas_json_get(f, "parameters");
+            const struct janas_json *ty = janas_json_get(t->item[i], "type");
+            if (i)
+                janas_buf_puts(out, ",");
+            janas_buf_puts(out, "{\"description\":");
+            if (d && d->type == JANAS_JSON_STRING)
+                janas_json_write(out, d);
+            else
+                janas_buf_puts(out, "\"\"");
+            janas_buf_puts(out, ",\"name\":");
+            if (nm)
+                janas_json_write(out, nm);
+            else
+                janas_buf_puts(out, "\"\"");
+            janas_buf_puts(out, ",\"parameters\":");
+            if (p && p->type == JANAS_JSON_OBJECT && p->child)
+                ink_json(out, p, 1);
+            else
+                janas_buf_puts(out, "{}");
+            janas_buf_puts(out, ",\"type\":");
+            if (ty && ty->type == JANAS_JSON_STRING && ty->n)
+                janas_json_write(out, ty);
+            else
+                janas_buf_puts(out, "\"function\"");
+            janas_buf_puts(out, "}");
+        }
+        janas_buf_puts(out, "]");
+        break;
+    case JANAS_TOOLS_DSML:
+        /* encoding_dsv4.py's render_tools after the system message */
+        if (sys)
+            janas_buf_put(out, sys, sys_n);
+        janas_buf_puts(out, DSML_TOOLS_HEAD);
+        for (uint32_t i = 0; i < t->n; i++) {
+            if (i)
+                janas_buf_puts(out, "\n");
+            janas_json_write(out, t->fn[i]);
+        }
+        janas_buf_puts(out, DSML_TOOLS_TAIL);
+        break;
     case JANAS_TOOLS_NONE:
         if (sys)
             janas_buf_put(out, sys, sys_n);
@@ -654,14 +805,33 @@ void janas_tools_system(struct janas_buf *out, enum janas_tool_dialect d,
 
 static uint32_t g_value_rule(struct janas_gbuild *b, int32_t quote);
 
+/* Whether function i is one a call may name: `only`, or with a prefix those
+   whose names begin with it, or all where none does. */
+static int callable(const struct janas_toolset *t, uint32_t i, int only,
+                    const char *prefix, size_t prefix_n)
+{
+    if (only >= 0)
+        return (uint32_t)only == i;
+    if (!prefix_n)
+        return 1;
+    int any = 0;
+    for (uint32_t k = 0; k < t->n && !any; k++) {
+        const struct janas_json *nm = janas_json_get(t->fn[k], "name");
+        any = nm->n >= prefix_n && memcmp(nm->s, prefix, prefix_n) == 0;
+    }
+    const struct janas_json *nm = janas_json_get(t->fn[i], "name");
+    return !any || (nm->n >= prefix_n && memcmp(nm->s, prefix, prefix_n) == 0);
+}
+
 /* The rule of a Gemma call: call:name{members} then the closing token. */
 uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
                                 const struct janas_toolset *t, int only,
+                                const char *prefix, size_t prefix_n,
                                 int32_t close, int32_t quote)
 {
     uint32_t fns = janas_gb_rule(b);
     for (uint32_t i = 0; i < t->n; i++) {
-        if (only >= 0 && (uint32_t)only != i)
+        if (!callable(t, i, only, prefix, prefix_n))
             continue;
         const struct janas_json *nm = janas_json_get(t->fn[i], "name");
         janas_gb_lit(b, janas_gb_alt(b, fns), nm->s, nm->n);
@@ -723,6 +893,45 @@ void janas_tools_assistant(struct janas_buf *out, enum janas_tool_dialect d,
         }
         if (content)
             janas_buf_put(out, content, n);
+        return;
+    }
+    if (d == JANAS_TOOLS_DSML) { /* the text, then the block of calls */
+        if (content)
+            janas_buf_put(out, content, n);
+        if (!n_calls)
+            return;
+        janas_buf_puts(out, "\n\n<" DSML "tool_calls>\n");
+        for (size_t i = 0; i < n_calls; i++) {
+            if (i)
+                janas_buf_puts(out, "\n");
+            janas_buf_puts(out, "<" DSML "invoke name=\"");
+            janas_buf_put(out, calls[i].name, calls[i].name_n);
+            janas_buf_puts(out, "\">\n");
+            struct janas_json_doc *doc =
+                janas_json_parse(calls[i].args, calls[i].args_n, NULL, 0);
+            const struct janas_json *o = janas_json_root(doc);
+            int first = 1;
+            for (const struct janas_json *k =
+                     o && o->type == JANAS_JSON_OBJECT ? o->child : NULL;
+                 k; k = k->next) {
+                int str = k->type == JANAS_JSON_STRING;
+                if (!first)
+                    janas_buf_puts(out, "\n");
+                first = 0;
+                janas_buf_puts(out, "<" DSML "parameter name=\"");
+                janas_buf_put(out, k->key, k->key_n);
+                janas_buf_puts(out, str ? "\" string=\"true\">"
+                                        : "\" string=\"false\">");
+                if (str)
+                    janas_buf_put(out, k->s, k->n);
+                else
+                    janas_json_write(out, k);
+                janas_buf_puts(out, "</" DSML "parameter>");
+            }
+            janas_json_free(doc);
+            janas_buf_puts(out, "\n</" DSML "invoke>");
+        }
+        janas_buf_puts(out, "\n</" DSML "tool_calls>");
         return;
     }
     if (d == JANAS_TOOLS_XML_CODER) {
@@ -855,10 +1064,70 @@ static int parse_xml(const struct janas_toolset *t, const char *s, size_t n,
     return 0;
 }
 
+/* One DSML invoke: <｜DSML｜invoke name="f">, its parameters, as
+   encoding_dsv4.py's parse_tool_calls reads them; a string="true" value is
+   text, the others JSON (written as text if they are not). */
+static int parse_dsml(const struct janas_toolset *t, const char *s, size_t n,
+                      struct janas_buf *name, struct janas_buf *args)
+{
+    const char *end = s + n;
+    const char *f = find(s, n, "<" DSML "invoke name=\"");
+    if (!f)
+        return -1;
+    f += strlen("<" DSML "invoke name=\"");
+    const char *q = memchr(f, '"', (size_t)(end - f));
+    if (!q || janas_toolset_find(t, f, (size_t)(q - f)) < 0)
+        return -1;
+    janas_buf_put(name, f, (size_t)(q - f));
+    janas_buf_puts(args, "{");
+    int first = 1;
+    const char *p = q;
+    static const char open[] = "<" DSML "parameter name=\"",
+                      close[] = "</" DSML "parameter>";
+    for (;;) {
+        const char *k = find(p, (size_t)(end - p), open);
+        if (!k)
+            break;
+        k += sizeof(open) - 1;
+        const char *ke = memchr(k, '"', (size_t)(end - k));
+        if (!ke)
+            return -1;
+        const char *st = find(ke, (size_t)(end - ke), "string=\"");
+        if (!st)
+            return -1;
+        st += 8;
+        int str = (size_t)(end - st) >= 4 && !memcmp(st, "true", 4);
+        const char *v = find(st, (size_t)(end - st), "\">");
+        if (!v)
+            return -1;
+        v += 2;
+        const char *ve = find(v, (size_t)(end - v), close);
+        if (!ve)
+            return -1;
+        p = ve + sizeof(close) - 1;
+        if (!first)
+            janas_buf_puts(args, ", ");
+        first = 0;
+        janas_json_write_str(args, k, (size_t)(ke - k));
+        janas_buf_puts(args, ": ");
+        struct janas_json_doc *d =
+            str ? NULL : janas_json_parse(v, (size_t)(ve - v), NULL, 0);
+        if (d)
+            janas_json_write(args, janas_json_root(d));
+        else
+            janas_json_write_str(args, v, (size_t)(ve - v));
+        janas_json_free(d);
+    }
+    janas_buf_puts(args, "}");
+    return 0;
+}
+
 int janas_tools_parse(enum janas_tool_dialect d, const struct janas_toolset *t,
                       const char *body, size_t n, struct janas_buf *name,
                       struct janas_buf *args)
 {
+    if (d == JANAS_TOOLS_DSML)
+        return parse_dsml(t, body, n, name, args);
     if (d == JANAS_TOOLS_GEMMA) { /* call:name{...} */
         const char *s = body, *end = body + n;
         while (s < end && (*s == ' ' || *s == '\n'))
@@ -874,12 +1143,13 @@ int janas_tools_parse(enum janas_tool_dialect d, const struct janas_toolset *t,
         janas_buf_put(name, nm, (size_t)(s - nm));
         return g_to_json(&s, end, args);
     }
-    if (d != JANAS_TOOLS_JSON)
+    if (d != JANAS_TOOLS_JSON && d != JANAS_TOOLS_INK)
         return parse_xml(t, body, n, name, args);
     struct janas_json_doc *doc = janas_json_parse(body, n, NULL, 0);
     const struct janas_json *root = janas_json_root(doc);
     const struct janas_json *nm = janas_json_get(root, "name");
-    const struct janas_json *ar = janas_json_get(root, "arguments");
+    const struct janas_json *ar =
+        janas_json_get(root, d == JANAS_TOOLS_INK ? "args" : "arguments");
     int rc = -1;
     if (nm && nm->type == JANAS_JSON_STRING) {
         janas_buf_put(name, nm->s, nm->n);
@@ -1102,23 +1372,26 @@ static uint32_t g_value_rule(struct janas_gbuild *b, int32_t quote)
 uint32_t janas_tools_rule(struct janas_gbuild *b, struct janas_jsg *j,
                           enum janas_tool_dialect d,
                           const struct janas_toolset *t, int only,
-                          int32_t close)
+                          const char *prefix, size_t prefix_n, int32_t close)
 {
     uint32_t ws = janas_jsg_ws(j);
     uint32_t fns = janas_gb_rule(b); /* one alternative per function */
     for (uint32_t i = 0; i < t->n; i++) {
-        if (only >= 0 && (uint32_t)only != i)
+        if (!callable(t, i, only, prefix, prefix_n))
             continue;
         const struct janas_json *nm = janas_json_get(t->fn[i], "name");
         uint32_t a = janas_gb_alt(b, fns);
-        if (d == JANAS_TOOLS_JSON) {
+        if (d == JANAS_TOOLS_JSON || d == JANAS_TOOLS_INK) {
             janas_gb_byte(b, a, '"');
             janas_gb_lit(b, a, nm->s, nm->n);
             janas_gb_byte(b, a, '"');
             janas_gb_ref(b, a, ws);
             janas_gb_byte(b, a, ',');
             janas_gb_ref(b, a, ws);
-            janas_gb_lit(b, a, "\"arguments\"", 11);
+            if (d == JANAS_TOOLS_INK)
+                janas_gb_lit(b, a, "\"args\"", 6);
+            else
+                janas_gb_lit(b, a, "\"arguments\"", 11);
             janas_gb_ref(b, a, ws);
             janas_gb_byte(b, a, ':');
             janas_gb_ref(b, a, ws);
@@ -1132,7 +1405,7 @@ uint32_t janas_tools_rule(struct janas_gbuild *b, struct janas_jsg *j,
     uint32_t r = janas_gb_rule(b);
     uint32_t a = janas_gb_alt(b, r);
     janas_gb_ref(b, a, ws);
-    if (d == JANAS_TOOLS_JSON) {
+    if (d == JANAS_TOOLS_JSON || d == JANAS_TOOLS_INK) {
         janas_gb_byte(b, a, '{');
         janas_gb_ref(b, a, ws);
         janas_gb_lit(b, a, "\"name\"", 6);

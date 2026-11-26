@@ -99,6 +99,13 @@ static int from_gguf(const struct janas_model_entry *m, const char *dir,
                      int keep, int no_mtp)
 {
     char out[4096], first[4096], flat[4200];
+    if (!m->parts[0]) { /* converted from safetensors: its JNS alone */
+        fprintf(stderr,
+                "janas-get: %s is published converted only (%s); it could "
+                "not be downloaded\n",
+                m->name, m->jns_repo ? m->jns_repo : "nowhere");
+        return 1;
+    }
     snprintf(out, sizeof(out), "%s/%s", dir, m->out);
     get_local(first, sizeof(first), dir, m->parts[0]);
     int have = exists(out) &&
@@ -149,6 +156,21 @@ static int from_gguf(const struct janas_model_entry *m, const char *dir,
         snprintf(xout, sizeof(xout), "%s/%s", dir, m->extra_out);
         if (exists(xout) && get_same(xout, m->extra_sha) == 1) {
             printf("%s: already here, fingerprint checked\n", xout);
+        } else if (m->extra == JANAS_EXTRA_BLOCK) {
+            char src[4096];
+            printf("== its MTP block, from %s (hf2jns_mtp)\n",
+                   m->extra_repo ? m->extra_repo : m->repo);
+            if (get_fetch(m->extra_repo ? m->extra_repo : m->repo, m->extra_src,
+                          dir, m->extra_src_sha, 0) != 0)
+                return 1;
+            get_local(src, sizeof(src), dir, m->extra_src);
+            char *argv[] = {"hf2jns_mtp", out, src, xout, NULL};
+            fflush(stdout);
+            if (get_run("hf2jns_mtp", argv) != 0 ||
+                check(xout, m->extra_sha, "hf2jns_mtp") != 0)
+                return 1;
+            if (!keep)
+                remove(src);
         } else if (m->extra == JANAS_EXTRA_GGUF) {
             char src[4096];
             printf("== its assistant\n");
@@ -259,6 +281,34 @@ static int from_hf(const char *spec, const char *dir, int keep)
     const char *path = b + 1;
     char local[4096], out[4200];
     get_local(local, sizeof(local), dir, path);
+    /* a file of that name there already is someone's model: never taken
+       for a part of this one, nor written over */
+    struct stat st;
+    if (stat(local, &st) == 0) {
+        fprintf(stderr,
+                "janas-get: %s is there already: remove it, or download into "
+                "another folder (--dir)\n",
+                local);
+        return 1;
+    }
+    /* a part left by a download of another repository: not this one's */
+    char part[4200], from[4300], was[600] = "";
+    snprintf(part, sizeof part, "%s.part", local);
+    snprintf(from, sizeof from, "%s.part.from", local);
+    FILE *ff = fopen(from, "r");
+    if (ff) {
+        if (!fgets(was, sizeof was, ff))
+            was[0] = 0;
+        fclose(ff);
+        was[strcspn(was, "\n")] = 0;
+    }
+    if (strcmp(was, repo) != 0)
+        remove(part);
+    ff = fopen(from, "w");
+    if (ff) {
+        fprintf(ff, "%s\n", repo);
+        fclose(ff);
+    }
     size_t pl = strlen(path);
     if (pl > 4 && strcmp(path + pl - 4, ".jns") == 0) {
         printf("== %s: downloading (not in the catalog: checked against the "
@@ -266,6 +316,7 @@ static int from_hf(const char *spec, const char *dir, int keep)
                path);
         if (get_fetch(repo, path, dir, NULL, 0) != 0)
             return 1;
+        remove(from);
         printf("\nReady: %s (no fingerprint to compare: not in MODELS.md)\n"
                "Chat with it: janas-chat %s\n",
                local, local);
@@ -279,10 +330,20 @@ static int from_hf(const char *spec, const char *dir, int keep)
         if (*c >= 'A' && *c <= 'Z')
             *c = (char)(*c - 'A' + 'a');
     strcat(out, ".jns");
+    if (stat(out, &st) == 0) {
+        fprintf(stderr,
+                "janas-get: %s is there already: remove it, or download into "
+                "another folder (--dir)\n",
+                out);
+        return 1;
+    }
     printf("== %s: downloading (not in the catalog: checked against the "
            "SHA-256 Hugging Face lists)\n",
            path);
-    if (get_fetch(repo, path, dir, NULL, 0) != 0 || convert(local, out) != 0)
+    if (get_fetch(repo, path, dir, NULL, 0) != 0)
+        return 1;
+    remove(from);
+    if (convert(local, out) != 0)
         return 1;
     if (!keep)
         remove(local);
@@ -295,6 +356,8 @@ static int from_hf(const char *spec, const char *dir, int keep)
 int main(int argc, char **argv)
 {
     janas_env_check("janas-get");
+    /* a line at a time through a pipe too: Brebus follows the steps */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
         usage();
         return 2;

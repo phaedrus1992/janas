@@ -1,0 +1,176 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+/*
+ * extract.c - the text of a document, by the kind its name says: plain
+ * text and Markdown as they are (when they are text: no NUL, valid UTF-8
+ * but for a byte in a hundred), a docx's word/document.xml and the
+ * content.xml of LibreOffice's documents, sheets and slides (odt, ods, odp)
+ * through xml.c, Excel's and PowerPoint's (xlsx, pptx) through office.c,
+ * web pages and EPUB books through html.c, RTF through rtf.c, a PDF
+ * through pdf.c. Anything else is not a document here.
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#include "docs.h"
+
+static const char *const TEXT_EXT[] = {"txt",      "text", "md",  "markdown",
+                                       "mdown",    "rst",  "org", "adoc",
+                                       "asciidoc", "tex",  "csv", "tsv"};
+
+int dz_kind(const char *path)
+{
+    const char *slash = strrchr(path, '/'), *dot = strrchr(path, '.');
+    if (!dot || (slash && dot < slash) || dot == (slash ? slash + 1 : path))
+        return DZ_NONE;
+    dot++;
+    if (!strcasecmp(dot, "docx"))
+        return DZ_DOCX;
+    if (!strcasecmp(dot, "odt"))
+        return DZ_ODT;
+    if (!strcasecmp(dot, "pdf"))
+        return DZ_PDF;
+    static const struct {
+        const char *ext;
+        int kind;
+    } MORE[] = {{"ods", DZ_ODS},   {"odp", DZ_ODP},    {"xlsx", DZ_XLSX},
+                {"xlsm", DZ_XLSX}, {"pptx", DZ_PPTX},  {"html", DZ_HTML},
+                {"htm", DZ_HTML},  {"xhtml", DZ_HTML}, {"epub", DZ_EPUB},
+                {"rtf", DZ_RTF}};
+    for (size_t i = 0; i < sizeof MORE / sizeof MORE[0]; i++)
+        if (!strcasecmp(dot, MORE[i].ext))
+            return MORE[i].kind;
+    for (size_t i = 0; i < sizeof TEXT_EXT / sizeof TEXT_EXT[0]; i++)
+        if (!strcasecmp(dot, TEXT_EXT[i]))
+            return DZ_TEXT;
+    return DZ_NONE;
+}
+
+int dz_is_text(const char *t, size_t n)
+{
+    if (memchr(t, 0, n))
+        return 0;
+    size_t bad = 0;
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)t[i];
+        size_t k = c < 0x80         ? 1
+                   : (c >> 5) == 6  ? 2
+                   : (c >> 4) == 14 ? 3
+                   : (c >> 3) == 30 ? 4
+                                    : 0;
+        if (!k || i + k > n) {
+            bad++;
+            i++;
+            continue;
+        }
+        for (size_t j = 1; j < k; j++)
+            if (((unsigned char)t[i + j] & 0xc0) != 0x80) {
+                bad++;
+                k = 1;
+                break;
+            }
+        i += k;
+    }
+    return bad * 100 <= n;
+}
+
+int dz_extract_mem(const uint8_t *p, size_t n, int kind, struct janas_buf *text,
+                   char *why, size_t wn)
+{
+    if (kind == DZ_TEXT) {
+        if (n >= 3 && !memcmp(p, "\xef\xbb\xbf", 3)) /* a byte order mark */
+            p += 3, n -= 3;
+        if (!dz_is_text((const char *)p, n)) {
+            snprintf(why, wn, "not text");
+            return -1;
+        }
+        janas_buf_put(text, (const char *)p, n);
+        return text->oom ? -1 : 0;
+    }
+    if (kind == DZ_PDF)
+        return dz_pdf_text(p, n, text, why, wn);
+    if (kind == DZ_XLSX)
+        return dz_xlsx_text(p, n, text, why, wn);
+    if (kind == DZ_PPTX)
+        return dz_pptx_text(p, n, text, why, wn);
+    if (kind == DZ_EPUB)
+        return dz_epub_text(p, n, text, why, wn);
+    if (kind == DZ_RTF)
+        return dz_rtf_text((const char *)p, n, text, why, wn);
+    if (kind == DZ_HTML) {
+        if (dz_html_text((const char *)p, n, text) != 0) {
+            snprintf(why, wn, "out of memory");
+            return -1;
+        }
+        return 0;
+    }
+    if (kind != DZ_DOCX && kind != DZ_ODT && kind != DZ_ODS && kind != DZ_ODP) {
+        snprintf(why, wn, "not a kind of document read here");
+        return -1;
+    }
+    uint8_t *x;
+    size_t xn;
+    if (dz_zip_get(p, n, kind == DZ_DOCX ? "word/document.xml" : "content.xml",
+                   &x, &xn, why, wn) != 0)
+        return -1;
+    int rc = dz_xml_text((const char *)x, xn, kind, text);
+    free(x);
+    if (rc != 0)
+        snprintf(why, wn, "out of memory");
+    return rc;
+}
+
+int dz_extract(const char *path, struct janas_buf *text, char *why, size_t wn)
+{
+    int kind = dz_kind(path);
+    if (kind == DZ_NONE) {
+        snprintf(why, wn, "not a kind of document read here");
+        return -1;
+    }
+    /* the file named, not a link put in its place; and on Linux the very
+       file the checks were made on: a folder of the path swapped for a
+       link after them leads the descriptor elsewhere, and is refused */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    FILE *f = fd >= 0 ? fdopen(fd, "rb") : NULL;
+    if (!f) {
+        if (fd >= 0)
+            close(fd);
+        snprintf(why, wn, "cannot be opened");
+        return -1;
+    }
+#ifdef __linux__
+    char self[64], at[PATH_MAX];
+    snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+    ssize_t an = readlink(self, at, sizeof at - 1);
+    if (path[0] == '/' && (an <= 0 || (at[an] = 0, strcmp(at, path)))) {
+        fclose(f);
+        snprintf(why, wn, "changed while being opened");
+        return -1;
+    }
+#endif
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size > DZ_MAX_FILE) {
+        fclose(f);
+        snprintf(why, wn, "not a file of at most %d MiB", DZ_MAX_FILE >> 20);
+        return -1;
+    }
+    size_t n = (size_t)st.st_size;
+    uint8_t *p = malloc(n + 1);
+    if (!p || fread(p, 1, n, f) != n) {
+        free(p);
+        fclose(f);
+        snprintf(why, wn, "cannot be read");
+        return -1;
+    }
+    fclose(f);
+    int rc = dz_extract_mem(p, n, kind, text, why, wn);
+    free(p);
+    return rc;
+}

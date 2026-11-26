@@ -10,6 +10,7 @@
  * Drafting off is measured on the first opening, since it only takes a
  * parameter of the chat, one prompt at a time beside drafting on.
  */
+#include "common/catalog.h"
 #include "tune.h"
 
 #include <stdio.h>
@@ -28,8 +29,8 @@
    between two runs (Gemma 4 E2B with its assistant: 38.6, then 46.9) */
 static const char *const PROMPTS[] = {
     "Explain in about one hundred words how a bicycle stays upright.",
-    "Write a C function that reverses a singly linked list, with a short "
-    "comment.",
+    ("Write a C function that reverses a singly linked list, with a short "
+     "comment."),
     "List ten Italian cities with one line about each."};
 #define N_PROMPTS (sizeof PROMPTS / sizeof *PROMPTS)
 
@@ -45,6 +46,10 @@ int chat_tune_path(char *buf, size_t len, const char *key, int fast)
         return -1;
     int n = snprintf(buf, len, "%s/tune-%s-%s.conf", dir, key,
                      fast ? "fast" : "quality");
+    /* its folder made: on a first start (a new Windows account's
+       %LOCALAPPDATA%\janas) a declined measure was not kept, and asked
+       again at every start */
+    janas_mkdirs(dir);
     return n > 0 && (size_t)n < len ? 0 : -1;
 }
 

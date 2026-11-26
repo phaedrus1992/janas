@@ -3,7 +3,8 @@
 /*
  * test_pool.c - the thread pool: every run reaches exactly the active
  * threads, each once, with n_threads equal to their count, through changes
- * of the active count in both directions.
+ * of the active count in both directions; and the CPUs a thread pinned by
+ * a first model still offers a second one.
  */
 #include <stdatomic.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #include "common/pool.h"
+#include "common/sysinfo.h"
 
 #define N 8
 
@@ -59,6 +61,23 @@ int main(void)
         failures++;
     }
     janas_pool_destroy(p);
+    /* a model pins its caller to one CPU and gives it back when freed: while
+       pinned, the CPUs a second model sees are still the thread's own */
+    struct janas_cpu_layout before, during, after;
+    unsigned char save[JANAS_CPU_SAVE_BYTES];
+    if (janas_cpu_layout(NULL, 0, &before) == 0 && before.n > 1 &&
+        janas_cpus_save(save) == 0) {
+        janas_pin_current_thread(before.cpus[0]);
+        during.n = after.n = -1;
+        int rd = janas_cpu_layout(NULL, 0, &during);
+        janas_cpus_restore(save);
+        int ra = janas_cpu_layout(NULL, 0, &after);
+        if (rd != 0 || ra != 0 || during.n != before.n || after.n != before.n) {
+            printf("pinned: %d CPUs seen (%d), %d after it (%d), %d before\n",
+                   during.n, rd, after.n, ra, before.n);
+            failures++;
+        }
+    }
     printf("test_pool: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

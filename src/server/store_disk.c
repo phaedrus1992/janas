@@ -15,6 +15,7 @@
  */
 #define _GNU_SOURCE
 #include "store_disk.h"
+#include "store.h" /* SRV_STORE_DOC_MAX */
 
 #include <dirent.h>
 #include <errno.h>
@@ -199,6 +200,8 @@ static int load_one(const char *path, const char *kind, const char *id,
     int ok = fscanf(f, "JANAS-STORE 1 %" SCNu64 " %" SCNd64 " %lld %lld", &seq,
                     &created, &nj, &na) == 4 &&
              fgetc(f) == '\n' && nj >= 0 && na >= -1 &&
+             (unsigned long long)nj + (unsigned long long)(na > 0 ? na : 0) <=
+                 SRV_STORE_DOC_MAX &&
              (json = read_n(f, nj)) && (na < 0 || (aux = read_n(f, na))) &&
              fgetc(f) == EOF && strlen(json) == (size_t)nj &&
              (!aux || strlen(aux) == (size_t)na);

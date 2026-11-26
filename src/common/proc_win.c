@@ -18,6 +18,7 @@
 #include "common/proc.h"
 
 #include <windows.h>
+#include <shellapi.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
@@ -60,9 +61,9 @@ static void putc_(struct str *s, char c)
 
 /* One argument quoted as CommandLineToArgvW and the C runtime read it:
    backslashes are literal except before a quote. */
-static void quote(struct str *s, const char *a)
+static void quote_as(struct str *s, const char *a, int always)
 {
-    if (*a && !strpbrk(a, " \t\n\v\"")) {
+    if (!always && *a && !strpbrk(a, " \t\n\v\"")) {
         put(s, a, strlen(a));
         return;
     }
@@ -89,6 +90,11 @@ static void quote(struct str *s, const char *a)
         }
     }
     putc_(s, '"');
+}
+
+static void quote(struct str *s, const char *a)
+{
+    quote_as(s, a, 0);
 }
 
 static int ends_with(const char *s, const char *tail)
@@ -193,17 +199,31 @@ int janas_proc_start(struct janas_proc *p, const char *const argv[],
         return -1;
     }
     int script = ends_with(prog, ".cmd") || ends_with(prog, ".bat");
+    /* cmd.exe reads the line before the program does: & | < > ^ ( ) are
+       inert only inside quotes, so every argument is quoted; a quote of
+       the argument's own would end that, and % (and ! with delayed
+       expansion) expands even inside: those are refused, never passed
+       (BatBadBut) */
+    for (size_t i = 1; script && argv[i]; i++)
+        if (strpbrk(argv[i], "\"%!\r\n")) {
+            snprintf(err, err_len,
+                     "cannot start %s: an argument holds a character "
+                     "cmd.exe would act on (\" %% ! or a newline)",
+                     argv[0]);
+            errno = EINVAL;
+            return -1;
+        }
     struct str cmd = {0};
     if (script) {
         /* cmd.exe /s /c "the whole line": its first and last quote go */
         put(&cmd, "cmd.exe /d /s /c \"", 18);
-        quote(&cmd, prog);
+        quote_as(&cmd, prog, 1);
     } else {
         quote(&cmd, prog);
     }
     for (size_t i = 1; argv[i]; i++) {
         putc_(&cmd, ' ');
-        quote(&cmd, argv[i]);
+        quote_as(&cmd, argv[i], script);
     }
     if (script)
         putc_(&cmd, '"');
@@ -244,6 +264,10 @@ int janas_proc_start(struct janas_proc *p, const char *const argv[],
         how |= CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
     else if (flags & JANAS_PROC_GROUP)
         how |= CREATE_NEW_PROCESS_GROUP;
+    /* a program with no console of its own (Brebus's window) would give
+       each console program it starts a window of its own: none */
+    if (!GetConsoleWindow())
+        how |= CREATE_NO_WINDOW;
     job = CreateJobObjectA(NULL, NULL);
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
@@ -311,6 +335,37 @@ int janas_proc_wait(struct janas_proc *p, int timeout_ms, int *code)
     return 1;
 }
 
+int janas_proc_adopt(struct janas_proc *p, unsigned long pid, int group)
+{
+    (void)group;
+    memset(p, 0, sizeof(*p));
+    HANDLE h =
+        OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE |
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA,
+                    FALSE, (DWORD)pid);
+    if (!h)
+        return -1;
+    /* a job of this process's: it ends with this one, as the ones started
+       here do */
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+        li.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li,
+                                sizeof li);
+        if (!AssignProcessToJobObject(job, h)) {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+    p->id = (intptr_t)h;
+    p->job = (intptr_t)job;
+    p->pid = pid;
+    p->adopted = 1;
+    return 0;
+}
+
 void janas_proc_kill(struct janas_proc *p, int hard)
 {
     if (!p->id)
@@ -334,6 +389,15 @@ int janas_null_fd(int for_writing)
 {
     return _open("NUL", (for_writing ? _O_WRONLY : _O_RDONLY) | _O_BINARY |
                             _O_NOINHERIT);
+}
+
+int janas_open_url(const char *url)
+{
+    /* the default browser, as a link clicked */
+    return (INT_PTR)ShellExecuteA(NULL, "open", url, NULL, NULL,
+                                  SW_SHOWNORMAL) > 32
+               ? 0
+               : -1;
 }
 
 #endif /* _WIN32 */

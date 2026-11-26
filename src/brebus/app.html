@@ -1,0 +1,242 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     Copyright (C) 2026 Maurizio Cammalleri
+     Brebus: the page of Janas's app, served by brebus on 127.0.0.1. It
+     loads nothing from anywhere else and talks only to brebus. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brebus</title>
+<style>
+<!--#include brebus/page/app.css-->
+</style>
+</head>
+<body>
+<nav id="side">
+  <div class="top"><h1><img src="/prabanta.png" alt="Prabanta" width="28" height="28"> <span class="lbl">Brebus</span></h1>
+    <span class="topbtns"><button id="findbtn" class="ico lbl" title="Search the chats and the projects (Ctrl+K)" aria-label="Search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg></button>
+    <button id="navtog" class="ico" title="Hide the side bar (Ctrl+B)" aria-label="Hide the side bar"><svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9.5 4.5v15"/></svg></button></span></div>
+  <button id="newc" class="newchat" title="A new chat, of no project (Ctrl+Shift+O)"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span class="lbl">New chat</span></button>
+  <div id="tree" class="lbl">
+    <input id="csearch" type="search" placeholder="Find a chat" spellcheck="false" title="The chats whose title or messages hold these words, in every project">
+    <div id="hits"></div>
+    <div class="grp" data-g="chats"><div class="ghead"><span class="arrow"></span><span class="gname">Chats</span>
+      <button class="gadd" id="addchat" title="A new chat, of no project" aria-label="New chat">+</button></div>
+      <div class="glist" id="freelist"></div></div>
+    <div class="grp" data-g="projects"><div class="ghead"><span class="arrow"></span><span class="gname">Projects</span>
+      <button class="gadd" id="addproj" title="A new project: a folder of yours, with its documents, files and chats" aria-label="New project">+</button></div>
+      <div class="glist" id="projlist"></div></div>
+    <div class="grp shut" data-g="archived"><div class="ghead"><span class="arrow"></span><span class="gname">Archived</span></div>
+      <div class="glist" id="archlist"></div></div>
+  </div>
+  <div class="sects">
+    <button data-s="chat" hidden></button>
+    <button data-s="discover" title="Discover: the models to get"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></svg><span class="lbl">Discover</span></button>
+    <button data-s="models" title="My models: those on this computer"><svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg><span class="lbl">My models</span></button>
+    <button data-s="server" title="Server: the model for other programs"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M8 7.5h.01M8 16.5h.01"/></svg><span class="lbl">Server</span></button>
+    <button data-s="prefs" title="Settings: what the chat may do"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg><span class="lbl">Settings</span></button>
+    <button data-s="machine" title="Info: Brebus, this computer, the engine"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></svg><span class="lbl">Info</span></button>
+    <div id="uizoom" class="uizoom" hidden title="The size of the whole interface: also Ctrl+wheel, Ctrl+plus, Ctrl+minus, and Ctrl+0 for 100%. An artifact has a zoom of its own, in its bar"><svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 8.5h18M8 12.5v4M6 14.5h4M14 14.5h4"/></svg><span class="lbl">Interface</span>
+      <span class="seg zoomseg"><button data-z="-1" class="lbl" title="The whole interface smaller (Ctrl+minus)">−</button><button data-z="0" title="The whole interface back to 100% (Ctrl+0)"><b>100%</b></button><button data-z="1" class="lbl" title="The whole interface larger (Ctrl+plus)">+</button></span></div>
+    <button id="navout" hidden title="Log out of this Brebus"><svg viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4M6 12h10"/></svg><span class="lbl">Log out</span></button>
+  </div>
+</nav>
+<main>
+  <section id="chat">
+    <div id="talk">
+      <div id="bar"><button id="ctitle" class="ctitle" title="This chat: rename, export, move, archive, delete">New chat<span class="caret"></span></button>
+        <span id="cwhere" class="note"></span>
+        <button type="button" id="chatmore" class="ico" title="This chat's artifacts, its files and its settings" aria-label="More of this chat"></button></div>
+      <div id="log"></div>
+      <div id="chips"></div>
+      <div id="archbar" class="note" hidden>This chat is archived: it can be read, not continued. <button class="act quiet" id="unarch" title="Back among the chats, to be continued">Restore it</button></div>
+      <form id="form"><textarea id="ask" rows="1" placeholder="Ask the model. Enter sends, Shift+Enter a new line."></textarea>
+        <button type="submit" id="send" title="Send (Enter)" aria-label="Send" disabled></button></form>
+      <div id="under"><input type="file" id="upfile" multiple hidden><button type="button" id="attach" class="ico" title="Attach a file or a web address" aria-label="Attach"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+        <button type="button" id="speak" class="ico" title="Read the replies aloud" aria-label="Read the replies aloud" aria-pressed="false"></button>
+        <button type="button" id="thinkbtn" class="ico" hidden aria-label="Reason before answering" aria-pressed="false"></button>
+        <span id="loaded" class="note"></span>
+        <span id="ctxring" title="The model's memory of this chat: nothing used yet"><svg viewBox="0 0 24 24"><circle class="bg" cx="12" cy="12" r="8.5"/><circle class="fg" cx="12" cy="12" r="8.5"/></svg></span>
+        <button type="button" id="modelbtn" class="modelbtn" title="The model that answers: click to choose another">…<span class="caret"></span></button>
+        <button type="button" id="monbtn" class="ico" title="The engine's monitor: the reply being written, the memory and the devices the model uses, live" aria-label="Engine monitor"></button>
+        <button type="button" id="modelset" class="ico" title="This model's settings: how much it remembers, how it reasons, its devices" aria-label="Model settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg></button></div>
+    </div>
+    <aside id="artpane" hidden><div id="artgrip" title="Drag to widen"></div>
+      <div class="arthead"><b id="arttitle"></b>
+        <select id="artver" title="Its versions"></select>
+        <span class="artbtns"><span class="seg" id="artview"><button data-v="preview" class="on" title="The artifact as it looks and works">Preview</button><button data-v="code" title="The artifact's source, as the model wrote it">Code</button></span>
+          <span class="seg zoomseg" id="artzoom" title="The artifact's own zoom, not the interface's: Ctrl+wheel over it too"><button data-z="-1" title="The artifact smaller">−</button><button data-z="0" id="artzpct" title="The artifact back to 100%">100%</button><button data-z="1" title="The artifact larger">+</button></span>
+          <button class="act quiet" id="artfull" title="Wide, over the chat" aria-label="Wide" aria-pressed="false">⤢</button>
+          <button class="act quiet" id="artcopy" title="Copy its source to the clipboard">Copy</button>
+          <button class="act quiet" id="artdown" title="Save it as a file of its own">Download</button>
+          <button class="act quiet" id="artopen" title="Open the saved file with this computer's own program for it">Open</button>
+          <button class="act quiet" id="artclose" title="Close">×</button></span></div>
+      <div id="arterr" hidden><pre></pre><span><button class="act" id="artfix" title="The error goes to the model, which writes the artifact again">Ask the model to fix it</button>
+        <button class="act quiet" id="arterrx" title="Hide this error">Dismiss</button></span></div>
+      <div id="artbody"></div>
+      <div class="note" id="artpath"></div>
+    </aside>
+  </section>
+  <section id="discover">
+    <h2>Discover</h2>
+    <p class="lead">The models Janas knows, converted and checked: Get downloads one. "fits" means this computer has the memory it is meant for; one that "needs more" still runs, slower, reading its parts from the disk. <span id="mem"></span></p>
+    <div class="card" id="dl" hidden></div>
+    <form class="hfget" id="hfsearch" onsubmit="return false">
+      <input name="q" spellcheck="false" placeholder="Search or get: qwen3 4b, gemma 4… or a file's address on Hugging Face">
+      <button class="act" type="submit" id="hfgo" title="Words: search Hugging Face. An address: download that file"><span>Search</span><span hidden>Get</span></button>
+    </form>
+    <p class="note">Words search Hugging Face; an address (https://… or hf:owner/repo/file.gguf) gets that file. A GGUF is converted here, and not checked against MODELS.md as the catalog's models are.</p>
+    <div id="hfres"></div>
+    <table><thead><tr><th>Model</th><th></th><th class="num">Download</th>
+      <th class="num">Memory it is meant for</th><th class="tag">Here</th><th class="tag"></th></tr></thead>
+      <tbody id="cat"><tr><td colspan="6" class="empty">Reading…</td></tr></tbody></table>
+  </section>
+  <section id="models">
+    <h2>My models</h2>
+    <div class="dirrow"><input id="dir" readonly aria-label="The folder of the models" title="The folder where the models are kept">
+      <button class="act quiet" id="dirchg" title="Keep the models in another folder (one with more room, an external disk…)">Change…</button></div>
+    <p class="lead">The models on this computer. Load starts one (or choose it under the chat's field); Settings says how it runs; Remove deletes it from the disk.</p>
+    <table><thead><tr><th>Model</th><th>Kind</th><th class="num">Size</th>
+      <th class="num">Context</th><th></th></tr></thead>
+      <tbody id="mine"><tr><td colspan="5" class="empty">Reading…</td></tr></tbody></table>
+  </section>
+  <section id="server">
+    <h2>Server</h2>
+    <p class="lead">The model loaded in Brebus can answer other programs too: an editor, a script, another chat app. They talk to it as they would to OpenAI, Ollama or Anthropic, only here, on this computer.</p>
+    <div class="card"><dl id="srv"></dl></div>
+    <h3>Settings</h3>
+    <div class="card">
+      <form id="srvset" class="srvset plainset" onsubmit="return false">
+        <label>Models loaded at once, at most
+          <input name="max_loaded" type="number" min="1" max="4" step="1" placeholder="as many as fit (4)">
+          <span class="note">A model chosen while others are loaded is loaded beside them when the memory free holds it, so going back to one is at once; when it does not, the ones used least lately are unloaded first. A model larger than half the memory runs alone. 1 keeps one at a time.</span></label>
+        <label>Free the memory when the chat is idle for this many minutes
+          <input name="ttl" type="number" min="0" step="5" placeholder="0: never">
+          <span class="note">The model is unloaded after so long without a message, and loaded again with the next one (a few seconds). 0 keeps it loaded.</span></label>
+        <label class="tog"><input type="checkbox" name="lan"> Other computers of this network may use it
+          <span class="note">Off, only programs on this computer reach the model. On, any computer of your network can: set a key below, so that only those who know it may.</span></label>
+        <label class="tog"><input type="checkbox" name="https"> Encrypted (HTTPS)
+          <span class="note">What goes between the programs and the model, the key too, cannot be read on the way. Brebus makes the certificate for this computer; a program that asks to trust it compares its fingerprint, shown above, with the one it sees.</span></label>
+        <details><summary>Advanced</summary>
+        <label>Key the other programs must send
+          <span class="row"><input name="api_key" autocomplete="off" spellcheck="false" placeholder="none: anyone who reaches it">
+          <button class="act quiet" type="button" id="genkey" title="Make a new random key">New key</button></span>
+          <span class="note">A password for programs: they send it as <code>Authorization: Bearer &lt;key&gt;</code>. Brebus's own window needs none.</span></label>
+        <label>Web pages of other sites allowed to call it, one a line
+          <textarea name="origins" rows="2" spellcheck="false" placeholder="http://localhost:3000"></textarea>
+          <span class="note">Only for a web app you are building that calls the model from the browser; leave it empty otherwise.</span></label>
+        </details>
+        <span class="row"><button class="act" type="button" id="srvsave" title="Keep these settings">Save</button>
+          <span class="note" id="srvnote"></span></span>
+      </form>
+    </div>
+  </section>
+  <section id="prefs">
+    <h2>Settings</h2>
+    <p class="lead">What the chat may do. Each choice holds for every chat until you change it.</p>
+    <div class="card prefs">
+      <label class="tog"><input type="checkbox" id="usedocs"> Search documents
+        <span class="note">Before each question Brebus searches the project's documents (PDF, Word, Excel, text…) and gives the model the passages it finds, so that it answers from them.</span></label>
+      <label class="tog"><input type="checkbox" id="usetools"> Tools
+        <span class="note">The model may list, read and search the project's files, and write there; it asks you before writing anything. The services (weather, maps, Wikipedia…) too, when they are on.</span></label>
+      <label class="tog"><input type="checkbox" id="usecode"> Run code
+        <span class="note">The model may run Python in a sandbox: the project's folder only, no network, a few minutes at most. You allow each piece of code before it runs. Off, the model is told it cannot run anything.</span></label>
+      <label class="tog"><input type="checkbox" id="useart"> Artifacts
+        <span class="note">Pages, drawings, documents and programs the model makes open beside the chat, and are kept with their versions in the project's artifact folder.</span></label>
+    </div>
+        <h3>Voice</h3>
+    <div class="card prefs" id="voicecard"></div>
+    <h3>Connectors</h3>
+    <div class="card prefs" id="conncard"></div>
+    <h3>Skills</h3>
+    <div class="card prefs" id="skillcard"></div>
+    <h3>Appearance</h3>
+    <div class="card prefs" id="zoomcard"></div>
+    <h3>When the computer starts</h3>
+    <div class="card prefs">
+      <label class="tog"><input type="checkbox" id="autost"> Start Brebus in the background
+        <span class="note">When you log in, Brebus starts without its window and loads the model the chat used last, with its settings, so that other programs (an editor, a script, another chat app) can use it at once through its server. Brebus's own window opens onto it when you start it.</span></label>
+    </div>
+    <div id="pyset" hidden>
+      <h3>Python, for Run code</h3>
+      <div class="card"><p id="pyline" class="note"></p></div>
+    </div>
+  </section>
+  <section id="machine">
+    <h2>Info</h2>
+    <div class="card about">
+      <p><b>Brebus</b> <span id="aboutver"></span> - a private chat with AI models that run on this computer, with no cloud.</p>
+      <dl>
+        <dt>Made by</dt><dd>Prabanta</dd>
+        <dt>Author</dt><dd>Maurizio "camauri" Cammalleri</dd>
+        <dt>Engine</dt><dd>Janas-LLM, part of Janas</dd>
+        <dt>Licence</dt><dd>GNU GPL 3.0 or later: free to use, study, share and change; whoever shares it shares the source too.</dd>
+        <dt>Source</dt><dd><a href="https://github.com/prabanta-dev/janas" target="_blank" rel="noopener">github.com/prabanta-dev/janas</a></dd>
+      </dl>
+    </div>
+    <div id="acct" hidden>
+      <h3>Your account</h3>
+      <p class="note">Brebus served from this machine: who is logged in, and the last logins.</p>
+      <div class="card"><dl id="acctme"></dl>
+        <p><button class="act quiet" id="logout">Log out</button> <button class="act quiet" id="newpw">Change the password</button> <button class="act quiet" id="endall" title="End your sessions in the other browsers">Log out elsewhere</button></p>
+        <ul class="note" id="logins"></ul></div>
+    </div>
+    <h3>This computer</h3>
+    <p class="note">What Janas sees of it, and how it is doing now.</p>
+    <div class="card"><dl id="mach"></dl></div>
+    <p class="note"><a href="/monitor" target="_blank" rel="noopener">The engine's monitor</a>: the reply being written, the memory and the devices the model uses, live.</p>
+  </section>
+</main>
+<div id="wsdlg" class="dlg" hidden><div class="box">
+  <h2>A project</h2>
+  <p class="lead">A folder of yours, for work that goes on: the model reads its documents and files, writes there what it makes for you, and its chats stay with it. One of the recent ones, a folder you choose, or a new one.</p>
+  <div id="wsrecent"></div>
+  <form id="wsform" class="hfget" onsubmit="return false">
+    <input name="path" spellcheck="false" placeholder="/home/you/Projects/something">
+    <button class="act quiet browse" type="button" id="wsbrowse" title="Choose the folder in the system's window">Browse…</button>
+    <button class="act quiet" type="submit" title="Open the folder written in the field as a project">Open</button>
+  </form>
+  <p><button class="act" id="wsnew" title="A new project, in a new folder named by today's date">New folder</button> <span class="note" id="wsnewin"></span></p>
+  <div id="wsemb" hidden><h3>Search by meaning</h3>
+    <p class="note" id="embnote"></p>
+    <select id="embsel"></select></div>
+  <div id="wssvc" hidden><h3>Services</h3>
+    <p class="note" id="svcnote"></p>
+    <div id="svclist"></div>
+    <p><label>A tool of your servers allowed always in a chat stays allowed, when the chat is taken up again,
+      <select id="apprage">
+        <option value="3600">for an hour</option><option value="28800">for 8 hours</option>
+        <option value="86400">for a day</option><option value="604800">for a week</option>
+        <option value="2592000">for 30 days</option><option value="-1">for good</option>
+        <option value="0">never</option></select> after its last use.</label>
+      <span class="note">It holds for the server it was given to: a new command, address or version asks again. Janas's own tools that change something ask every time.</span></p>
+    <p><button type="button" class="act quiet" id="apprclear" title="The tools allowed always in this chat ask again">Ask again in this chat</button></p></div>
+  <div id="wsro" hidden><h3>Read only, beside it</h3>
+    <p class="note">Folders and files the model may search and read, never write: documents, code, pictures, audio. Video is not read by Janas yet.</p>
+    <div id="rolist"></div>
+    <form id="roform" class="hfget" onsubmit="return false">
+      <input name="path" spellcheck="false" placeholder="/home/you/Documents/contracts">
+      <button class="act quiet browse" type="button" id="robrowse" title="Choose the folder in the system's window">Browse…</button>
+      <button class="act quiet" type="submit" title="Let the model read this folder too, never write in it">Add</button>
+    </form></div>
+  <p class="right"><button class="act quiet" id="wsclose" title="Close, changing nothing">Cancel</button></p>
+</div></div>
+<script>
+<!--#include web/md_entities.js-->
+<!--#include web/md_parse.js-->
+<!--#include web/markdown.js-->
+</script>
+<script>
+<!--#include brebus/page/base.js-->
+<!--#include brebus/page/models.js-->
+<!--#include brebus/page/chats.js-->
+<!--#include brebus/page/artifacts.js-->
+<!--#include brebus/page/turn.js-->
+<!--#include brebus/page/compact.js-->
+<!--#include brebus/page/side.js-->
+<!--#include brebus/page/more.js-->
+<!--#include brebus/page/zoom.js-->
+</script>
+</body>
+</html>
