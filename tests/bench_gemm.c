@@ -28,6 +28,7 @@
 #endif
 #include <time.h>
 
+#include "common/aligned.h"
 #include "common/pool.h"
 #include "llm/gpu.h"
 #include "llm/matvec.h"
@@ -60,7 +61,7 @@ static uint8_t *weights(size_t bytes)
 {
     if (mem_kind == 1)
         return janas_gpu_alloc(gpu, bytes);
-    return aligned_alloc(mem_kind == 2 ? (size_t)2 << 20 : 4096, bytes);
+    return janas_aligned_alloc(mem_kind == 2 ? (size_t)2 << 20 : 4096, bytes);
 }
 
 /* Written weights collapsed into 2 MB pages, then imported (pinned): the
@@ -265,9 +266,9 @@ int main(int argc, char **argv)
     janas_gpu_destroy(gpu); /* the driver's memory with it */
     janas_pool_destroy(pool);
     if (mem_kind != 1) {
-        free(w);
-        free(pl[0]);
-        free(pl[1]);
+        janas_aligned_free(w);
+        janas_aligned_free(pl[0]);
+        janas_aligned_free(pl[1]);
     }
     free(x);
     free(xf);

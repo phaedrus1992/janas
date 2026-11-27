@@ -36,6 +36,20 @@ enum janas_tool_dialect {
        tokens, answers <|tool_response>response:f{value:...}<tool_response|>
        inside the model's own turn */
     JANAS_TOOLS_GEMMA,
+    /* DeepSeek-V4's DSML: the tools as JSON lines under "## Tools" in the
+       system message, calls in a <｜DSML｜tool_calls> block of
+       <｜DSML｜invoke name="f"> with <｜DSML｜parameter name="k"
+       string="true|false"> each, answers <tool_result>...</tool_result> in
+       a user turn. ｜DSML｜ is a token of its own, the rest text */
+    JANAS_TOOLS_DSML,
+    /* Inkling-2-Mini: the tools as a JSON array (keys sorted, no spaces)
+       in a system message of their own, <|message_system|>tool_declare
+       <|content_xml|>[...]; each call a message of the model's,
+       <|message_model|>f<|content_invoke_tool_json|>{"name":"f","args":
+       {...}}<|end_message|>; each answer a message of the tool's,
+       <|message_tool|>f<|content_text|>...<|end_message|>. The marks are
+       tokens of their own, written by the caller (api_chat.c, api_load.c) */
+    JANAS_TOOLS_INK,
 };
 
 /* The dialect of a chat template (NONE when it has no tools). */
@@ -65,6 +79,11 @@ struct janas_tool_call {
     size_t name_n, args_n;
 };
 
+/* Inkling: a call's body as its template writes it,
+   {"name":"f","args":{...}} - the arguments' keys sorted, no spaces. */
+void janas_tools_ink_call(struct janas_buf *out,
+                          const struct janas_tool_call *call);
+
 /* An assistant message with calls, after the role: its content, then each
    call as the dialect writes it. */
 void janas_tools_assistant(struct janas_buf *out, enum janas_tool_dialect d,
@@ -88,6 +107,7 @@ int janas_tools_parse(enum janas_tool_dialect d, const struct janas_toolset *t,
 /* Gemma 4's call rule: the quote token <|"|> too. */
 uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
                                 const struct janas_toolset *t, int only,
+                                const char *prefix, size_t prefix_n,
                                 int32_t close, int32_t quote);
 
 /* Gemma 4: a tool's answer as its template writes it, without the opening
@@ -98,9 +118,11 @@ uint32_t janas_tools_rule_gemma(struct janas_gbuild *b,
 void janas_tools_gemma_response(struct janas_buf *out, const char *name,
                                 size_t name_n, const char *text, size_t n);
 
+/* With prefix (prefix_n bytes, 0: none), only the functions whose names
+   begin with it - all of them where none does. */
 uint32_t janas_tools_rule(struct janas_gbuild *b, struct janas_jsg *j,
                           enum janas_tool_dialect d,
                           const struct janas_toolset *t, int only,
-                          int32_t close);
+                          const char *prefix, size_t prefix_n, int32_t close);
 
 #endif

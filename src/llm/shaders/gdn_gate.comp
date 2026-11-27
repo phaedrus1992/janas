@@ -24,7 +24,8 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RP { uint v[]; };
 
 // att, z: n rows of d floats; w: ds floats
-layout(push_constant) uniform P { uvec2 att, z, w, q256, q32, bd, lb, ld, pos; uint d, nv; float eps; } p;
+// sig: sigmoid(z) in place of SiLU(z) (qwen4exp)
+layout(push_constant) uniform P { uvec2 att, z, w, q256, q32, bd, lb, ld, pos; uint d, nv; float eps; uint sig; } p;
 
 shared float sq_[256];
 shared float hs_[2];
@@ -72,7 +73,7 @@ void main()
     precise float sc = 1.0 / sqrt(hs_[t / 128u] / 128.0 + p.eps);
     precise float vs = a * sc;
     float z = F(p.z).v[o];
-    float v = vs * F(p.w).v[e % 128u] * (z / (1.0 + exp(-z)));
+    float v = vs * F(p.w).v[e % 128u] * ((p.sig != 0u ? 1.0 : z) / (1.0 + exp(-z)));
     /* the maxima of the groups of 32 and of the block */
     float mc = subgroupClusteredMax(abs(v), 8u);
     if (t % 8u == 0u)

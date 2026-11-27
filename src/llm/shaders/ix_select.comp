@@ -1,0 +1,117 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 Maurizio Cammalleri */
+#version 450
+// qwen4exp's indexer, last step (model_qsa.c choose and janas_m_qsa): the
+// positions token j of a block (workgroup y) at p = pos + j attends to,
+// into row j of list (ls words: their count, then the positions). While
+// its complete blocks are no more than keep, every position 0 .. p (the
+// dense attention); past that the keep blocks of highest score (sc's row
+// j), those above the keep-th score and among those equal to it the
+// earliest, in their order, r positions each, then the positions of its
+// own block that is not complete, tail = (p + 1) / r r .. p. The keep-th
+// score by its bits (scores are sums of relus, never negative: their bits
+// order as they do), a byte at a time from the top.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer W { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RU { uint v[]; };
+
+layout(push_constant) uniform P {
+    uvec2 sc, list, pos;
+    uint r, keep, nbs, ls;
+} p;
+
+shared uint hist[256];
+shared uint sel[2];  /* the threshold's bits so far, and the rank left */
+shared uint scn[256]; /* a scan's sums */
+
+/* the exclusive sum of v over the workgroup's threads, and in total their
+   sum */
+uint scan(uint t, uint v, out uint total)
+{
+    scn[t] = v;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1) {
+        uint a = t >= off ? scn[t - off] : 0u;
+        barrier();
+        scn[t] += a;
+        barrier();
+    }
+    total = scn[255];
+    uint x = scn[t] - v;
+    barrier();
+    return x;
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x, j = gl_WorkGroupID.y;
+    uint pp = RU(p.pos).v[0] + j, blocks = (pp + 1u) / p.r;
+    W L = W(p.list);
+    uint lo = j * p.ls;
+    if (blocks <= p.keep) {
+        for (uint i = t; i <= pp; i += 256u)
+            L.v[lo + 1u + i] = i;
+        if (t == 0u)
+            L.v[lo] = pp + 1u;
+        return;
+    }
+    R S = R(p.sc);
+    uint so = j * p.nbs;
+    if (t == 0u) {
+        sel[0] = 0u;
+        sel[1] = p.keep;
+    }
+    uint mask = 0u;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        hist[t] = 0u;
+        barrier();
+        uint prefix = sel[0];
+        for (uint b = t; b < blocks; b += 256u) {
+            uint u = floatBitsToUint(S.v[so + b]);
+            if ((u & mask) == prefix)
+                atomicAdd(hist[(u >> uint(shift)) & 255u], 1u);
+        }
+        barrier();
+        if (t == 0u) {
+            uint k = sel[1], bin = 255u;
+            for (;; bin--) {
+                if (k <= hist[bin] || bin == 0u)
+                    break;
+                k -= hist[bin];
+            }
+            sel[0] = prefix | (bin << uint(shift));
+            sel[1] = k;
+        }
+        mask |= 255u << uint(shift);
+        barrier();
+    }
+    uint th = sel[0], equal = sel[1];
+    /* in block order: every block above th, and the first `equal` of
+       those at th */
+    uint eq_base = 0u, sel_base = 0u;
+    for (uint c = 0; c < blocks; c += 256u) {
+        uint b = c + t;
+        uint u = b < blocks ? floatBitsToUint(S.v[so + b]) : 0u;
+        bool in_ = b < blocks;
+        uint eq = in_ && u == th ? 1u : 0u, eq_tot;
+        uint eqx = scan(t, eq, eq_tot) + eq_base;
+        bool take = in_ && (u > th || (eq == 1u && eqx < equal));
+        uint sel_tot;
+        uint sx = scan(t, take ? 1u : 0u, sel_tot) + sel_base;
+        if (take)
+            for (uint k = 0; k < p.r; k++)
+                L.v[lo + 1u + sx * p.r + k] = b * p.r + k;
+        eq_base += eq_tot;
+        sel_base += sel_tot;
+    }
+    uint tail = blocks * p.r, np = p.keep * p.r;
+    for (uint i = t; tail + i <= pp; i += 256u)
+        L.v[lo + 1u + np + i] = tail + i;
+    if (t == 0u)
+        L.v[lo] = np + pp + 1u - tail;
+}

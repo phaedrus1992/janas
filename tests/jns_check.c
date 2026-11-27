@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/reopen.h"
+#include "common/aligned.h"
 #include "llm/jns.h"
 
 static double now(void)
@@ -73,13 +75,17 @@ int main(int argc, char **argv)
 
     int status = 0;
     if (argc > 2 && strcmp(argv[2], "--verify") == 0) {
-        int fd = open(argv[1], O_RDONLY | O_DIRECT);
+        /* direct reads as the cache makes them, on every system */
+        int fd0 = open(argv[1], O_RDONLY);
+        int fd = fd0 >= 0 ? janas_reopen_read(fd0, 1) : -1;
+        if (fd0 >= 0)
+            close(fd0);
         uint64_t max_slot = 0;
         for (uint32_t l = 0; l < h->n_layer; l++)
             if (j.layers[l].slot_bytes > max_slot)
                 max_slot = j.layers[l].slot_bytes;
         void *buf = NULL;
-        if (fd < 0 || posix_memalign(&buf, JANAS_JNS_ALIGN, max_slot) != 0) {
+        if (fd < 0 || !(buf = janas_aligned_alloc(JANAS_JNS_ALIGN, max_slot))) {
             fprintf(stderr, "cannot open with O_DIRECT\n");
             return 1;
         }
@@ -88,6 +94,8 @@ int main(int argc, char **argv)
         for (uint32_t l = 0; l < h->n_layer; l++)
             for (uint32_t e = 0; e < h->n_expert; e++) {
                 uint64_t n = j.layers[l].slot_bytes;
+                if (janas_jns_expert_offset(&j, l, e) == 0)
+                    continue; /* absent (a layer with fewer experts) */
                 if (pread(fd, buf, n,
                           (off_t)janas_jns_expert_offset(&j, l, e)) !=
                     (ssize_t)n) {
@@ -105,7 +113,7 @@ int main(int argc, char **argv)
                bad, (unsigned long long)h->n_layer * h->n_expert, bytes / 1e9,
                dt, bytes / 1e9 / dt);
         status = bad ? 1 : 0;
-        free(buf);
+        janas_aligned_free(buf);
         close(fd);
     }
     janas_jns_close(&j);
